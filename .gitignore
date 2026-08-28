@@ -30,7 +30,7 @@ service-account*.json
 htmlcov/
 
 # Fixtures (large, regenerable via tools/fetch_fixtures.py)
-tests/fixtures/large/
+/fixtures-large/
 
 # Editors / OS
 .DS_Store
