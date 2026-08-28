@@ -28,10 +28,10 @@ def test_vertex_location_is_global() -> None:
     assert config.VERTEX_LOCATION == "global"
 
 
-def test_gcp_project_defaults_to_setback_app(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gcp_project_defaults_to_vexcourt_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SETBACK_GCP_PROJECT", raising=False)
     importlib.reload(config)
-    assert config.GCP_PROJECT == "setback-app"
+    assert config.GCP_PROJECT == "vexcourt-agent"
 
 
 def test_gcp_project_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:

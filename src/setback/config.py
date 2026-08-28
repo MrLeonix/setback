@@ -1,7 +1,7 @@
 """Central configuration: model IDs, thinking levels, GCP defaults, budgets.
 
 Values here are read once at import time from environment variables, falling
-back to the `setback-app` GCP project defaults. Re-import (or
+back to the `vexcourt-agent` GCP project defaults. Re-import (or
 ``importlib.reload``) after mutating the environment to pick up changes.
 """
 
@@ -48,8 +48,15 @@ CLERK = ModelConfig(
 
 # --- GCP -------------------------------------------------------------------
 
-GCP_PROJECT = os.environ.get("SETBACK_GCP_PROJECT", "setback-app")
-"""GCP project ID, overridable via SETBACK_GCP_PROJECT."""
+GCP_PROJECT = os.environ.get("SETBACK_GCP_PROJECT", "vexcourt-agent")
+"""GCP project ID, overridable via SETBACK_GCP_PROJECT.
+
+The hackathon's actual GCP project id is ``vexcourt-agent``; its Cloud
+Console *display name* is "Setback", but the project id itself was never
+renamed to match (GCP project ids are immutable post-creation) — a project
+literally named ``setback-app`` does not exist. Default to the real id so
+callers that don't set the env var still hit a live project.
+"""
 
 GCS_BUCKET = os.environ.get("SETBACK_GCS_BUCKET", "setback-app-corpus")
 """GCS bucket for the case corpus, overridable via SETBACK_GCS_BUCKET."""
