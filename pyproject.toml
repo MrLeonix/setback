@@ -21,6 +21,8 @@ dependencies = [
     "pyyaml>=6.0,<7",
     "python-dotenv>=1.0,<2",
     "packaging>=24.0,<26",
+    "pypdfium2>=4.30,<5",
+    "pillow>=11.0,<12",
 ]
 
 [dependency-groups]
