@@ -1,0 +1,58 @@
+{
+  "Application": [
+    {
+      "AccompaniedByVPAFlag": "N",
+      "ApplicationStatus": "On Exhibition",
+      "ApplicationType": "Development Application",
+      "AssessmentExhibitionEndDate": "2026-09-03T00:00:00",
+      "AssessmentExhibitionStartDate": "2026-08-20T00:00:00",
+      "CostOfDevelopment": 825000.0,
+      "Council": {
+        "CouncilName": "Georges River Council"
+      },
+      "CouncilApplicationNumber": "DA2026/0359",
+      "DateLastUpdated": "2026-08-25T22:57:31.543",
+      "DeterminationAuthority": "Unknown",
+      "DevelopmentSubjectToSICFlag": "N",
+      "DevelopmentType": [
+        {
+          "DevelopmentType": "Alterations or additions to an existing building or structure"
+        },
+        {
+          "DevelopmentType": "Demolition"
+        },
+        {
+          "DevelopmentType": "Dwelling house"
+        }
+      ],
+      "EPIVariationProposedFlag": "N",
+      "Location": [
+        {
+          "FullAddress": "65A VISTA STREET SANS SOUCI 2219",
+          "Lot": [
+            {
+              "Lot": "4",
+              "PlanLabel": "DP232626"
+            }
+          ],
+          "Postcode": "2219",
+          "State": "New South Wales",
+          "StreetName": "VISTA",
+          "StreetNumber1": "65A",
+          "StreetType": "STREET",
+          "Suburb": "SANS SOUCI",
+          "X": "151.123301432",
+          "Y": "-33.998075822"
+        }
+      ],
+      "LodgementDate": "2026-08-05",
+      "NumberOfNewDwellings": 1,
+      "PlanningPortalApplicationNumber": "PAN-661190",
+      "SubmissionDate": "2026-07-29"
+    }
+  ],
+  "PageNumber": 1,
+  "PageSize": 10,
+  "TotalCount": 1,
+  "TotalPages": 1
+}

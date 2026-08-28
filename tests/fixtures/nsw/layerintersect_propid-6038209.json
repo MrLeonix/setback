@@ -1,0 +1,350 @@
+[
+  {
+    "id": "234",
+    "layerName": "Acid Sulfate Soils Map",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Class": "Class 1",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Class 1"
+      },
+      {
+        "Amendment": "Map Amendment No 5",
+        "Class": "Class 5",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Class 5"
+      },
+      {
+        "Amendment": "Map Amendment No 5",
+        "Class": "Class 2",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Class 2"
+      }
+    ]
+  },
+  {
+    "id": "22",
+    "layerName": "Lot Size Map",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Lot Size": "700",
+        "Published Date": "15-5-2026",
+        "Units": "m\u00b2",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "700 m\u00b2"
+      }
+    ]
+  },
+  {
+    "id": "14",
+    "layerName": "Height of Buildings Map",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Legislative Clause": "Clause 4.3",
+        "Maximum Building Height": "9",
+        "Published Date": "15-5-2026",
+        "Units": "m",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "9 m"
+      }
+    ]
+  },
+  {
+    "id": "11",
+    "layerName": "Floor Space Ratio Map",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "Floor Space Ratio": "0.55",
+        "LGA Name": "GEORGES RIVER",
+        "Legislative Clause": "Clause 4.4",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "0.55:1"
+      },
+      {
+        "Additional Controls": "AREA 1",
+        "Amendment": "Map Amendment No 5",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Legislative Clause": "Clause 4.4",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587"
+      }
+    ]
+  },
+  {
+    "id": "8",
+    "layerName": "Land Application Map",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Published Date": "15-5-2026",
+        "Type": "Included",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Georges River Local Environmental Plan 2021"
+      }
+    ]
+  },
+  {
+    "id": "242",
+    "layerName": "Scenic Protection Land",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Class": "Foreshore Scenic Protection Area",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Foreshore Scenic Protection Area"
+      }
+    ]
+  },
+  {
+    "id": "26",
+    "layerName": "Foreshore Building Line Map",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Class": "Foreshore Area",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Label": "45m (from MHWM)",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Foreshore Area"
+      },
+      {
+        "Amendment": "Map Amendment No 5",
+        "Class": "Foreshore Building Line",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Label": "45m from MHWM",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Foreshore Building Line"
+      }
+    ]
+  },
+  {
+    "id": "19",
+    "layerName": "Land Zoning Map",
+    "results": [
+      {
+        "Amendment": "State Environmental Planning Policy Amendment (Land Use Zones) 2023",
+        "Commenced Date": "26-4-2023",
+        "Currency Date": "21-11-2025",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Land Use": "Low Density Residential",
+        "Published Date": "24-2-2023",
+        "Zone": "R2",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "R2: Low Density Residential"
+      }
+    ]
+  },
+  {
+    "id": "6",
+    "layerName": "Local Aboriginal Land Council",
+    "results": [
+      {
+        "Local Council Name": "METROPOLITAN",
+        "Regional Council Name": "SYDNEY NEWCASTLE",
+        "title": "METROPOLITAN"
+      }
+    ]
+  },
+  {
+    "id": "0",
+    "layerName": "Greater Sydney Tree Canopy Cover 2019",
+    "results": [
+      {
+        "Canopy %": "23.84",
+        "title": "Canopy %"
+      }
+    ]
+  },
+  {
+    "id": "310",
+    "layerName": "Regional Plan Boundary",
+    "results": [
+      {
+        "Regional Plan Website": "&lt;a href=\"https://bit.ly/3oaehef\"&gt;Greater Sydney&lt;/a&gt;",
+        "title": "Greater Sydney"
+      }
+    ]
+  },
+  {
+    "id": "240",
+    "layerName": "Riparian Lands and Watercourses Map",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Layer Class": "Sensitive Land",
+        "Layer Name": "Riparian Lands and Waterways",
+        "Published Date": "15-5-2026",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Riparian Lands and Waterways"
+      }
+    ]
+  },
+  {
+    "id": "149",
+    "layerName": "Special Provisions",
+    "results": [
+      {
+        "Class": "40%",
+        "Commenced Date": "1-10-2023",
+        "Currency Date": "1-10-2023",
+        "EPI Name": "State Environmental Planning Policy (Sustainable Buildings) 2022",
+        "EPI Type": "SEPP",
+        "Label": "2219",
+        "Map Type": "WAT",
+        "Published Date": "29-8-2022",
+        "Type": "Minimum Water Use Standard (%)",
+        "title": "SEPP (Sustainable Buildings) 2022 Water Use Map"
+      },
+      {
+        "Amendment": "State Environmental Planning Policy (Transport and Infrastructure) Amendment (Thermal Energy from Waste) 2022",
+        "Class": "Greater Sydney",
+        "Commenced Date": "16-12-2022",
+        "Currency Date": "16-12-2022",
+        "EPI Name": "State Environmental Planning Policy (Transport and Infrastructure) 2021",
+        "EPI Type": "SEPP",
+        "Map Type": "TEW",
+        "Published Date": "16-12-2022",
+        "Type": "Greater Sydney",
+        "title": "Thermal Energy from Waste Prohibition Map - Greater Sydney"
+      },
+      {
+        "Class": "56",
+        "Commenced Date": "1-10-2023",
+        "Currency Date": "1-10-2023",
+        "EPI Name": "State Environmental Planning Policy (Sustainable Buildings) 2022",
+        "EPI Type": "SEPP",
+        "Label": "2219",
+        "Map Type": "CLM",
+        "Published Date": "29-8-2022",
+        "Type": "Climate Zones",
+        "title": "SEPP (Sustainable Buildings) 2022 Climate Zones for BASIX Buildings Map"
+      },
+      {
+        "Class": "5",
+        "Commenced Date": "1-10-2023",
+        "Currency Date": "1-10-2023",
+        "EPI Name": "State Environmental Planning Policy (Sustainable Buildings) 2022",
+        "EPI Type": "SEPP",
+        "Label": "GEORGES RIVER",
+        "Map Type": "BAL",
+        "Published Date": "29-8-2022",
+        "Type": "Climate Zones",
+        "title": "SEPP (Sustainable Buildings) 2022 Climate Zones for BASIX Alterations Map"
+      }
+    ]
+  },
+  {
+    "id": "1",
+    "layerName": "Greater Sydney Tree Canopy Cover 2022",
+    "results": [
+      {
+        "Canopy %": "15.68",
+        "title": "Canopy %"
+      }
+    ]
+  },
+  {
+    "id": "223",
+    "layerName": "Local Provisions",
+    "results": [
+      {
+        "Amendment": "Map Amendment No 5",
+        "Class": "1000",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Label": "U",
+        "Map Type": "LSD",
+        "Published Date": "15-5-2026",
+        "Type": "Minimum Lot Size (sq m)",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Lot Size for Dual Occupancy Development Map"
+      },
+      {
+        "Amendment": "Map Amendment No 5",
+        "Class": "2100 Projected Sea Level Rise",
+        "Commenced Date": "15-5-2026",
+        "Currency Date": "15-5-2026",
+        "EPI Name": "Georges River Local Environmental Plan 2021",
+        "EPI Type": "LEP",
+        "LGA Name": "GEORGES RIVER",
+        "Map Type": "CHZ",
+        "Published Date": "15-5-2026",
+        "Type": "Sea Level Rise",
+        "legislationUrl": "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587",
+        "title": "Coastal Hazard and Risk Map"
+      }
+    ]
+  }
+]

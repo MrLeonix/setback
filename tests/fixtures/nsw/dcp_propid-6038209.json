@@ -1,0 +1,28 @@
+[
+  {
+    "dcpResults": [
+      {
+        "planName": "Hurstville DCP 2015 - Hurstville City Centre - Amendment 6",
+        "planURL": "https://s3-ap-southeast-2.amazonaws.com/shared-drupal-s3fs/master-test/fapub_pdf/HURSTVILLE/Hurstville%20DCP%202015%20-%20Hurstville%20City%20Centre%20-%20Amendment%206.pdf"
+      },
+      {
+        "planName": "Hurstville DCP No. 1 2007 - as amended 13 Jul 2016",
+        "planURL": "https://s3-ap-southeast-2.amazonaws.com/shared-drupal-s3fs/master-test/fapub_pdf/HURSTVILLE/Hurstville%20DCP%20No.%201%202007%20-%20as%20amended%2013%20Jul%202016.pdf"
+      },
+      {
+        "planName": "Kogarah DCP 2013 - Amendment 2",
+        "planURL": "https://s3-ap-southeast-2.amazonaws.com/shared-drupal-s3fs/master-test/fapub_pdf/KOGARAH/Kogarah+DCP+2013+-+Amendment+2.pdf"
+      },
+      {
+        "planName": "Kogarah DCP 2013",
+        "planURL": "https://s3-ap-southeast-2.amazonaws.com/shared-drupal-s3fs/master-test/fapub_pdf/KOGARAH/Kogarah%20DCP%202013.pdf"
+      },
+      {
+        "planName": "Hurstville DCP No. 2 2007 - Hurstville City Centre - as amended 9 Aug 2012",
+        "planURL": "https://s3-ap-southeast-2.amazonaws.com/shared-drupal-s3fs/master-test/fapub_pdf/HURSTVILLE/Hurstville%20DCP%20No.%202%202007%20-%20Hurstville%20City%20Centre%20-%20as%20amended%209%20Aug%202012.pdf"
+      }
+    ],
+    "geomId": 6038209,
+    "lgaName": "GEORGES RIVER"
+  }
+]
