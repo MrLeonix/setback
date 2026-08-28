@@ -1,0 +1,67 @@
+"""Tests for setback.config: model IDs, thinking levels, GCP defaults, and demo constants."""
+
+from __future__ import annotations
+
+import importlib
+
+import pytest
+from google.genai.types import ThinkingLevel
+
+from setback import config
+
+
+def test_interview_model_is_flash_lite_with_minimal_thinking() -> None:
+    assert config.INTERVIEW.model == "gemini-3.5-flash-lite"
+    assert config.INTERVIEW.thinking_level == ThinkingLevel.MINIMAL
+
+
+def test_bench_model_is_gemini_3_7_flash_with_low_thinking() -> None:
+    assert config.BENCH.model == "gemini-3.7-flash"
+    assert config.BENCH.thinking_level == ThinkingLevel.LOW
+
+
+def test_clerk_model_is_gemma_4_maas() -> None:
+    assert config.CLERK.model == "gemma-4-26b-a4b-it-maas"
+
+
+def test_vertex_location_is_global() -> None:
+    assert config.VERTEX_LOCATION == "global"
+
+
+def test_gcp_project_defaults_to_setback_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SETBACK_GCP_PROJECT", raising=False)
+    importlib.reload(config)
+    assert config.GCP_PROJECT == "setback-app"
+
+
+def test_gcp_project_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SETBACK_GCP_PROJECT", "custom-project")
+    importlib.reload(config)
+    assert config.GCP_PROJECT == "custom-project"
+    monkeypatch.delenv("SETBACK_GCP_PROJECT", raising=False)
+    importlib.reload(config)
+
+
+def test_gcs_bucket_defaults_to_setback_app_corpus(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SETBACK_GCS_BUCKET", raising=False)
+    importlib.reload(config)
+    assert config.GCS_BUCKET == "setback-app-corpus"
+
+
+def test_gcs_bucket_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SETBACK_GCS_BUCKET", "custom-bucket")
+    importlib.reload(config)
+    assert config.GCS_BUCKET == "custom-bucket"
+    monkeypatch.delenv("SETBACK_GCS_BUCKET", raising=False)
+    importlib.reload(config)
+
+
+def test_total_budget_ceiling_matches_project_cap() -> None:
+    assert config.TOTAL_BUDGET_CEILING_USD == 62.0
+
+
+def test_demo_case_constants() -> None:
+    assert config.DEMO_DA_NUMBER == "PAN-661190"
+    assert config.DEMO_COUNCIL == "Georges River Council"
+    assert config.DEMO_ADDRESS == "65A Vista Street, Sans Souci NSW 2219"
+    assert config.DEMO_LOT_DP == "Lot 4 DP232626"

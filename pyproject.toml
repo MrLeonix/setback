@@ -1,0 +1,64 @@
+[project]
+name = "setback"
+version = "0.1.0"
+description = "Setback: a Collaborative Partner agent that helps NSW residents object to a neighbouring Development Application."
+readme = "README.md"
+requires-python = "==3.12.*"
+license = { text = "MIT" }
+authors = [{ name = "Leo de Sousa" }]
+
+dependencies = [
+    "google-adk==2.8.0",
+    "google-genai==2.20.0",
+    "pydantic>=2.9,<3",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.32,<1",
+    "google-cloud-firestore>=2.19,<3",
+    "google-cloud-storage>=2.18,<3",
+    "google-cloud-tasks>=2.17,<3",
+    "google-cloud-secret-manager>=2.21,<3",
+    "httpx>=0.27,<1",
+    "pyyaml>=6.0,<7",
+    "python-dotenv>=1.0,<2",
+    "packaging>=24.0,<26",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<1",
+    "pytest-cov>=6.0,<7",
+    "respx>=0.21,<1",
+    "ruff>=0.7,<1",
+    "mypy>=1.13,<2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/setback"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+mypy_path = "src"
+files = ["src/setback"]
+
+[[tool.mypy.overrides]]
+module = ["google.adk.*", "google.genai.*"]
+ignore_missing_imports = true
