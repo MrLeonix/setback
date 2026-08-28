@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from setback.config import DEMO_RUN_BUDGET_CEILING_USD
 from setback.models.client import TokenUsage
 
 PRICING_USD_PER_MILLION_TOKENS: dict[str, tuple[float, float]] = {
@@ -21,8 +22,10 @@ PRICING_USD_PER_MILLION_TOKENS: dict[str, tuple[float, float]] = {
 }
 """Vertex AI list prices, USD per 1,000,000 tokens, as (input_rate, output_rate)."""
 
-DEFAULT_RUN_CEILING_USD = 2.0
-"""Default per-run self-abort ceiling, matching setback.config's demo-run cap."""
+DEFAULT_RUN_CEILING_USD = DEMO_RUN_BUDGET_CEILING_USD
+"""Default per-run self-abort ceiling. Imports (rather than repeats) the demo-run
+cap from `setback.config` — resolved at this checkpoint after review confirmed
+the two were meant to be the same value by construction, not by coincidence."""
 
 
 class BudgetExceededError(RuntimeError):
