@@ -1,21 +1,403 @@
-"""The ADK workflow graph wiring the disjoint reviewers and adjudication.
+"""The ADK court graph: two parallel, structurally disjoint reviewers, a
+deterministic tally, and conditional adjudication.
 
-Builds the directed graph of nodes (Clause Reviewer, Evidence Reviewer,
-adjudicator) that make up the adversarial review stage of the pipeline.
+Built from the proven construction in ``spike-adkCourt.md``, exactly:
+
+* Fan-out/fan-in **must** use the nested-tuple edge form —
+  ``(START, (clause_agent, evidence_agent))`` and
+  ``((clause_agent, evidence_agent), join)`` — never a bare top-level tuple
+  of three-plus nodes, which ADK parses as a *sequential chain* instead of
+  parallel branches. Both forms "run" without error; only the nested form is
+  actually parallel and feeds both agents the same shared input.
+* Every branch that must reach the `JoinNode` needs its own explicit edge
+  into it — a forgotten branch edge still runs that branch, but silently
+  drops its output from the join payload.
+* An `LlmAgent` node's external event has its `.output` field cleared by the
+  ADK `Runner` even when structured output parsed successfully. Every
+  terminal node in this graph (`finalize_clear`, `post_adjudicate`,
+  `conservative_default`) is a plain `FunctionNode`, whose events are never
+  subject to that clearing, so `run_court` never has to work around it.
+
+::
+
+    IngestNode output (ClauseSlice + EvidenceSlice)
+              |
+        ┌─────┴─────┐
+        │           │
+    clause_reviewer  evidence_reviewer      (parallel, disjoint)
+        │           │
+        └─────┬─────┘
+              │
+             join
+              │
+            tally  ──CLEAR──> finalize_clear ─────────────┐
+              │                                            │
+            SPLIT                                          ▼
+              │                                    CourtVerdict (terminal)
+       ┌──────┴───────┐                                    ▲
+       │ (bench open)  │ (bench closed/half-open)           │
+       ▼               ▼                                    │
+  conservative_    adjudicator ──> post_adjudicate ──────────┘
+  default
 """
 
 from __future__ import annotations
 
-from typing import Any
+from enum import StrEnum
+from typing import Any, Literal
+
+from google.adk.events.event import Event
+from google.adk.events.event_actions import EventActions
+from google.adk.models import BaseLlm
+from google.adk.runners import Runner
+from google.adk.sessions import BaseSessionService, InMemorySessionService
+from google.adk.workflow import START, FunctionNode, JoinNode, Workflow
+from google.genai import types
+from pydantic import BaseModel
+
+from setback import config
+from setback.court import roles, tally
+from setback.court.bench import (
+    AdjudicationBench,
+    ContestedCitationGrounder,
+    reground_contested_citations,
+)
+from setback.court.roles import (
+    AdjudicatorOutput,
+    ClauseSlice,
+    EvidenceSlice,
+    ReviewOutput,
+    ReviewStance,
+)
+
+CLAUSE_REVIEWER_NODE = "clause_reviewer"
+EVIDENCE_REVIEWER_NODE = "evidence_reviewer"
+JOIN_NODE = "join"
+TALLY_NODE = "tally"
+FINALIZE_CLEAR_NODE = "finalize_clear"
+ADJUDICATOR_NODE = "adjudicator"
+POST_ADJUDICATE_NODE = "post_adjudicate"
+CONSERVATIVE_DEFAULT_NODE = "conservative_default"
+
+TERMINAL_NODES = frozenset({FINALIZE_CLEAR_NODE, POST_ADJUDICATE_NODE, CONSERVATIVE_DEFAULT_NODE})
 
 
-def build_review_workflow() -> Any:
-    """Construct the ADK workflow graph for the adversarial review stage.
+class CourtOutcome(StrEnum):
+    """Whether the court graph reached a confident resolution for a ground."""
+
+    RESOLVED = "resolved"
+    """Unanimous agreement, or an adjudication with genuine confidence."""
+
+    UNRESOLVED_FLAGGED = "unresolved_flagged"
+    """The conservative default: adjudication was unavailable, contested
+    citations failed a recheck, or the adjudicator itself lacked confidence.
+    The ground is flagged for human review, never guessed at
+    (ARCHITECTURE.md §2, "conservative default on unresolved split")."""
+
+
+class CourtVerdict(BaseModel):
+    """The court graph's final, single decision for one candidate ground."""
+
+    ground_id: str
+    outcome: CourtOutcome
+    stance: ReviewStance
+    confidence: float
+    cited_anchor_ids: tuple[str, ...]
+    rationale: str
+    source: Literal["unanimous", "adjudicated", "conservative_default"]
+
+
+def node_name_for_event(event: Event) -> str | None:
+    """The workflow node name that produced `event`.
+
+    Measured live against this ADK build (see `court_offline_check.py` in
+    the spike scratchpad): non-`LlmAgent` node events (`JoinNode`,
+    `FunctionNode`) carry `event.author == <workflow name>`, not the node's
+    own name — the reliable signal is `event.node_info.path`, whose last
+    segment (before its `@run_id` suffix) is the node name. `LlmAgent`
+    nodes' events do carry their own name in `.author` as well, so this
+    helper works uniformly for every node type.
+    """
+    if event.node_info is None or not event.node_info.path:
+        return None
+    return event.node_info.path.rsplit("/", 1)[-1].split("@", 1)[0]
+
+
+def _dedupe(anchor_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Order-preserving de-duplication of cited anchor ids from both reviewers."""
+    return tuple(dict.fromkeys(anchor_ids))
+
+
+def _make_tally_node(known_anchor_ids: frozenset[str]) -> FunctionNode:
+    """Build the tally `FunctionNode`: voids uncited opinions, then routes
+    CLEAR/SPLIT per `setback.court.tally`."""
+
+    def _tally(node_input: dict[str, Any]) -> Event:
+        clause_raw = node_input.get(CLAUSE_REVIEWER_NODE)
+        evidence_raw = node_input.get(EVIDENCE_REVIEWER_NODE)
+        ground_id = (clause_raw or evidence_raw or {}).get("ground_id", "")
+
+        clause = ReviewOutput.model_validate(clause_raw) if clause_raw is not None else None
+        evidence = ReviewOutput.model_validate(evidence_raw) if evidence_raw is not None else None
+        if clause is not None and evidence is not None and clause.ground_id != evidence.ground_id:
+            raise ValueError(
+                f"clause_reviewer and evidence_reviewer reviewed different grounds: "
+                f"{clause.ground_id!r} vs {evidence.ground_id!r}"
+            )
+
+        clause = tally.void_if_uncited(clause, known_anchor_ids) if clause is not None else None
+        evidence = (
+            tally.void_if_uncited(evidence, known_anchor_ids) if evidence is not None else None
+        )
+        route = tally.tally(clause, evidence)
+
+        payload: dict[str, Any] = {
+            "ground_id": ground_id,
+            "clause": clause.model_dump(mode="json") if clause is not None else None,
+            "evidence": evidence.model_dump(mode="json") if evidence is not None else None,
+        }
+        return Event(output=payload, actions=EventActions(route=route.value))
+
+    return FunctionNode(func=_tally, name=TALLY_NODE)
+
+
+def _finalize_clear(node_input: dict[str, Any]) -> dict[str, Any]:
+    """CLEAR path: both reviewers survived voiding, agreed, and were
+    confident — no adjudicator call needed."""
+    clause = ReviewOutput.model_validate(node_input["clause"])
+    evidence = ReviewOutput.model_validate(node_input["evidence"])
+    verdict = CourtVerdict(
+        ground_id=node_input["ground_id"],
+        outcome=CourtOutcome.RESOLVED,
+        stance=clause.stance,
+        confidence=min(clause.confidence, evidence.confidence),
+        cited_anchor_ids=_dedupe(clause.cited_anchor_ids + evidence.cited_anchor_ids),
+        rationale=f"Clause Reviewer: {clause.rationale} | Evidence Reviewer: {evidence.rationale}",
+        source="unanimous",
+    )
+    return verdict.model_dump(mode="json")
+
+
+def _conservative_default(node_input: dict[str, Any]) -> dict[str, Any]:
+    """SPLIT path with no adjudicator available (its breaker is open): the
+    ground is flagged, never shipped, never guessed at."""
+    verdict = CourtVerdict(
+        ground_id=node_input["ground_id"],
+        outcome=CourtOutcome.UNRESOLVED_FLAGGED,
+        stance=ReviewStance.REJECT,
+        confidence=0.0,
+        cited_anchor_ids=(),
+        rationale=(
+            "Reviewers disagreed (or a citation was voided) and adjudication was "
+            "unavailable; the ground is flagged for human review rather than shipped."
+        ),
+        source="conservative_default",
+    )
+    return verdict.model_dump(mode="json")
+
+
+def _make_post_adjudicate_node(grounder: ContestedCitationGrounder | None) -> FunctionNode:
+    """Build the post-adjudication `FunctionNode`: applies the contested-
+    citation recheck and the conservative default when confidence or
+    re-grounding doesn't hold up.
+
+    A plain `FunctionNode`, deliberately — its event is never subject to the
+    `LlmAgent` output-clearing quirk, so this is also where the graph's
+    external output for the SPLIT-then-adjudicated path becomes trustworthy
+    to read straight off `event.output`.
+    """
+
+    async def _post_adjudicate(node_input: dict[str, Any]) -> dict[str, Any]:
+        adjudication = AdjudicatorOutput.model_validate(node_input)
+        resolved = adjudication.confidence >= tally.CONFIDENCE_THRESHOLD
+        if resolved and grounder is not None and adjudication.cited_anchor_ids:
+            resolved = await reground_contested_citations(adjudication.cited_anchor_ids, grounder)
+
+        if not resolved:
+            verdict = CourtVerdict(
+                ground_id=adjudication.ground_id,
+                outcome=CourtOutcome.UNRESOLVED_FLAGGED,
+                stance=ReviewStance.REJECT,
+                confidence=0.0,
+                cited_anchor_ids=(),
+                rationale=(
+                    "The adjudicator could not confidently resolve this ground, or one "
+                    "of its cited anchors failed a contested-citation recheck; flagged "
+                    "for human review rather than shipped."
+                ),
+                source="conservative_default",
+            )
+        else:
+            verdict = CourtVerdict(
+                ground_id=adjudication.ground_id,
+                outcome=CourtOutcome.RESOLVED,
+                stance=adjudication.stance,
+                confidence=adjudication.confidence,
+                cited_anchor_ids=adjudication.cited_anchor_ids,
+                rationale=adjudication.rationale,
+                source="adjudicated",
+            )
+        return verdict.model_dump(mode="json")
+
+    return FunctionNode(func=_post_adjudicate, name=POST_ADJUDICATE_NODE)
+
+
+def build_court_workflow(
+    clause_slice: ClauseSlice,
+    evidence_slice: EvidenceSlice,
+    *,
+    known_anchor_ids: frozenset[str],
+    adjudicator_model: str | BaseLlm | None,
+    clause_model: str | BaseLlm = config.INTERVIEW.model,
+    evidence_model: str | BaseLlm = config.INTERVIEW.model,
+    contested_citation_grounder: ContestedCitationGrounder | None = None,
+) -> Workflow:
+    """Construct the ADK workflow graph for one ground's adversarial review.
+
+    Args:
+        clause_slice: The Clause Reviewer's entire input for this ground.
+        evidence_slice: The Evidence Reviewer's entire input for this ground
+            (must share `clause_slice.ground_id`).
+        known_anchor_ids: The case's citation manifest — every clause ref
+            and evidence anchor id a reviewer is allowed to cite.
+        adjudicator_model: The adjudicator's model (string id or an injected
+            `BaseLlm` fake), or `None` to wire the SPLIT route straight to
+            the conservative default without ever building an adjudicator
+            node — the caller's signal that `AdjudicationBench.tier()` is
+            currently open.
+        clause_model: The Clause Reviewer's model (string id or a `BaseLlm`
+            fake). Defaults to the shared cheap worker tier.
+        evidence_model: The Evidence Reviewer's model (string id or a
+            `BaseLlm` fake). Defaults to the shared cheap worker tier.
+        contested_citation_grounder: The second-pass grounding port for an
+            adjudicated ground's cited anchors, or `None` to skip that check.
 
     Returns:
-        The constructed workflow, ready to run against a candidate ground.
+        The constructed workflow, ready to run against a single shared
+        `new_message` via an ADK `Runner`.
 
     Raises:
-        NotImplementedError: The workflow graph is not yet implemented.
+        ValueError: `clause_slice` and `evidence_slice` review different
+            grounds.
     """
-    raise NotImplementedError
+    if clause_slice.ground_id != evidence_slice.ground_id:
+        raise ValueError(
+            f"clause_slice and evidence_slice must review the same ground_id: "
+            f"{clause_slice.ground_id!r} vs {evidence_slice.ground_id!r}"
+        )
+
+    clause_agent = roles.build_clause_reviewer_agent(
+        clause_slice, model=clause_model, thinking_level=config.INTERVIEW.thinking_level
+    )
+    evidence_agent = roles.build_evidence_reviewer_agent(
+        evidence_slice, model=evidence_model, thinking_level=config.INTERVIEW.thinking_level
+    )
+    join = JoinNode(name=JOIN_NODE)
+    tally_node = _make_tally_node(known_anchor_ids)
+    finalize_clear_node = FunctionNode(func=_finalize_clear, name=FINALIZE_CLEAR_NODE)
+
+    if adjudicator_model is not None:
+        adjudicator_agent = roles.build_adjudicator_agent(
+            model=adjudicator_model, thinking_level=config.BENCH.thinking_level
+        )
+        post_adjudicate_node = _make_post_adjudicate_node(contested_citation_grounder)
+        split_edges = [
+            (tally_node, {"CLEAR": finalize_clear_node, "SPLIT": adjudicator_agent}),
+            (adjudicator_agent, post_adjudicate_node),
+        ]
+    else:
+        conservative_node = FunctionNode(func=_conservative_default, name=CONSERVATIVE_DEFAULT_NODE)
+        split_edges = [(tally_node, {"CLEAR": finalize_clear_node, "SPLIT": conservative_node})]
+
+    # Nested-tuple fan-out/fan-in -- the proven, non-obvious construction.
+    # A bare `(START, clause_agent, evidence_agent)` would be parsed as a
+    # sequential chain instead; see the module docstring and
+    # spike-adkCourt.md.
+    edges: list[Any] = [
+        (START, (clause_agent, evidence_agent)),
+        ((clause_agent, evidence_agent), join),
+        (join, tally_node),
+        *split_edges,
+    ]
+    return Workflow(name="court", edges=edges)
+
+
+async def run_court(
+    clause_slice: ClauseSlice,
+    evidence_slice: EvidenceSlice,
+    *,
+    known_anchor_ids: frozenset[str],
+    clause_model: str | BaseLlm = config.INTERVIEW.model,
+    evidence_model: str | BaseLlm = config.INTERVIEW.model,
+    bench: AdjudicationBench | None = None,
+    contested_citation_grounder: ContestedCitationGrounder | None = None,
+    session_service: BaseSessionService | None = None,
+) -> CourtVerdict:
+    """Run the court graph end-to-end for one ground and return its verdict.
+
+    Args:
+        clause_slice: The Clause Reviewer's input for this ground.
+        evidence_slice: The Evidence Reviewer's input for this ground.
+        known_anchor_ids: The case's citation manifest.
+        clause_model: The Clause Reviewer's model (string id or `BaseLlm` fake).
+        evidence_model: The Evidence Reviewer's model (string id or `BaseLlm` fake).
+        bench: The adjudicator's `AdjudicationBench`. Pass the same instance
+            back in across grounds/cases to preserve degrade-not-halt state;
+            defaults to a fresh, closed bench.
+        contested_citation_grounder: The second-pass grounding port, or
+            `None` to skip that check.
+        session_service: Injectable ADK session service; defaults to a
+            fresh in-memory one (fine for a single one-shot run).
+
+    Returns:
+        The graph's single `CourtVerdict` for this ground.
+
+    Raises:
+        RuntimeError: The graph did not produce exactly one terminal event
+            (a bug in the graph construction, not a normal outcome).
+    """
+    bench = bench or AdjudicationBench.default()
+    tier = bench.tier()
+    adjudicator_model: str | BaseLlm | None = tier.model if tier is not None else None
+
+    workflow = build_court_workflow(
+        clause_slice,
+        evidence_slice,
+        known_anchor_ids=known_anchor_ids,
+        adjudicator_model=adjudicator_model,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        contested_citation_grounder=contested_citation_grounder,
+    )
+    runner = Runner(
+        node=workflow,
+        app_name="setback-court",
+        session_service=session_service or InMemorySessionService(),
+        auto_create_session=True,
+    )
+
+    events: list[Event] = []
+    try:
+        async for event in runner.run_async(
+            user_id="setback-tribunal",
+            session_id=f"court-{clause_slice.ground_id}",
+            new_message=types.Content(role="user", parts=[types.Part(text="review this ground")]),
+        ):
+            events.append(event)
+    except Exception:
+        if adjudicator_model is not None:
+            bench.record_failure()
+        raise
+
+    if adjudicator_model is not None and any(
+        node_name_for_event(e) == ADJUDICATOR_NODE for e in events
+    ):
+        bench.record_success()
+
+    terminal_events = [e for e in events if node_name_for_event(e) in TERMINAL_NODES]
+    if len(terminal_events) != 1:
+        raise RuntimeError(
+            f"expected exactly one terminal court event, got {len(terminal_events)}: "
+            f"{[node_name_for_event(e) for e in events]}"
+        )
+    return CourtVerdict.model_validate(terminal_events[0].output)
