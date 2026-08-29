@@ -66,6 +66,7 @@ from setback.console.guards import (
     per_case_interview_turn_guard,
     per_ip_case_creation_guard,
 )
+from setback.evidence.dossier import ProvenanceGrade
 from setback.evidence.overlays import ROLE_CSS_CLASS_SUFFIX, ROLE_LEGEND_TEXT, OverlayRole
 from setback.ingest.tracker import (
     DocumentNotFoundError,
@@ -1561,11 +1562,23 @@ def _render_document_uploaded_item(case_id: str, event: CaseEvent) -> str:
     document_id = payload.get("document_id")
     kind = _classify_document_kind_offline(filename, "")
     kind_label = _DOCUMENT_KIND_LABELS.get(kind, "Document")
-    title = _humanize_filename(filename)
+    # LEO-FEEDBACK-UIUX.md §4: the Street View grade-B fallback
+    # (`job.pipeline._record_street_view_fallback_event`) is the one
+    # `document_uploaded` producer that isn't a resident's own upload --
+    # it carries its own `provenance_grade`/attribution rather than a
+    # human-typed filename, so it gets its own title/badge instead of
+    # being mislabelled "Your photo".
+    is_street_view = payload.get("provenance_grade") == ProvenanceGrade.STREET_VIEW_SOLAR_FALLBACK
+    title = "Street View (archival)" if is_street_view else _humanize_filename(filename)
     uploaded_at = _format_clock_time(event.recorded_at)
     is_photo = _is_photo_upload(filename, content_type)
     grade_badge = ""
-    if is_photo:
+    if is_street_view:
+        grade_badge = (
+            f'<span class="tag tag--grade-b" title="Provenance grade B -- {_esc(filename)}">'
+            "Archival Street View</span>"
+        )
+    elif is_photo:
         grade_badge = (
             '<span class="tag tag--grade-a" title="Provenance grade A -- your own photo">'
             "Your photo</span>"

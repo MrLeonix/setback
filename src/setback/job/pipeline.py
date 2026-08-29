@@ -1078,8 +1078,61 @@ class RealPipelineRunner:
         title = f"Street View fallback ({fallback.attribution})"
         return (_STREET_VIEW_DOCUMENT_ID, title, fallback.image_bytes, fallback.provenance_grade)
 
+    async def _record_street_view_fallback_event(
+        self,
+        case_id: str,
+        fallback_document: tuple[str, str, bytes, ProvenanceGrade],
+        *,
+        store: CaseStore | None,
+    ) -> None:
+        """Surface a fetched Street View fallback to the resident-facing
+        Evidence section, not only to the grounding model.
+
+        **The bug this closes** (LEO-FEEDBACK-UIUX.md §4, "verify the
+        Street View fallback... actually fires and renders"): before this
+        fix, `_build_dossier` registered the fallback in the in-memory
+        `CaseDossier` for grounding purposes only -- it never appended a
+        `document_uploaded` event, the *only* event type `console.app`'s
+        `_SECTION_FOR_EVENT_TYPE` map routes to the "Evidence" section. The
+        fetch itself worked correctly (confirmed live against real Street
+        View coverage during the wave-9 populate pass -- see that pass's
+        "Blocker 2"), but a resident's case page rendered an empty
+        Evidence section regardless, silently, with no error anywhere:
+        this was a missing event, not a failed request.
+
+        Durably stores the image bytes via `self._document_source` (when
+        it also satisfies `EvidenceUploadStore` -- `GcsEvidenceStore` in
+        production, the in-memory double in every offline test) at the
+        same `document_id` the dossier already uses, so the existing
+        `GET /api/cases/{case_id}/documents/{document_id}` route serves it
+        back exactly like any resident-uploaded photo, needing no new
+        storage or route. `store` is optional and a no-op when omitted (a
+        handful of this module's white-box tests call `_build_dossier`
+        directly with no store, and degrading rather than requiring one
+        keeps those unaffected) -- `run()` always passes a real one.
+        """
+        if store is None:
+            return
+        document_id, title, image_bytes, grade = fallback_document
+        if isinstance(self._document_source, EvidenceUploadStore):
+            await self._document_source.add_evidence_document(
+                case_id, document_id, image_bytes, content_type="image/jpeg"
+            )
+        await store.append_event(
+            case_id,
+            f"document-uploaded:{document_id}",
+            "document_uploaded",
+            payload={
+                "document_id": document_id,
+                "filename": title,
+                "content_type": "image/jpeg",
+                "size_bytes": len(image_bytes),
+                "provenance_grade": grade.value,
+            },
+        )
+
     async def _build_dossier(
-        self, case_id: str, resume: ResumeState
+        self, case_id: str, resume: ResumeState, *, store: CaseStore | None = None
     ) -> tuple[CaseDossier, _IngestOutcome]:
         application_number = (
             resume.case.application_number if resume.case is not None else _DEMO_PAN
@@ -1143,6 +1196,9 @@ class RealPipelineRunner:
             fallback_document = await self._street_view_fallback_document(da_record.address)
             if fallback_document is not None:
                 photo_documents.append(fallback_document)
+                await self._record_street_view_fallback_event(
+                    case_id, fallback_document, store=store
+                )
 
         dossier = build_dossier(
             da_record=da_record,
@@ -1187,7 +1243,7 @@ class RealPipelineRunner:
             )
             return
 
-        dossier, ingest_outcome = await self._build_dossier(case_id, resume)
+        dossier, ingest_outcome = await self._build_dossier(case_id, resume, store=store)
         await store.append_event(
             case_id,
             f"ingest-resolved:{case_id}",

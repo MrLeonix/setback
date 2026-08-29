@@ -1929,7 +1929,9 @@ async def test_build_dossier_adds_a_street_view_fallback_when_no_resident_photo_
             street_view_secret_accessor=_fake_street_view_secret_accessor,
         )
         resume = await resume_case(store, case_id)
-        dossier, ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+        dossier, ingest_outcome = await runner._build_dossier(  # noqa: SLF001
+            case_id, resume, store=store
+        )
 
     assert ingest_outcome.used_demo_fixture is False
     street_view_doc = dossier.documents[_STREET_VIEW_DOCUMENT_ID]
@@ -1937,6 +1939,39 @@ async def test_build_dossier_adds_a_street_view_fallback_when_no_resident_photo_
     assert "(c) Google Street View, 2023-01" in street_view_doc.title
     anchor = next(a for a in dossier.anchors.values() if a.source_doc == _STREET_VIEW_DOCUMENT_ID)
     assert "(c) Google Street View, 2023-01" in anchor.caption
+
+    # LEO-FEEDBACK-UIUX.md §4: the fallback must actually render on the
+    # resident-facing case page, not just feed the grounding model -- a
+    # real gap found live against real (non-fixture) cases (see the
+    # populate pass's "Blocker 2"), where the dossier carried the fallback
+    # correctly but nothing ever told the console's Evidence section it
+    # existed. A `document_uploaded` event (the only event type the
+    # Evidence section renders from -- console/app.py's own
+    # `_SECTION_FOR_EVENT_TYPE` map) must be recorded, and the image bytes
+    # must be durably retrievable through the same
+    # `GET /api/cases/{id}/documents/{document_id}` route every other
+    # doc-card uses.
+    events = await store.list_events(case_id)
+    street_view_events = [
+        e
+        for e in events
+        if e.event_type == "document_uploaded"
+        and e.payload.get("document_id") == _STREET_VIEW_DOCUMENT_ID
+    ]
+    assert len(street_view_events) == 1
+    payload = street_view_events[0].payload
+    assert payload["content_type"] == "image/jpeg"
+    assert payload["provenance_grade"] == "B"
+    assert "(c) Google Street View, 2023-01" in payload["filename"]
+    stored_bytes = await document_source.download_document(
+        ExhibitedDocument(
+            document_id=_STREET_VIEW_DOCUMENT_ID,
+            title="street view",
+            source="street-view-fallback",
+            case_id=case_id,
+        )
+    )
+    assert stored_bytes == _tiny_white_png(50, 50)
 
 
 @respx.mock
@@ -1987,9 +2022,17 @@ async def test_build_dossier_does_not_fetch_street_view_when_a_resident_photo_ex
             street_view_secret_accessor=_fake_street_view_secret_accessor,
         )
         resume = await resume_case(store, case_id)
-        dossier, _ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+        dossier, _ingest_outcome = await runner._build_dossier(  # noqa: SLF001
+            case_id, resume, store=store
+        )
 
     assert _STREET_VIEW_DOCUMENT_ID not in dossier.documents
+    events = await store.list_events(case_id)
+    assert not any(
+        e.event_type == "document_uploaded"
+        and e.payload.get("document_id") == _STREET_VIEW_DOCUMENT_ID
+        for e in events
+    )
 
 
 async def test_street_view_fallback_document_returns_none_without_an_ingest_client() -> None:

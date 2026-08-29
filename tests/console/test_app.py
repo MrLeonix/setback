@@ -1410,6 +1410,43 @@ def test_document_uploaded_photo_gets_your_photo_provenance_tag(client: TestClie
     assert "Your photo" in response.text
 
 
+def test_street_view_fallback_document_renders_in_the_evidence_section(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """LEO-FEEDBACK-UIUX.md §4 / wave-9 populate pass "Blocker 2": a
+    `job.pipeline`-recorded Street View fallback (a `document_uploaded`
+    event carrying `provenance_grade: "B"`, never a resident's own upload)
+    must render as a real, attributed doc-card in the Evidence section --
+    found live to be silently absent (the fetch succeeded but nothing ever
+    told the console it existed). Regression-tests the renderer contract
+    directly, since reproducing the live pipeline's own network calls is
+    out of this module's scope."""
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "document-uploaded:street-view-fallback",
+            "document_uploaded",
+            payload={
+                "document_id": "street-view-fallback",
+                "filename": "Street View fallback ((c) Google Street View, 2024-06)",
+                "content_type": "image/jpeg",
+                "size_bytes": 4096,
+                "provenance_grade": "B",
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert 'class="tag tag--grade-b"' in response.text
+    assert "Archival Street View" in response.text
+    assert "(c) Google Street View, 2024-06" in response.text
+    expected_src = f"/api/cases/{case_id}/documents/street-view-fallback"
+    assert f'<img class="doc-card__thumb" src="{expected_src}"' in response.text
+    # Never mislabelled as the resident's own photo.
+    assert "Your photo" not in response.text
+
+
 # --- doc-card real thumbnails for uploaded photo evidence -------------------
 
 
