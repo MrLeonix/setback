@@ -10,9 +10,9 @@ progress.
 Wiring only in this work package (0 live-model-call budget in its tests):
 :func:`run_job` depends on a :class:`PipelineRunner` port rather than
 calling `court`/`gate`/`dispatch` directly, so it is fully testable with a
-fake pipeline today and becomes real the moment those packages land --
-no change needed here, only a new `PipelineRunner` implementation plugged
-into :func:`main`.
+fake pipeline today. The production port implementation,
+:class:`~setback.job.pipeline.RealPipelineRunner`, now lives in
+:mod:`setback.job.pipeline` and is wired into :func:`main` below.
 """
 
 from __future__ import annotations
@@ -42,24 +42,6 @@ class PipelineRunner(Protocol):
     """
 
     async def run(self, case_id: str, resume: ResumeState, store: CaseStore) -> None: ...
-
-
-class _RealPipelineRunner:
-    """The production `PipelineRunner`.
-
-    Deliberately not implemented yet -- `court.graph`, `gate.validator`,
-    and `dispatch.composer` are owned by other work packages in this wave
-    and are still stubs as of this file. Calling `main()` for a real case
-    today will surface that as a failed job (exit nonzero, a `job_failed`
-    event recorded) rather than crash uncaught or silently no-op, which is
-    the correct wiring-only behaviour until those packages land -- no
-    change will be needed here beyond filling in this method's body.
-    """
-
-    async def run(self, case_id: str, resume: ResumeState, store: CaseStore) -> None:
-        raise NotImplementedError(
-            "the review pipeline (court/gate/dispatch) is not yet wired into the job"
-        )
 
 
 @dataclass(frozen=True)
@@ -134,7 +116,7 @@ def main(
 
     Reads `CASE_ID` from `env` (defaults to `os.environ`), builds the
     production `store`/`pipeline` (defaults to `FirestoreCaseStore` and
-    `_RealPipelineRunner` -- constructed lazily, only once `CASE_ID` is
+    `RealPipelineRunner` -- constructed lazily, only once `CASE_ID` is
     confirmed present, and only via the factory parameters so a test can
     inject fakes and never touch a real GCP client), runs the job, and
     raises `SystemExit(1)` on any failure (missing `CASE_ID`, an unknown
@@ -148,7 +130,7 @@ def main(
         raise SystemExit(1)
 
     store = store_factory() if store_factory is not None else _default_store_factory()
-    pipeline = pipeline_factory() if pipeline_factory is not None else _RealPipelineRunner()
+    pipeline = pipeline_factory() if pipeline_factory is not None else _default_pipeline_factory()
 
     result = asyncio.run(run_job(case_id, store=store, pipeline=pipeline))
     if not result.success:
@@ -160,6 +142,29 @@ def _default_store_factory() -> CaseStore:
     from setback.state.firestore import FirestoreCaseStore
 
     return FirestoreCaseStore()
+
+
+def _default_pipeline_factory() -> PipelineRunner:
+    """Build the production `PipelineRunner`.
+
+    A fresh `UserUploadedDocumentSource` here will not find any documents a
+    resident uploaded to a separate `setback-console` process (see
+    `job.pipeline`'s module docstring's "known gaps" note) -- a real Cloud
+    Run Job execution therefore degrades to citation-only grounds rather
+    than crashing. Local/dev callers that want uploaded documents visible
+    to the job should instead construct `RealPipelineRunner` directly with
+    the same `UserUploadedDocumentSource` instance the console app is using
+    (see `console.app`'s in-process trigger).
+    """
+    from setback.ingest.tracker import UserUploadedDocumentSource
+    from setback.job.pipeline import RealPipelineRunner
+    from setback.models.client import ModelClient
+
+    return RealPipelineRunner(
+        document_source=UserUploadedDocumentSource(),
+        polisher=ModelClient(),
+        grounding_client=ModelClient(),
+    )
 
 
 if __name__ == "__main__":

@@ -38,23 +38,28 @@ import asyncio
 import hashlib
 import html
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
+import os
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from setback.ingest.tracker import UserUploadedDocumentSource
 from setback.interview.flow import (
+    ConcernType,
     InterviewFlow,
+    InterviewStage,
     InterviewTurn,
     ModelQuestionComposer,
     QuestionComposer,
+    RaisedConcern,
     capture_refusal_feedback,
 )
+from setback.models.client import ModelClient
 from setback.state.firestore import (
     CaseEvent,
     CaseNotFoundError,
@@ -65,6 +70,29 @@ from setback.state.firestore import (
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _DEFAULT_MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB
+
+_CONCERN_CATEGORY: Mapping[ConcernType, str] = {
+    ConcernType.HEIGHT_BULK: "epi_dcp_provisions",
+    ConcernType.PRIVACY_OVERLOOKING: "environmental_and_social_impacts",
+    ConcernType.OVERSHADOWING: "environmental_and_social_impacts",
+    ConcernType.TREES_LANDSCAPE: "environmental_and_social_impacts",
+    ConcernType.TRAFFIC_PARKING: "environmental_and_social_impacts",
+    ConcernType.HERITAGE_CHARACTER: "epi_dcp_provisions",
+    ConcernType.VIEW_LOSS: "private_view_loss",
+    ConcernType.PROPERTY_VALUE: "property_value",
+    ConcernType.NOISE: "environmental_and_social_impacts",
+    ConcernType.OTHER: "environmental_and_social_impacts",
+}
+"""Maps the interview's light keyword-matched `ConcernType` triage onto the
+s4.15 category the gate (`gate.relevance`) rules on. This is a deliberate,
+demo-scope simplification -- picking the *closest* statutory head (or the
+matching non-planning ground) for each concern type, so every confirmed
+concern reaches the gate as a real candidate ground rather than being
+silently dropped. `HEIGHT_BULK`/`HERITAGE_CHARACTER` map to
+`epi_dcp_provisions` since this build's zoning controls (a height limit, a
+heritage flag) are LEP/DCP-hooked, citable clauses, not bare impacts;
+`VIEW_LOSS` maps to the explicit `private_view_loss` non-planning ground
+since a bare view-loss complaint has no control hook by default."""
 
 
 class JobTrigger(Protocol):
@@ -90,6 +118,54 @@ class LoggingJobTrigger:
 
     async def trigger(self, case_id: str) -> None:
         self.triggered_case_ids.append(case_id)
+
+
+class LocalPipelineJobTrigger:
+    """A local/dev `JobTrigger` that runs the real tribunal pipeline
+    in-process, as a background `asyncio` task, sharing this console
+    process's own `store`/`document_source` instances.
+
+    Enabled only when `SETBACK_LOCAL_TRIBUNAL=1` is set (see
+    `_build_production_app`) -- the deployed Cloud Run Service never sets
+    it, so it never runs the tribunal pipeline inside a customer-facing web
+    request; a real `setback-tribunal` Cloud Run Job execution remains the
+    production path (`LoggingJobTrigger`, unchanged). This trigger exists
+    because a real Cloud Run Job execution runs in a separate container
+    with no access to this process's in-memory `UserUploadedDocumentSource`
+    (see `job.pipeline`'s module docstring) -- sharing the instance
+    directly is exactly how local end-to-end testing sidesteps that gap.
+
+    Fire-and-forget: `trigger` schedules the run and returns immediately
+    (matching the production route's 202-Accepted semantics) rather than
+    blocking the HTTP request for the whole tribunal run; the SSE stream
+    and case page pick up every event as `RealPipelineRunner` persists it.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: CaseStore,
+        document_source: UserUploadedDocumentSource,
+        model_client: ModelClient,
+    ) -> None:
+        self._store = store
+        self._document_source = document_source
+        self._model_client = model_client
+        self._tasks: list[asyncio.Task[None]] = []
+
+    async def trigger(self, case_id: str) -> None:
+        self._tasks.append(asyncio.create_task(self._run(case_id)))
+
+    async def _run(self, case_id: str) -> None:
+        from setback.job.main import run_job
+        from setback.job.pipeline import RealPipelineRunner
+
+        pipeline = RealPipelineRunner(
+            document_source=self._document_source,
+            polisher=self._model_client,
+            grounding_client=self._model_client,
+        )
+        await run_job(case_id, store=self._store, pipeline=pipeline)
 
 
 # --- request/response bodies ---------------------------------------------------
@@ -147,12 +223,53 @@ async def _persist_resident_answer(store: CaseStore, case_id: str, stage: str, a
     )
 
 
+def _ground_id_for(case_id: str, concern: RaisedConcern) -> str:
+    """A deterministic ground id from the confirmed concern's identifying
+    content, so re-processing the same confirmation (a retried request) is
+    idempotent rather than proposing a duplicate ground."""
+    digest = hashlib.sha256(
+        f"{case_id}:{concern.concern_type.value}:{concern.initial_statement}".encode()
+    ).hexdigest()[:16]
+    return f"ground-{digest}"
+
+
+async def _propose_ground_for_confirmed_concern(
+    store: CaseStore, case_id: str, concern: RaisedConcern
+) -> None:
+    """Propose a `CandidateGround` the moment a concern is confirmed
+    (`InterviewFlow._handle_confirming`'s affirm branch), and tag it with
+    the s4.15 category `job.pipeline.RealPipelineRunner` later reads back
+    to run the court/gate pipeline for this ground. This is the only place
+    the interview's parsed `RaisedConcern` (with its classified
+    `ConcernType`) is available -- the tribunal job never re-parses the
+    transcript itself, per `job.pipeline`'s module docstring.
+    """
+    ground_id = _ground_id_for(case_id, concern)
+    claim = concern.initial_statement
+    if concern.clarification:
+        claim = f"{claim} {concern.clarification}"
+    await store.propose_ground(case_id, ground_id, claim=claim)
+    category = _CONCERN_CATEGORY.get(concern.concern_type, "environmental_and_social_impacts")
+    await store.append_event(
+        case_id,
+        f"ground-category:{ground_id}",
+        "ground_category_assigned",
+        payload={
+            "ground_id": ground_id,
+            "category": category,
+            "concern_type": concern.concern_type.value,
+            "evidence_document_ids": list(concern.evidence_document_ids),
+        },
+    )
+
+
 async def _sse_event_stream(
     store: CaseStore,
     case_id: str,
     *,
     poll_interval: float,
     idle_timeout: float | None,
+    after: int = -1,
 ) -> AsyncIterator[str]:
     """Yield newly appended case events, in sequence order, as SSE `data:`
     lines, polling `store` for new ones.
@@ -162,12 +279,24 @@ async def _sse_event_stream(
     duration of a Cloud Run Service request. Tests pass a small
     `idle_timeout` so the stream terminates deterministically once it has
     caught up and gone quiet for that long, rather than hanging.
+
+    `after`: skip every event at or below this sequence number. A fresh
+    page load opens a brand-new SSE connection with an empty `seen` set, so
+    without this cursor every event the case already has would be replayed
+    and treated as "new" by the client -- which reloads the page on any
+    event it doesn't already know how to handle in place, causing an
+    infinite reload loop the moment a case has any history at all. The
+    case page renders its own last-seen sequence number for the client to
+    pass back here (see `render_case_page`/`app.js`).
     """
     seen: set[str] = set()
     idle_elapsed = 0.0
     while True:
         events = await store.list_events(case_id)
-        new_events = sorted((e for e in events if e.event_id not in seen), key=lambda e: e.sequence)
+        new_events = sorted(
+            (e for e in events if e.event_id not in seen and e.sequence > after),
+            key=lambda e: e.sequence,
+        )
         if new_events:
             idle_elapsed = 0.0
         for event in new_events:
@@ -261,6 +390,8 @@ def create_app(
         await _persist_resident_answer(store, case_id, current_stage.value, body.answer)
         turn = await flow.submit(body.answer)
         await _persist_system_turn(store, case_id, turn)
+        if turn.stage is InterviewStage.ASK_MORE and flow.concerns:
+            await _propose_ground_for_confirmed_concern(store, case_id, flow.concerns[-1])
         return _turn_to_json(turn, flow.transcript)
 
     @app.post("/api/cases/{case_id}/documents")
@@ -304,7 +435,7 @@ def create_app(
         return {"case_id": case_id, "status": "tribunal_requested"}
 
     @app.get("/api/cases/{case_id}/events")
-    async def stream_events(case_id: str) -> StreamingResponse:
+    async def stream_events(case_id: str, after: int = -1) -> StreamingResponse:
         await _require_case(case_id)
         return StreamingResponse(
             _sse_event_stream(
@@ -312,9 +443,41 @@ def create_app(
                 case_id,
                 poll_interval=sse_poll_interval_seconds,
                 idle_timeout=sse_idle_timeout_seconds,
+                after=after,
             ),
             media_type="text/event-stream",
         )
+
+    async def _latest_submission_payload(case_id: str) -> Mapping[str, Any]:
+        events = await store.list_events(case_id)
+        submissions = [e for e in events if e.event_type == "submission_composed"]
+        if not submissions:
+            raise HTTPException(status_code=404, detail="no submission has been composed yet")
+        return max(submissions, key=lambda e: e.sequence).payload
+
+    @app.get("/api/cases/{case_id}/submission.md", response_class=PlainTextResponse)
+    async def download_submission_markdown(case_id: str) -> str:
+        await _require_case(case_id)
+        payload = await _latest_submission_payload(case_id)
+        return str(payload.get("submission_markdown", ""))
+
+    @app.get("/api/cases/{case_id}/submission.html", response_class=HTMLResponse)
+    async def download_submission_html(case_id: str) -> str:
+        await _require_case(case_id)
+        payload = await _latest_submission_payload(case_id)
+        return str(payload.get("submission_html", ""))
+
+    @app.get("/api/cases/{case_id}/refusals.md", response_class=PlainTextResponse)
+    async def download_refusals_markdown(case_id: str) -> str:
+        await _require_case(case_id)
+        payload = await _latest_submission_payload(case_id)
+        return str(payload.get("refusals_markdown", ""))
+
+    @app.get("/api/cases/{case_id}/refusals.html", response_class=HTMLResponse)
+    async def download_refusals_html(case_id: str) -> str:
+        await _require_case(case_id)
+        payload = await _latest_submission_payload(case_id)
+        return str(payload.get("refusals_html", ""))
 
     @app.post("/api/cases/{case_id}/grounds/{ground_id}/feedback")
     async def refusal_feedback(
@@ -415,22 +578,96 @@ _EVENT_SECTION_TITLES: Mapping[str, str] = {
     "review_verdict": "Reviewer opinions",
     "adjudication_decision": "Adjudication",
     "gate_decision": "Gate decisions",
+    "annotated_overlay": "Annotated evidence overlay",
     "resident_refusal_feedback": "Resident feedback on refusals",
     "submission_composed": "Submission documents",
     "tribunal_requested": "Tribunal",
 }
 
 
-def _render_events_section(title: str, events: Sequence[CaseEvent]) -> str:
+def _render_review_verdict_item(event: CaseEvent) -> str:
+    payload = event.payload
+    if payload.get("voided"):
+        return (
+            f'<li class="review-verdict review-verdict--voided">'
+            f"<strong>{_esc(payload.get('reviewer', 'reviewer'))}</strong> "
+            "(opinion voided -- cited an anchor outside the case dossier)</li>"
+        )
+    return (
+        f'<li class="review-verdict review-verdict--{_esc(payload.get("stance", ""))}">'
+        f"<strong>{_esc(payload.get('reviewer', 'reviewer'))}</strong> "
+        f"&mdash; {_esc(payload.get('stance', ''))} "
+        f"(confidence {_esc(payload.get('confidence', ''))})"
+        f"<br><em>{_esc(payload.get('rationale', ''))}</em></li>"
+    )
+
+
+def _render_gate_decision_item(event: CaseEvent) -> str:
+    payload = event.payload
+    return (
+        f'<li class="gate-decision gate-decision--{_esc(payload.get("status", ""))}">'
+        f"<strong>{_esc(payload.get('status', ''))}</strong> "
+        f"({_esc(payload.get('statutory_basis', ''))})<br>"
+        f"{_esc(payload.get('explanation', ''))}</li>"
+    )
+
+
+def _render_annotated_overlay_item(event: CaseEvent) -> str:
+    payload = event.payload
+    mime_type = _esc(payload.get("mime_type", "image/png"))
+    image_base64 = _esc(payload.get("image_base64", ""))
+    return (
+        '<li class="annotated-overlay">'
+        f'<img src="data:{mime_type};base64,{image_base64}" alt="Annotated evidence overlay">'
+        "</li>"
+    )
+
+
+def _render_submission_composed_item(case_id: str, event: CaseEvent) -> str:
+    submission_html = str(event.payload.get("submission_html", ""))
+    refusals_html = str(event.payload.get("refusals_html", ""))
+    base = f"/api/cases/{_esc(case_id)}"
+    return f"""<li class="submission-package">
+      <div class="document-preview">{submission_html}</div>
+      <p class="document-downloads">
+        <a href="{base}/submission.md" download>Download submission (.md)</a>
+        &middot;
+        <a href="{base}/submission.html" download>Download submission (.html)</a>
+      </p>
+      <div class="document-preview">{refusals_html}</div>
+      <p class="document-downloads">
+        <a href="{base}/refusals.md" download>Download refusals explainer (.md)</a>
+        &middot;
+        <a href="{base}/refusals.html" download>Download refusals explainer (.html)</a>
+      </p>
+    </li>"""
+
+
+_EVENT_ITEM_RENDERERS: Mapping[str, Callable[[str, CaseEvent], str]] = {
+    "review_verdict": lambda _case_id, e: _render_review_verdict_item(e),
+    "gate_decision": lambda _case_id, e: _render_gate_decision_item(e),
+    "annotated_overlay": lambda _case_id, e: _render_annotated_overlay_item(e),
+    "submission_composed": _render_submission_composed_item,
+}
+
+
+def _render_events_section(
+    case_id: str, event_type: str, title: str, events: Sequence[CaseEvent]
+) -> str:
     if not events:
         return (
             f'<section class="card"><h3>{_esc(title)}</h3>'
             '<p class="empty">Nothing yet.</p></section>'
         )
-    items = "".join(
-        f'<li><span class="event-seq">#{e.sequence}</span> {_esc(json.dumps(dict(e.payload)))}</li>'
-        for e in events
-    )
+    renderer = _EVENT_ITEM_RENDERERS.get(event_type)
+    if renderer is not None:
+        items = "".join(renderer(case_id, e) for e in events)
+    else:
+        items = "".join(
+            f'<li><span class="event-seq">#{e.sequence}</span> '
+            f"{_esc(json.dumps(dict(e.payload)))}</li>"
+            for e in events
+        )
     return (
         f'<section class="card"><h3>{_esc(title)}</h3><ul class="event-list">{items}</ul></section>'
     )
@@ -466,10 +703,11 @@ def render_case_page(
         by_type.setdefault(event.event_type, []).append(event)
 
     sections = "".join(
-        _render_events_section(title, by_type.get(event_type, ()))
+        _render_events_section(case.case_id, event_type, title, by_type.get(event_type, ()))
         for event_type, title in _EVENT_SECTION_TITLES.items()
     )
     grounds_section = _render_grounds_section(grounds)
+    last_sequence = max((e.sequence for e in events), default=-1)
 
     return f"""
 <!doctype html>
@@ -479,7 +717,7 @@ def render_case_page(
   <title>Setback -- {_esc(case.application_number)}</title>
   {_PAGE_STYLE}
 </head>
-<body data-case-id="{_esc(case.case_id)}">
+<body data-case-id="{_esc(case.case_id)}" data-last-sequence="{last_sequence}">
   <header class="topbar">
     <h1>Setback</h1>
     <p class="tagline">Case {_esc(case.application_number)} &middot; {_esc(case.case_id)}</p>
@@ -519,11 +757,30 @@ def _build_production_app() -> FastAPI:
     this runs safely at import time (needed for `uvicorn
     setback.console.app:app`) without ever touching the network during
     test collection.
+
+    `SETBACK_LOCAL_TRIBUNAL=1` swaps in `LocalPipelineJobTrigger` (see its
+    docstring) for local/dev testing -- unset (the default, and always
+    unset on the deployed Cloud Run Service), `start_tribunal` keeps only
+    recording the request via `LoggingJobTrigger`, exactly as before.
     """
-    from setback.models.client import ModelClient
     from setback.state.firestore import FirestoreCaseStore
 
-    return create_app(FirestoreCaseStore(), composer=ModelQuestionComposer(ModelClient()))
+    store = FirestoreCaseStore()
+    document_source = UserUploadedDocumentSource()
+    model_client = ModelClient()
+
+    job_trigger: JobTrigger | None = None
+    if os.environ.get("SETBACK_LOCAL_TRIBUNAL") == "1":
+        job_trigger = LocalPipelineJobTrigger(
+            store=store, document_source=document_source, model_client=model_client
+        )
+
+    return create_app(
+        store,
+        composer=ModelQuestionComposer(model_client),
+        document_source=document_source,
+        job_trigger=job_trigger,
+    )
 
 
 app = _build_production_app()

@@ -43,6 +43,8 @@ Built from the proven construction in ``spike-adkCourt.md``, exactly:
 
 from __future__ import annotations
 
+import os
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -53,9 +55,27 @@ from google.adk.runners import Runner
 from google.adk.sessions import BaseSessionService, InMemorySessionService
 from google.adk.workflow import START, FunctionNode, JoinNode, Workflow
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from setback import config
+
+# A bare model-id string handed to `google.adk.agents.Agent` (every real
+# reviewer/adjudicator node this module builds) constructs its OWN internal
+# `genai.Client` lazily, on first use -- unlike `setback.models.client.
+# ModelClient`, which passes `vertexai=True, project=..., location=...`
+# explicitly. ADK's client instead reads these three environment variables
+# (falling back to the public Gemini Developer API, which then fails with
+# "No API key was provided", if they are unset). This is the exact Vertex
+# config the live spike used (`spike-adkCourt.md`: "Vertex config:
+# GOOGLE_GENAI_USE_VERTEXAI=TRUE, GOOGLE_CLOUD_PROJECT=vexcourt-agent,
+# GOOGLE_CLOUD_LOCATION=global") -- set here, once, at import time, from
+# `setback.config`'s own project/location so every ADK agent this module
+# builds is correctly Vertex-routed under ADC without every caller needing
+# to remember to set them. `setdefault` never overrides an operator's own
+# explicit environment configuration.
+os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", config.GCP_PROJECT)
+os.environ.setdefault("GOOGLE_CLOUD_LOCATION", config.VERTEX_LOCATION)
 from setback.court import roles, tally
 from setback.court.bench import (
     AdjudicationBench,
@@ -322,40 +342,40 @@ def build_court_workflow(
     return Workflow(name="court", edges=edges)
 
 
-async def run_court(
+class CourtRunResult(BaseModel):
+    """A court run's final verdict, plus the two raw reviewer opinions the
+    tally node computed on the way there -- for a caller (the tribunal job)
+    that needs to show both reviewer opinions to the resident, not just the
+    final decision.
+
+    `clause_review`/`evidence_review` are `None` exactly when
+    :func:`setback.court.tally.void_if_uncited` voided that opinion (an
+    uncited-anchor citation failure), matching the semantics `run_court`
+    itself already applies internally -- never the raw, uncounted opinion.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    verdict: CourtVerdict
+    clause_review: ReviewOutput | None
+    evidence_review: ReviewOutput | None
+
+
+async def _run_court_events(
     clause_slice: ClauseSlice,
     evidence_slice: EvidenceSlice,
     *,
     known_anchor_ids: frozenset[str],
-    clause_model: str | BaseLlm = config.INTERVIEW.model,
-    evidence_model: str | BaseLlm = config.INTERVIEW.model,
-    bench: AdjudicationBench | None = None,
-    contested_citation_grounder: ContestedCitationGrounder | None = None,
-    session_service: BaseSessionService | None = None,
-) -> CourtVerdict:
-    """Run the court graph end-to-end for one ground and return its verdict.
-
-    Args:
-        clause_slice: The Clause Reviewer's input for this ground.
-        evidence_slice: The Evidence Reviewer's input for this ground.
-        known_anchor_ids: The case's citation manifest.
-        clause_model: The Clause Reviewer's model (string id or `BaseLlm` fake).
-        evidence_model: The Evidence Reviewer's model (string id or `BaseLlm` fake).
-        bench: The adjudicator's `AdjudicationBench`. Pass the same instance
-            back in across grounds/cases to preserve degrade-not-halt state;
-            defaults to a fresh, closed bench.
-        contested_citation_grounder: The second-pass grounding port, or
-            `None` to skip that check.
-        session_service: Injectable ADK session service; defaults to a
-            fresh in-memory one (fine for a single one-shot run).
-
-    Returns:
-        The graph's single `CourtVerdict` for this ground.
-
-    Raises:
-        RuntimeError: The graph did not produce exactly one terminal event
-            (a bug in the graph construction, not a normal outcome).
-    """
+    clause_model: str | BaseLlm,
+    evidence_model: str | BaseLlm,
+    bench: AdjudicationBench | None,
+    contested_citation_grounder: ContestedCitationGrounder | None,
+    session_service: BaseSessionService | None,
+) -> tuple[CourtVerdict, list[Event]]:
+    """Run the court graph end-to-end for one ground, returning both its
+    final verdict and the full raw event list -- the shared implementation
+    behind :func:`run_court` and :func:`run_court_verbose`, so the two never
+    drift on how the graph is actually driven."""
     bench = bench or AdjudicationBench.default()
     tier = bench.tier()
     adjudicator_model: str | BaseLlm | None = tier.model if tier is not None else None
@@ -400,4 +420,110 @@ async def run_court(
             f"expected exactly one terminal court event, got {len(terminal_events)}: "
             f"{[node_name_for_event(e) for e in events]}"
         )
-    return CourtVerdict.model_validate(terminal_events[0].output)
+    verdict = CourtVerdict.model_validate(terminal_events[0].output)
+    return verdict, events
+
+
+def _extract_reviews(events: Sequence[Event]) -> tuple[ReviewOutput | None, ReviewOutput | None]:
+    """Pull the (possibly voided-to-`None`) Clause/Evidence reviewer
+    opinions straight off the tally node's `FunctionNode` event.
+
+    Safe to read directly off `.output`: only `LlmAgent` events have their
+    `.output` cleared by the ADK `Runner` (see the module docstring); the
+    tally node is a plain `FunctionNode`, so its payload -- built in
+    `_make_tally_node` from the already-`void_if_uncited`-filtered opinions
+    -- is exactly what a caller needs, with no re-parsing of model text.
+    """
+    for event in events:
+        if node_name_for_event(event) == TALLY_NODE and isinstance(event.output, dict):
+            clause_raw = event.output.get("clause")
+            evidence_raw = event.output.get("evidence")
+            clause = ReviewOutput.model_validate(clause_raw) if clause_raw is not None else None
+            evidence = (
+                ReviewOutput.model_validate(evidence_raw) if evidence_raw is not None else None
+            )
+            return clause, evidence
+    return None, None
+
+
+async def run_court(
+    clause_slice: ClauseSlice,
+    evidence_slice: EvidenceSlice,
+    *,
+    known_anchor_ids: frozenset[str],
+    clause_model: str | BaseLlm = config.INTERVIEW.model,
+    evidence_model: str | BaseLlm = config.INTERVIEW.model,
+    bench: AdjudicationBench | None = None,
+    contested_citation_grounder: ContestedCitationGrounder | None = None,
+    session_service: BaseSessionService | None = None,
+) -> CourtVerdict:
+    """Run the court graph end-to-end for one ground and return its verdict.
+
+    Args:
+        clause_slice: The Clause Reviewer's input for this ground.
+        evidence_slice: The Evidence Reviewer's input for this ground.
+        known_anchor_ids: The case's citation manifest.
+        clause_model: The Clause Reviewer's model (string id or `BaseLlm` fake).
+        evidence_model: The Evidence Reviewer's model (string id or `BaseLlm` fake).
+        bench: The adjudicator's `AdjudicationBench`. Pass the same instance
+            back in across grounds/cases to preserve degrade-not-halt state;
+            defaults to a fresh, closed bench.
+        contested_citation_grounder: The second-pass grounding port, or
+            `None` to skip that check.
+        session_service: Injectable ADK session service; defaults to a
+            fresh in-memory one (fine for a single one-shot run).
+
+    Returns:
+        The graph's single `CourtVerdict` for this ground.
+
+    Raises:
+        RuntimeError: The graph did not produce exactly one terminal event
+            (a bug in the graph construction, not a normal outcome).
+    """
+    verdict, _events = await _run_court_events(
+        clause_slice,
+        evidence_slice,
+        known_anchor_ids=known_anchor_ids,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        bench=bench,
+        contested_citation_grounder=contested_citation_grounder,
+        session_service=session_service,
+    )
+    return verdict
+
+
+async def run_court_verbose(
+    clause_slice: ClauseSlice,
+    evidence_slice: EvidenceSlice,
+    *,
+    known_anchor_ids: frozenset[str],
+    clause_model: str | BaseLlm = config.INTERVIEW.model,
+    evidence_model: str | BaseLlm = config.INTERVIEW.model,
+    bench: AdjudicationBench | None = None,
+    contested_citation_grounder: ContestedCitationGrounder | None = None,
+    session_service: BaseSessionService | None = None,
+) -> CourtRunResult:
+    """Run the court graph exactly like :func:`run_court`, but also return
+    the two reviewers' raw opinions -- for a caller (the tribunal job) that
+    needs to show both reviewer opinions to the resident, not just the
+    final decision.
+
+    Same arguments, same graph execution, same failure/breaker semantics as
+    `run_court` (both share `_run_court_events`); this is purely an additive
+    view over the same run, not a second execution.
+    """
+    verdict, events = await _run_court_events(
+        clause_slice,
+        evidence_slice,
+        known_anchor_ids=known_anchor_ids,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        bench=bench,
+        contested_citation_grounder=contested_citation_grounder,
+        session_service=session_service,
+    )
+    clause_review, evidence_review = _extract_reviews(events)
+    return CourtRunResult(
+        verdict=verdict, clause_review=clause_review, evidence_review=evidence_review
+    )

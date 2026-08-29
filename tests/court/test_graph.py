@@ -26,6 +26,7 @@ from setback.court.graph import (
     build_court_workflow,
     node_name_for_event,
     run_court,
+    run_court_verbose,
 )
 from setback.court.roles import ClauseSlice, EvidenceSlice, ReviewStance
 from setback.state.breakers import CircuitBreaker, CircuitState, DegradingBreaker
@@ -460,6 +461,69 @@ async def test_run_court_records_adjudicator_failure_on_the_shared_breaker() -> 
         )
 
     assert breaker.state is CircuitState.CLOSED  # one failure, below the threshold of 3
+
+
+# --- run_court_verbose: exposes both raw reviewer opinions -----------------------
+
+
+async def test_run_court_verbose_exposes_both_reviewer_opinions_on_clear_path() -> None:
+    """The console needs to render both reviewer opinions, not just the
+    final verdict -- `run_court_verbose` must surface the two distinct
+    `ReviewOutput`s the tally node already computed, straight off its
+    never-cleared `FunctionNode` event."""
+    result = await run_court_verbose(
+        _CLAUSE_SLICE,
+        _EVIDENCE_SLICE,
+        known_anchor_ids=_KNOWN_ANCHOR_IDS,
+        clause_model=FakeLlm(
+            model="fake-clause",
+            bodies=[
+                review_body(ground_id=_GROUND_ID, stance="support", rationale="clause says ok")
+            ],
+        ),
+        evidence_model=FakeLlm(
+            model="fake-evidence",
+            bodies=[
+                review_body(ground_id=_GROUND_ID, stance="support", rationale="evidence says ok")
+            ],
+        ),
+        bench=AdjudicationBench.default(),
+    )
+
+    assert result.verdict.outcome is CourtOutcome.RESOLVED
+    assert result.clause_review is not None
+    assert result.evidence_review is not None
+    assert result.clause_review.rationale == "clause says ok"
+    assert result.evidence_review.rationale == "evidence says ok"
+    # the two opinions are genuinely distinct model events, not one value
+    # copied into both fields (the spike's regression guard, applied here too)
+    assert result.clause_review.rationale != result.evidence_review.rationale
+
+
+async def test_run_court_verbose_reports_voided_opinion_as_none() -> None:
+    """A reviewer opinion voided for citing an unknown anchor must come back
+    as `None`, not silently as its raw (uncounted) opinion."""
+    result = await run_court_verbose(
+        _CLAUSE_SLICE,
+        _EVIDENCE_SLICE,
+        known_anchor_ids=_KNOWN_ANCHOR_IDS,
+        clause_model=FakeLlm(
+            model="fake-clause",
+            bodies=[
+                review_body(
+                    ground_id=_GROUND_ID, stance="support", cited_anchor_ids=["not-a-real-anchor"]
+                )
+            ],
+        ),
+        evidence_model=FakeLlm(
+            model="fake-evidence", bodies=[review_body(ground_id=_GROUND_ID, stance="support")]
+        ),
+        bench=AdjudicationBench.default(breaker=_open_breaker()),
+    )
+
+    assert result.clause_review is None
+    assert result.evidence_review is not None
+    assert result.verdict.outcome is CourtOutcome.UNRESOLVED_FLAGGED
 
 
 async def test_build_court_workflow_rejects_mismatched_ground_ids() -> None:

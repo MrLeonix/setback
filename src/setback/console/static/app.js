@@ -101,7 +101,13 @@
   const LOCALLY_HANDLED_EVENT_TYPES = new Set(["interview_turn", "document_uploaded"]);
 
   function connectEventStream() {
-    const source = new EventSource(`/api/cases/${caseId}/events`);
+    // `data-last-sequence` (rendered server-side, see console/app.py's
+    // render_case_page) is the sequence number of the newest event this
+    // very page load already reflects -- passed back as `after` so a
+    // fresh SSE connection doesn't replay the case's whole history and
+    // treat it as new, which would reload the page in an infinite loop.
+    const afterSequence = document.body.getAttribute("data-last-sequence") || "-1";
+    const source = new EventSource(`/api/cases/${caseId}/events?after=${afterSequence}`);
     source.onmessage = (message) => {
       let eventType = null;
       try {

@@ -9,6 +9,7 @@ and a recording fake job trigger.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 
@@ -154,6 +155,63 @@ def test_interview_answer_before_start_is_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
+def test_confirmed_concern_proposes_a_ground_with_its_category(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """The moment a concern is confirmed (stage advances to `ask_more`),
+    the console must propose a ground and tag it with the s4.15 category
+    the tribunal job (`job.pipeline`) later reads back to run the court/gate
+    pipeline -- this is the only place the interview's parsed concern is
+    available to record it."""
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    client.post(
+        f"/api/cases/{case_id}/interview",
+        json={"answer": "The new second storey will overshadow my entire garden."},
+    )
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "It loses sun in winter."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "No photos, sorry."})
+    response = client.post(f"/api/cases/{case_id}/interview", json={"answer": "Yes, correct."})
+    assert response.json()["stage"] == "ask_more"
+
+    grounds = asyncio.run(store.list_grounds(case_id))
+    assert len(grounds) == 1
+    assert "overshadow" in grounds[0].claim.lower()
+
+    events = asyncio.run(store.list_events(case_id))
+    category_events = [e for e in events if e.event_type == "ground_category_assigned"]
+    assert len(category_events) == 1
+    assert category_events[0].payload["category"] == "environmental_and_social_impacts"
+    assert category_events[0].payload["ground_id"] == grounds[0].ground_id
+
+
+def test_confirming_a_second_concern_proposes_a_second_ground(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "It will devalue my property."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Comparable sales say so."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "No photos, sorry."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Yes, correct."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Yes, one more thing."})
+    client.post(
+        f"/api/cases/{case_id}/interview",
+        json={"answer": "It will also overshadow my garden."},
+    )
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Loses sun in winter."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "No photos, sorry."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Yes, correct."})
+
+    grounds = asyncio.run(store.list_grounds(case_id))
+    assert len(grounds) == 2
+    events = asyncio.run(store.list_events(case_id))
+    categories = {
+        e.payload["category"] for e in events if e.event_type == "ground_category_assigned"
+    }
+    assert categories == {"property_value", "environmental_and_social_impacts"}
+
+
 # --- document upload --------------------------------------------------------
 
 
@@ -237,6 +295,28 @@ def test_events_stream_unknown_case_is_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
+def test_events_stream_after_param_skips_already_rendered_events(client: TestClient) -> None:
+    """A case page reload opens a brand-new SSE connection with no memory of
+    what it already showed -- without an `after` cursor, the server would
+    replay every historical event and the client would treat each one as
+    "new", reloading the page again, forever. `after` must let a fresh
+    connection skip everything at or below the sequence the page already
+    rendered."""
+    case_id = _create_case(client)
+    client.post(f"/api/cases/{case_id}/tribunal")
+
+    with client.stream("GET", f"/api/cases/{case_id}/events") as response:
+        lines = [line for line in response.iter_lines() if line.startswith("data:")]
+    last_sequence = max(
+        json.loads(line.removeprefix("data:").strip())["sequence"] for line in lines
+    )
+
+    with client.stream("GET", f"/api/cases/{case_id}/events?after={last_sequence}") as response:
+        assert response.status_code == 200
+        replayed = [line for line in response.iter_lines() if line.startswith("data:")]
+    assert replayed == []
+
+
 # --- refusal feedback ----------------------------------------------------------
 
 
@@ -292,6 +372,61 @@ def test_case_page_renders_known_sections(client: TestClient) -> None:
 
 def test_case_page_unknown_case_is_404(client: TestClient) -> None:
     response = client.get("/cases/does-not-exist")
+    assert response.status_code == 404
+
+
+def test_annotated_overlay_event_renders_as_an_image(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "annotated-overlay:doc-1",
+            "annotated_overlay",
+            payload={"document_id": "doc-1", "mime_type": "image/png", "image_base64": "QUJD"},
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert '<img src="data:image/png;base64,QUJD"' in response.text
+
+
+def test_submission_composed_event_renders_download_links(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "submission-composed:x",
+            "submission_composed",
+            payload={
+                "submission_markdown": "# Objection\n\nGround text.",
+                "submission_html": "<article><h1>Objection</h1></article>",
+                "refusals_markdown": "# Refusals\n\nExplanation.",
+                "refusals_html": "<article><h1>Refusals</h1></article>",
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert f"/api/cases/{case_id}/submission.md" in response.text
+    assert f"/api/cases/{case_id}/submission.html" in response.text
+    assert f"/api/cases/{case_id}/refusals.md" in response.text
+    assert "<h1>Objection</h1>" in response.text
+
+    md_response = client.get(f"/api/cases/{case_id}/submission.md")
+    assert md_response.status_code == 200
+    assert md_response.text == "# Objection\n\nGround text."
+
+    html_response = client.get(f"/api/cases/{case_id}/submission.html")
+    assert "<h1>Objection</h1>" in html_response.text
+
+
+def test_download_submission_before_composed_is_404(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/api/cases/{case_id}/submission.md")
     assert response.status_code == 404
 
 
