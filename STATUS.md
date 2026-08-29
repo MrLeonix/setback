@@ -1,3 +1,158 @@
+# STATUS — wave 11 landed: grounding root-cause fix + round-2 UI feedback (2026-08-30)
+
+Founder-directed round, filmed early afternoon the same day it landed — the brief
+called for the smallest correct implementation, fast. Integration pass reconciling
+two concurrent lanes' work (both already applied to the working tree when this pass
+started) against full quality gates and a security diff check. **Git only, no
+deploy** — `./deploy.sh` against the live `setback-console`/`setback-tribunal`
+(`australia-southeast1`) is a separate, later step, not attempted by this pass.
+
+## Lane O — grounding root-cause fix (`models/client.py`, `evidence/grounding.py`, `job/pipeline.py`)
+
+**Major pre-existing defect found and fixed**: every vision-shaped model call in the
+codebase's history (since wave 4) sent zero image bytes to the model — "grounding"
+was pure text-only guessing, regardless of which document `job/pipeline.py` had
+selected. This is consistent with (and likely explains) Blocker 1's original
+symptom — window/door boxes landing mid a cover letter, not mid a drawing — since
+the model was never shown either document.
+
+- `ModelClient.generate` gains a backward-compatible `images: Sequence[tuple[bytes,
+  str]] | None` parameter (default `None`, zero behaviour change at every existing
+  call site); passing `images` to a text-only Gemma MaaS tier raises
+  `ModelCallError` rather than silently dropping them.
+- `evidence/grounding.py` adds a two-stage describe-then-ground pipeline
+  (`describe_drawing` → `ground_described_elements`, composed as
+  `describe_then_ground`) that replaces the single hardcoded elevation-shaped label
+  list (`window W.1`/`door D.1`/`9m height limit datum line`) with a per-page
+  inventory: what kind of drawing is this, and what real elements does it actually
+  contain? A top-down Site Plan is now grounded in its own vocabulary (building
+  footprint, boundary setbacks, the neighbouring lot, a north arrow) instead of
+  being asked for windows and doors that cannot exist on it — the exact defect this
+  wave was chartered to fix. `ground_elements` is kept as-is (still used by
+  `ground_contested_elements`'s adjudication-escalation path) and now also attaches
+  real image content via the same shared plumbing.
+- `job/pipeline.py`'s `_ground_annotated_evidence` calls `describe_then_ground`
+  instead of `ground_elements` with the fixed list.
+
+Non-blocking quality nuances observed live during this lane's own verification, not
+fixed this wave (time-boxed): (1) stage 1 can reuse a generic element name across
+two physically different fixtures on different elevations of the same page —
+harmless for anchor identity (keyed on bbox, not label) but could read ambiguously
+in a caption if both appear in one overlay; (2) on the real Site Plan, one described
+element ("setback dimensions and boundary lines") is inherently scattered across
+most of the page, producing the least-tight bounding box of the nine seen —
+correctly non-elevation vocabulary and well under the overlay's 90%-page-area drop
+threshold, just visually the loosest. Neither blocks film.
+
+Live validation used 8 of 8 budgeted grounding calls this lane (elevations ×2
+rounds, the real Site Plan ×1 round, plus a re-run verifying a label-canonicalization
+fix). No budget remains in this lane for further live grounding tuning this wave.
+
+## Lane U — console round-2 founder UI feedback (`console/app.py`, `static/{app.js,style.css}`)
+
+- **Real tabs, not a ref-link nav** (item 1): the right pane's sections
+  (Grounds/Evidence/Overlay/Documents) are now a genuine WAI-ARIA tablist
+  (`role="tab"`/`"tabpanel"`, `aria-selected`, full arrow-key/Home/End keyboard
+  support) — the founder's own correction that the prior sticky anchor-link nav
+  scrolled to an always-rendered section with no visible selected state.
+- **Standalone "Tribunal" tab/section removed** (item 4): its start timestamp
+  (`DD/MM/YYYY HH:MM AM/PM`, Australia/Sydney) moved to a new case-header meta line
+  alongside run cost once non-zero; its ingest-source and rerun-ignored notices moved
+  into a small "Notes" card inside the Grounds tab. No resident-facing content was
+  dropped, only relocated.
+- **One-line chat input row** (item 3): text input | Send | Upload, all in one flex
+  row. The native `<input type="file">` is visually hidden behind a styled Upload
+  button that opens the picker and uploads immediately on selection; status (in
+  progress / done / error) shows as a small chip instead of the native "Choose file /
+  No file chosen" text.
+- **Mobile pass** (item 2, 390px/768px breakpoints), using only existing spacing/type
+  tokens: 44px tap targets, a bounded transcript height once single-column, stacked
+  landing-page form. A `viewport` meta tag was added to all three server-rendered
+  pages (landing, docket board, case page) — missing before, which is why none of
+  this would previously have rendered at mobile width at all.
+
+Soft finding, **not fixed** this round (pre-existing behaviour, outside the four
+requested items): uploading evidence after the interview has already reached the
+`DONE` stage does not show the "Evidence added: `<filename>`" chat line, because
+`loadInterview()`'s `renderTranscript()` replaces the whole transcript with only
+persisted interview turns. The upload itself (the `POST /documents` call, the
+`document_uploaded` event, the Evidence tab, the doc card) all work correctly —
+confirmed live. Flagging rather than leaving it for a future pass to rediscover.
+
+## Cross-lane notes
+
+- Lane U's own report flagged that `models/client.py`'s new `images` parameter is
+  outside its lane but was required for the wave's own feature (the grounding fix)
+  to work at all — noted here so whoever next touches `ModelClient` has the
+  rationale (full detail in `models/client.py`'s docstring and `evidence/
+  grounding.py`'s module docstring).
+- Both lanes independently reported concurrent uncommitted edits to a shared working
+  tree during this wave (a mid-session `console/app.py` WIP state with an undefined
+  `_render_tribunal_section`, and an unformatted `evidence/grounding.py`) — both were
+  resolved by the time this integration pass started; the tree was internally
+  consistent and every gate below passed cleanly on the first run.
+
+## Verification (verbatim, this integration pass)
+
+```
+$ uv run pytest -q
+648 passed, 256 warnings in 44.19s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+81 files already formatted
+
+$ uv run mypy
+Success: no issues found in 38 source files
+```
+
+Up from wave 9.5's 619 (648 after this wave's two lanes' own TDD additions: 71 new
+`models/client.py` multimodal-content tests, 370 new `evidence/grounding.py`
+describe-then-ground tests, plus `job/pipeline.py` and `console/app.py` test
+updates).
+
+## Security diff check (this pass, full wave-11 diff)
+
+Grepped the full diff for credential patterns (`AIza...`, `ghp_...`, `AKIA...`,
+`sk-...`, JWTs, `BEGIN ... PRIVATE KEY`, literal `docket-key`/`api_key`/`password`
+assignments), the user's email, and internal hostnames/home-directory paths
+(`kratos`, `mimir`, `/Users/leo`, `/home/leo`, `@gmail.com`). **Zero hits.** No
+secret value, personal identifier, or hostname appears anywhere in this wave's diff.
+Per both lanes' own reports: no secret was read or transmitted, `resident_session`
+values used in live validation were synthetic `uuid4`s, and every outbound HTTP call
+used the neutral `User-Agent: setback/0.1`.
+
+## Live model calls this pass (integration)
+
+Zero. This was a pure git-integration pass (reconciliation, gates, security check,
+commits) — no live Vertex AI, Secret Manager, or GCP call of any kind was made by
+this pass itself; the 8 live grounding calls and other live validation reported
+above were made by lane O/U's own work before this pass started.
+
+## Commits this pass
+
+- `50dbcf1` `fix(evidence,models): actually attach page images to grounding calls`
+- `823929d` `fix(console): round-2 founder UI feedback (tabs, mobile, one-line chat input)`
+
+Pushed to `origin/main`.
+
+## What remains (film-day / next-pass work)
+
+- **Redeploy**: this pass's changes are pushed to `origin/main` but not yet deployed
+  — `./deploy.sh` against `australia-southeast1` is the next step, followed by a live
+  smoke pass (docket gate, a real interview turn including a post-DONE upload check,
+  a real tribunal run against the real Site Plan case) before filming.
+- **The two lane-O quality nuances and the lane-U post-DONE upload-transcript
+  finding above** — none block film; candidates for a future pass if the founder
+  wants them tightened.
+- Everything else unchanged from wave 9.5's own closing note: pick the final film
+  case(s), the timed rehearsal, and the README/Devpost narrative items STATUS.md's
+  "what remains" sections already list.
+
+---
+
 # STATUS — wave 9.5 complete: Blocker 1 closed, redeployed, proof run verified (2026-08-29)
 
 Ship-phase pass over a fixer's Blocker-1 fix (`833e6fd`, already on `main`
