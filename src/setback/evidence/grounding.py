@@ -1,5 +1,49 @@
 """Bounding-box grounding: locates named evidence elements on a rendered page.
 
+**Two-stage describe-then-ground pipeline (wave 11).** The production entry
+point is :func:`describe_then_ground`, which replaces a single hardcoded
+elevation-shaped label list (``"window W.1"``, ``"door D.1"``, ``"9m height
+limit datum line"``, previously baked into `job/pipeline.py` regardless of
+what kind of drawing was actually being grounded) with two calls:
+
+1. :func:`describe_drawing` (stage 1) -- one cheap vision call whose sole
+   job is inventory: given the page image, what kind of drawing is this
+   (:class:`DrawingType`: a site plan, an elevation, a section, a floor
+   plan, a photo, or other), and what real, visible elements does it
+   actually contain (:class:`DescribedElement`)?
+2. :func:`ground_described_elements` (stage 2) -- requests bounding boxes
+   *only* for the elements stage 1's inventory said exist, labelled with
+   stage 1's own element names, never a fixed list.
+
+This fixes a real, confirmed-live defect (`CASES.md`'s Blocker 1, the real
+`5e791203...` case): a **top-down Site Plan** was being asked for
+window/door/height-datum boxes -- elevation-only concepts that are not
+visible on a top-down drawing at all -- because the old single-stage call
+never knew what kind of drawing it had been handed. Now a site plan is
+described (and then grounded) in its own vocabulary: building footprint,
+boundary setbacks, the neighbouring lot, a north arrow -- and an elevation
+is still described in the vocabulary that always worked for it (windows,
+doors, a height datum line), so the flagship elevation shot is unaffected.
+
+**Root-cause fix, same wave**: every vision call in this module (both
+stages, plus the original single-label-list :func:`ground_elements`, still
+kept as the general "locate these labels" primitive
+:func:`ground_contested_elements` wraps) now actually attaches the page's
+own image bytes as real multimodal content (`ModelClient.generate`'s
+`images` parameter). Before this fix, `ground_elements` sent only a text
+prompt describing what to look for -- the rendered page image was never
+attached at all, so every "grounding" call was, in effect, the model
+guessing plausible-sounding box coordinates for a label's own words
+without ever seeing the page. This is consistent with Blocker 1's observed
+symptom (window/door boxes landing mid a cover *letter*, not mid a
+drawing): the model was never shown either document, so switching which
+document was selected never changed anything about how the boxes were
+placed. `ModelClient.generate`'s `images` parameter is new this wave too
+(`models/client.py`, exercised by `tests/models/test_client.py`) --
+outside this module's own lane, but required for either stage of this
+module's pipeline to be a real vision call at all, so it is fixed here
+rather than left as dead-on-arrival infrastructure.
+
 Proven live in the spike (`spike-grounding.md`, verified against the real
 DA2026/0359 elevations drawing and an embedded aerial photo, 5 calls, 19/20
 correct localizations): `gemini-3.5-flash-lite` at `ThinkingLevel.MINIMAL`
@@ -56,6 +100,7 @@ from __future__ import annotations
 import io
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Final
 
 from PIL import Image, ImageDraw
@@ -73,6 +118,14 @@ _GROUNDING_INSTRUCTION: Final[str] = (
     "xmax]`, normalized to the range 0-1000 against the image's own width and "
     "height. If an element is not visible, omit it rather than guessing."
 )
+
+
+def _image_part(page: RenderedPage) -> tuple[bytes, str]:
+    """The `(bytes, mime_type)` pair every vision call in this module sends
+    alongside its prompt (`ModelClient.generate`'s `images` parameter) --
+    the resized image actually shown to the model, matching
+    :func:`_map_to_page_points`'s own assumption about what was sent."""
+    return page.resized_png_bytes, "image/png"
 
 
 class GroundedElement(BaseModel):
@@ -197,6 +250,29 @@ def _page_points_to_full_res_pixels(
     return x0_px, y0_px, x1_px, y1_px
 
 
+async def _run_grounding_call(
+    client: ModelClient, page: RenderedPage, prompt: str, tier: ModelConfig
+) -> GroundingResult:
+    """Shared plumbing behind every box-locating call this module makes
+    (:func:`ground_elements` and :func:`ground_described_elements`):
+    attach `page`'s own resized image as real multimodal content
+    (:func:`_image_part` — the wave-11 root-cause fix, see module
+    docstring), pin `temperature=0.0` per the spike, defensively parse each
+    returned box, and map every usable one back to true page points."""
+    result = await client.generate(
+        tier, prompt, GroundingResponse, temperature=0.0, images=[_image_part(page)]
+    )
+
+    boxes: list[GroundedBox] = []
+    for element in result.output.elements:
+        normalized = _extract_normalized_box(element)
+        if normalized is None:
+            continue
+        boxes.append(GroundedBox(label=element.label, bbox=_map_to_page_points(normalized, page)))
+
+    return GroundingResult(boxes=boxes, usage=result.usage, model=result.model)
+
+
 async def ground_elements(
     client: ModelClient,
     page: RenderedPage,
@@ -205,6 +281,14 @@ async def ground_elements(
     tier: ModelConfig = INTERVIEW,
 ) -> GroundingResult:
     """Ask the model to locate each of `labels` on `page`'s resized image.
+
+    The general "locate these exact labels" primitive -- kept as-is for
+    :func:`ground_contested_elements`'s adjudication-escalation use and any
+    caller that already knows exactly what it wants located. The
+    production annotated-overlay pipeline (`job/pipeline.py`) no longer
+    calls this directly with a fixed label list; see
+    :func:`describe_then_ground` for the describe-then-ground pipeline that
+    replaced that fixed list with a per-drawing-type inventory.
 
     Args:
         client: The sole model call site.
@@ -222,16 +306,7 @@ async def ground_elements(
         points), plus the call's token usage for ledger booking.
     """
     prompt = f"{_GROUNDING_INSTRUCTION}\n\nElements to locate: {', '.join(labels)}"
-    result = await client.generate(tier, prompt, GroundingResponse, temperature=0.0)
-
-    boxes: list[GroundedBox] = []
-    for element in result.output.elements:
-        normalized = _extract_normalized_box(element)
-        if normalized is None:
-            continue
-        boxes.append(GroundedBox(label=element.label, bbox=_map_to_page_points(normalized, page)))
-
-    return GroundingResult(boxes=boxes, usage=result.usage, model=result.model)
+    return await _run_grounding_call(client, page, prompt, tier)
 
 
 async def ground_contested_elements(
@@ -246,6 +321,253 @@ async def ground_contested_elements(
     out which tier "contested" means.
     """
     return await ground_elements(client, page, labels, tier=BENCH)
+
+
+# --- two-stage describe-then-ground pipeline (wave 11) -----------------------------
+
+
+class DrawingType(StrEnum):
+    """What kind of DA evidence page stage 1 (:func:`describe_drawing`)
+    thinks it is looking at -- deliberately a different, coarser vocabulary
+    than :class:`setback.clerk.DocumentKind` (which classifies a whole
+    *document* from its filename/first-page text, for document *selection*)
+    since this classifies one rendered *page image* from what is actually
+    visible in it, purely to pick which grounding vocabulary applies."""
+
+    SITE_PLAN = "site_plan"
+    ELEVATION = "elevation"
+    SECTION = "section"
+    FLOOR_PLAN = "floor_plan"
+    PHOTO = "photo"
+    OTHER = "other"
+
+
+class DescribedElement(BaseModel):
+    """One real, visible element stage 1's inventory found on the page.
+
+    `relevant_to` is the model's own judgement of which of a resident's
+    planning-objection categories (the same vocabulary as
+    :class:`setback.clerk.ConcernType`'s values, e.g. ``"overshadowing"``,
+    ``"height_bulk"``) this element could help assess -- informational
+    only in this wave (stage 2 grounds every described element regardless
+    of it), carried through so a future caller can filter or prioritise by
+    it without another vision call.
+    """
+
+    name: str
+    approx_location: str
+    relevant_to: list[str] = []
+
+
+class DrawingDescription(BaseModel):
+    """The structured-output schema requested from stage 1
+    (:func:`describe_drawing`)."""
+
+    drawing_type: DrawingType
+    elements: list[DescribedElement]
+    orientation_cues: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DescriptionResult:
+    """Stage 1's parsed description plus its token usage, mirroring
+    :class:`GroundingResult`'s shape for the call that precedes it."""
+
+    description: DrawingDescription
+    usage: TokenUsage
+    model: str
+
+
+_DESCRIBE_INSTRUCTION: Final[str] = (
+    "You are inventorying one page of evidence submitted with a NSW development "
+    "application objection. It could be an architectural drawing (a top-down site "
+    "plan, a building elevation, a vertical section, or an internal floor plan) or "
+    "a real site photograph. Respond with a JSON object matching the given schema "
+    "and nothing else.\n\n"
+    "First, classify the page's `drawing_type`: `site_plan` (a top-down plan "
+    "showing the block, boundaries, and building footprint), `elevation` (a "
+    "side-on view of the building's facade), `section` (a vertical cross-section), "
+    "`floor_plan` (a top-down internal room layout), `photo` (a real photograph, "
+    "not a drawing), or `other`.\n\n"
+    "Then list every real, visible `elements` entry actually shown in the image -- "
+    "never invent or guess at one that is not really there; omit it instead. Each "
+    'entry needs a short `name` (e.g. "window W.1", "north boundary", "the '
+    'overhanging balcony"), an `approx_location` in plain English (e.g. '
+    '"upper-right"), and `relevant_to`: zero or more of a resident\'s '
+    "planning-objection categories this element could help assess (choose from: "
+    "height_bulk, privacy_overlooking, overshadowing, trees_landscape, "
+    "traffic_parking, heritage_character, view_loss, property_value, noise). What "
+    "is actually worth listing depends on the drawing type: for an elevation, "
+    "list each individual window and door opening as its OWN separate element "
+    '(use the drawing\'s own callout label, e.g. "window W.1"/"door D.1", if one '
+    "is printed next to it; otherwise a location-based name) plus any "
+    "height-limit datum line drawn on it -- never describe an entire elevation "
+    'view (e.g. "the whole north elevation") as a single element; for a site '
+    "plan, prioritise the building footprint, boundary setback lines, the "
+    "neighbouring lot, and any north arrow or shadow-direction indicator; for a "
+    "photograph, prioritise the specific area(s) a resident's objection would "
+    "actually be about. Finally, note any `orientation_cues` visible (e.g. a north "
+    "arrow, a compass rose, a labelled elevation direction) as a short string, or "
+    "omit it if none are visible."
+)
+
+
+async def describe_drawing(
+    client: ModelClient,
+    page: RenderedPage,
+    *,
+    tier: ModelConfig = INTERVIEW,
+) -> DescriptionResult:
+    """Stage 1 of the describe-then-ground pipeline: one cheap vision call
+    whose sole job is inventory -- what kind of drawing is `page`, and what
+    real elements does it actually contain? Always `temperature=0.0`
+    (matching :func:`_run_grounding_call`'s own pin) and the cheap default
+    worker tier, since this is a factual inventory pass, not a creative
+    one.
+
+    Returns the parsed :class:`DrawingDescription` plus this call's own
+    token usage -- :func:`describe_then_ground` sums it with stage 2's own
+    usage for the combined two-call cost.
+    """
+    result = await client.generate(
+        tier, _DESCRIBE_INSTRUCTION, DrawingDescription, temperature=0.0, images=[_image_part(page)]
+    )
+    return DescriptionResult(description=result.output, usage=result.usage, model=result.model)
+
+
+_DRAWING_TYPE_LABEL: Final[dict[DrawingType, str]] = {
+    DrawingType.SITE_PLAN: "top-down site plan",
+    DrawingType.ELEVATION: "building elevation drawing",
+    DrawingType.SECTION: "building cross-section drawing",
+    DrawingType.FLOOR_PLAN: "floor plan drawing",
+    DrawingType.PHOTO: "site photograph",
+    DrawingType.OTHER: "drawing or photograph",
+}
+"""Plain-English name for each :class:`DrawingType`, used only to orient
+stage 2's prompt (:func:`ground_described_elements`) -- the actual choice
+of *which* elements to locate always comes from stage 1's own inventory,
+never from this mapping."""
+
+
+def _stage_two_prompt(description: DrawingDescription) -> str:
+    """Build stage 2's grounding prompt: locate exactly the elements stage
+    1's inventory named, nothing else -- the hardcoded elevation-only label
+    list (`window W.1`/`window W.2`/`window W.3`/`door D.1`/`9m height limit
+    datum line`) this replaces is gone; every label here comes from
+    `description.elements` regardless of drawing type."""
+    element_lines = "\n".join(
+        f"- {element.name} (roughly {element.approx_location})" for element in description.elements
+    )
+    drawing_type_label = _DRAWING_TYPE_LABEL[description.drawing_type]
+    return (
+        f"You are locating specific elements on a {drawing_type_label}, previously "
+        "inventoried by an earlier pass over this exact image. Locate ONLY the "
+        "following elements -- do not invent or guess at any element not in this "
+        "list, and omit one from your answer if you cannot actually find it. "
+        "Respond with a JSON object matching the given schema and nothing else. "
+        "Each box must be `box_2d: [ymin, xmin, ymax, xmax]`, normalized to the "
+        "range 0-1000 against the image's own width and height. Copy each "
+        "located element's `label` EXACTLY, character for character, from the "
+        "element names listed below -- never re-word it, and never include the "
+        "location hint that follows it in parentheses.\n\n"
+        f"Elements to locate:\n{element_lines}"
+    )
+
+
+def _canonicalize_label(returned_label: str, known_names: Sequence[str]) -> str:
+    """Normalize a stage-2 box's returned `label` back to stage 1's own
+    element name when it is (or starts with) one, case-insensitively.
+
+    Measured live: despite :func:`_stage_two_prompt`'s explicit "copy
+    exactly" instruction, the model sometimes echoes back its own location
+    hint alongside the name (``"window W.1 (roughly upper-left)"``) rather
+    than the bare name it was asked to copy. Left uncorrected, that verbose
+    text becomes the overlay chip's caption -- exactly the legibility this
+    wave must not regress. A label that doesn't match any known name (not
+    even as a prefix) is returned unchanged rather than dropped -- the
+    box's *position* is still real grounding work either way.
+    """
+    lowered = returned_label.strip().lower()
+    for name in known_names:
+        normalized_name = name.strip().lower()
+        if lowered == normalized_name or lowered.startswith(normalized_name):
+            return name
+    return returned_label
+
+
+async def ground_described_elements(
+    client: ModelClient,
+    page: RenderedPage,
+    description: DrawingDescription,
+    *,
+    tier: ModelConfig = INTERVIEW,
+) -> GroundingResult:
+    """Stage 2 of the describe-then-ground pipeline: request boxes only for
+    the elements `description` (stage 1's own inventory) said exist,
+    labelled with stage 1's own element names -- never a fixed label list.
+
+    Makes zero model calls (returns an empty result immediately) when
+    `description.elements` is empty -- nothing to ask for, and a page
+    stage 1 found nothing worth listing on (e.g. a blank cover sheet)
+    should not spend a second call confirming that.
+    """
+    if not description.elements:
+        return GroundingResult(
+            boxes=[], usage=TokenUsage(prompt_tokens=0, output_tokens=0), model=tier.model
+        )
+    prompt = _stage_two_prompt(description)
+    result = await _run_grounding_call(client, page, prompt, tier)
+    known_names = [element.name for element in description.elements]
+    canonical_boxes = [
+        GroundedBox(label=_canonicalize_label(box.label, known_names), bbox=box.bbox)
+        for box in result.boxes
+    ]
+    return GroundingResult(boxes=canonical_boxes, usage=result.usage, model=result.model)
+
+
+def _sum_usage(first: TokenUsage, second: TokenUsage) -> TokenUsage:
+    """Combine two real model calls' token usage into one total -- used by
+    :func:`describe_then_ground` since it makes two real calls (unlike
+    every other function in this module, which makes at most one) and a
+    future ledger-booking caller needs the true combined cost, not just
+    stage 2's own figure."""
+    return TokenUsage(
+        prompt_tokens=first.prompt_tokens + second.prompt_tokens,
+        output_tokens=first.output_tokens + second.output_tokens,
+        thinking_tokens=first.thinking_tokens + second.thinking_tokens,
+        estimated=first.estimated or second.estimated,
+    )
+
+
+async def describe_then_ground(
+    client: ModelClient,
+    page: RenderedPage,
+    *,
+    tier: ModelConfig = INTERVIEW,
+) -> GroundingResult:
+    """The production annotated-overlay grounding pipeline (wave 11):
+    describe `page` (stage 1), then ground only the elements the
+    description says exist (stage 2) -- see the module docstring for why
+    this replaces the old single hardcoded elevation-shaped label list.
+
+    Two real model calls when stage 1 finds at least one element (their
+    combined usage is returned, via :func:`_sum_usage`, model
+    tagged as stage 2's own); exactly one call, and an empty
+    :class:`GroundingResult`, when stage 1 finds nothing to ground
+    (:func:`ground_described_elements`'s own short-circuit).
+    """
+    description_result = await describe_drawing(client, page, tier=tier)
+    description = description_result.description
+    if not description.elements:
+        return GroundingResult(
+            boxes=[], usage=description_result.usage, model=description_result.model
+        )
+    grounding_result = await ground_described_elements(client, page, description, tier=tier)
+    return GroundingResult(
+        boxes=grounding_result.boxes,
+        usage=_sum_usage(description_result.usage, grounding_result.usage),
+        model=grounding_result.model,
+    )
 
 
 _OVERLAY_COLOR: Final[tuple[int, int, int]] = (220, 30, 30)

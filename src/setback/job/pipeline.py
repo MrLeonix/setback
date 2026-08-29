@@ -172,7 +172,7 @@ from setback.evidence.dossier import (
 from setback.evidence.dossier import (
     EvidenceAnchor as DossierEvidenceAnchor,
 )
-from setback.evidence.grounding import GroundedBox, ground_elements
+from setback.evidence.grounding import GroundedBox, describe_then_ground
 from setback.evidence.imagery import (
     SecretAccessor,
     StreetViewUnavailableError,
@@ -218,18 +218,6 @@ _FIXTURES_DIR: Final[Path] = Path(__file__).resolve().parents[3] / "tests" / "fi
 _DEMO_PAN: Final[str] = "PAN-661190"
 _DEMO_COUNCIL: Final[str] = "Georges River Council"
 _DEMO_ADDRESS: Final[str] = "65A Vista Street Sans Souci NSW 2219"
-
-# The real, labelled elements documented in docs/data-sources.md for this
-# fixture's elevations drawing -- the same labels tests/evidence/live_demo.py
-# uses for its checked-in demo overlay, reused here so the tribunal's own
-# grounding pass looks for real, name-checkable things rather than guessing.
-_GROUNDING_LABELS: Final[tuple[str, ...]] = (
-    "window W.1",
-    "window W.2",
-    "window W.3",
-    "door D.1",
-    "9m height limit datum line",
-)
 
 _ADJUDICATOR_BREAKER_NAME: Final[str] = "adjudicator"
 
@@ -930,12 +918,30 @@ class RealPipelineRunner:
     async def _ground_annotated_evidence(
         self, dossier: CaseDossier
     ) -> tuple[CaseDossier, _GroundedOverlayContext | None]:
-        """Run one grounding pass over the first rendered plan document (the
-        uploaded elevations PDF), registering each located element as a
-        fine-grained bbox anchor. Returns the dossier unchanged (with
-        `None`) if there is no plan document or no grounding client was
-        configured -- grounding is a richer-evidence enhancement, not a
-        hard requirement for a ground to ship on its page-level anchor.
+        """Run the describe-then-ground pipeline
+        (:func:`setback.evidence.grounding.describe_then_ground`) over the
+        first rendered page of the selected plan document, registering
+        each located element as a fine-grained bbox anchor. Returns the
+        dossier unchanged (with `None`) if there is no plan document or no
+        grounding client was configured -- grounding is a richer-evidence
+        enhancement, not a hard requirement for a ground to ship on its
+        page-level anchor.
+
+        **Wave 11**: this used to call `ground_elements` with a single
+        hardcoded elevation-shaped label list (`window W.1`/`window
+        W.2`/`window W.3`/`door D.1`/`9m height limit datum line`)
+        regardless of what kind of document `_select_plan_document` had
+        actually picked -- correct for the elevations fixture this build
+        started with, but wrong for a real top-down Site Plan (CASES.md's
+        Blocker 1, confirmed live on case `5e791203...`: window/door boxes
+        are not a thing a top-down drawing can show at all).
+        `describe_then_ground` replaces that fixed list with a per-page
+        inventory (describe, then ground only what the inventory found),
+        so a site plan is now grounded in its own vocabulary (building
+        footprint, boundary setbacks, the neighbouring lot, a north arrow)
+        while an elevation still gets its own familiar vocabulary
+        (windows, doors, a height datum line) -- see that function's
+        module docstring for the full before/after.
 
         Deliberately does **not** render the annotated overlay image here:
         `evidence.overlays.render_semantic_overlay` colours each box by
@@ -949,7 +955,7 @@ class RealPipelineRunner:
             return dossier, None
 
         page = plan_document.pages[0]
-        result = await ground_elements(self._grounding_client, page, _GROUNDING_LABELS)
+        result = await describe_then_ground(self._grounding_client, page)
         if not result.boxes:
             return dossier, None
 

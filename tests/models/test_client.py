@@ -139,6 +139,77 @@ async def test_generate_raises_when_response_not_parseable() -> None:
         await client.generate(INTERVIEW, "hello", SampleOutput)
 
 
+# --- multimodal (image) content ----------------------------------------------
+#
+# Grounding (`evidence/grounding.py`) is a vision task -- both its describe
+# and ground stages must actually send the rendered page's image bytes to
+# the model, not text alone. Before this parameter existed, no call site in
+# the codebase ever attached image content, so a "grounding" call was pure
+# text -- the model was never shown the page it was supposedly locating
+# elements on.
+
+
+async def test_generate_with_no_images_sends_the_prompt_as_plain_text() -> None:
+    """Every existing (non-vision) call site must see zero behaviour change:
+    `contents` stays a bare string when `images` is omitted."""
+    fake_models = _FakeAsyncModels([_FakeResponse(SampleOutput(answer="ok"), _FakeUsage(1, 1, 0))])
+    client = ModelClient(genai_client=_FakeGenaiClient(fake_models))
+
+    await client.generate(INTERVIEW, "hello", SampleOutput)
+
+    assert fake_models.calls[0]["contents"] == "hello"
+
+
+async def test_generate_with_images_sends_multimodal_parts_including_the_prompt_text() -> None:
+    from google.genai import types
+
+    fake_models = _FakeAsyncModels([_FakeResponse(SampleOutput(answer="ok"), _FakeUsage(1, 1, 0))])
+    client = ModelClient(genai_client=_FakeGenaiClient(fake_models))
+
+    await client.generate(
+        INTERVIEW, "locate the window", SampleOutput, images=[(b"\x89PNG...", "image/png")]
+    )
+
+    contents = fake_models.calls[0]["contents"]
+    assert isinstance(contents, list)
+    assert all(isinstance(part, types.Part) for part in contents)
+    image_parts = [p for p in contents if p.inline_data is not None]
+    text_parts = [p for p in contents if p.text is not None]
+    assert len(image_parts) == 1
+    assert image_parts[0].inline_data.data == b"\x89PNG..."
+    assert image_parts[0].inline_data.mime_type == "image/png"
+    assert text_parts == [types.Part(text="locate the window")]
+
+
+async def test_generate_with_multiple_images_sends_every_one() -> None:
+    fake_models = _FakeAsyncModels([_FakeResponse(SampleOutput(answer="ok"), _FakeUsage(1, 1, 0))])
+    client = ModelClient(genai_client=_FakeGenaiClient(fake_models))
+
+    await client.generate(
+        INTERVIEW,
+        "compare",
+        SampleOutput,
+        images=[(b"one", "image/png"), (b"two", "image/png")],
+    )
+
+    contents = fake_models.calls[0]["contents"]
+    image_parts = [p for p in contents if p.inline_data is not None]
+    assert [p.inline_data.data for p in image_parts] == [b"one", b"two"]
+
+
+async def test_generate_rejects_images_on_the_maas_tier() -> None:
+    """Gemma MaaS is the OpenAI-compatible text endpoint used only by
+    `setback.clerk` -- it never carries image content, so passing `images`
+    to it is a caller bug, not something to silently ignore."""
+    client = ModelClient(
+        maas_http_client=httpx.AsyncClient(base_url="https://example.invalid"),
+        token_provider=lambda: "fake-token",
+    )
+
+    with pytest.raises(ModelCallError):
+        await client.generate(CLERK, "hello", SampleOutput, images=[(b"x", "image/png")])
+
+
 # --- Retry behaviour ---------------------------------------------------------
 
 

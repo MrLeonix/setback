@@ -22,7 +22,7 @@ output-token rate.
 from __future__ import annotations
 
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
@@ -204,6 +204,7 @@ class ModelClient:
         *,
         system_instruction: str | None = None,
         temperature: float | None = None,
+        images: Sequence[tuple[bytes, str]] | None = None,
     ) -> ModelResult[T]:
         """Call `tier` with `prompt`, validating the reply as `response_model`.
 
@@ -214,8 +215,24 @@ class ModelClient:
         caller passes one explicitly -- e.g. `evidence/grounding.py`'s
         documented need for `temperature=0.0`, matching the proven
         grounding spike's direct `google-genai` call.
+
+        `images`: optional `(bytes, mime_type)` pairs attached alongside
+        `prompt` as real multimodal content (wave-11 fix -- every existing
+        vision-shaped call site, `evidence.grounding.ground_elements`
+        included, previously sent `prompt` as plain text with no image
+        content at all, so the model was never actually shown the page it
+        was asked to locate elements on). `None` (the default) preserves
+        every non-vision call site's exact prior behaviour: `contents`
+        stays a bare string. Gemma MaaS carries no image content -- passing
+        `images` for a `-maas` tier is a caller bug and raises
+        :class:`ModelCallError` rather than silently dropping the images.
         """
         if tier.model.endswith(_MAAS_MODEL_SUFFIX):
+            if images:
+                raise ModelCallError(
+                    f"model {tier.model!r} is a text-only Gemma MaaS tier; "
+                    "it cannot accept image content"
+                )
             return await self._generate_maas(
                 tier,
                 prompt,
@@ -229,6 +246,7 @@ class ModelClient:
             response_model,
             system_instruction=system_instruction,
             temperature=temperature,
+            images=images,
         )
 
     async def _generate_gemini(
@@ -239,6 +257,7 @@ class ModelClient:
         *,
         system_instruction: str | None,
         temperature: float | None,
+        images: Sequence[tuple[bytes, str]] | None = None,
     ) -> ModelResult[T]:
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
@@ -248,9 +267,18 @@ class ModelClient:
             temperature=temperature,
         )
 
+        contents: str | list[str | types.Part] = prompt
+        if images:
+            image_parts: list[str | types.Part] = [
+                types.Part.from_bytes(data=data, mime_type=mime_type) for data, mime_type in images
+            ]
+            contents = [*image_parts, types.Part(text=prompt)]
+
         async def call() -> types.GenerateContentResponse:
             return await self._genai_client.aio.models.generate_content(
-                model=tier.model, contents=prompt, config=config
+                model=tier.model,
+                contents=contents,  # type: ignore[arg-type]
+                config=config,
             )
 
         response = await _call_with_retry(call, policy=self._retry_policy, sleep=self._sleep)

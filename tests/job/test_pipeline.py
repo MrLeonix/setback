@@ -908,10 +908,21 @@ async def test_an_irrelevant_ground_keeps_its_s415_explanation_even_if_the_court
 class _FakeGroundingClient:
     """A `ModelClient`-shaped double (duck-typed -- `ModelClient` is a
     concrete class, not a Protocol) that deterministically "locates" one
-    labelled element wherever `ground_elements` asks it to, regardless of
-    the image actually sent -- enough to exercise the real
-    `evidence.grounding.ground_elements`/`_map_to_page_points` geometry
-    against `elevations.pdf`'s real rendered page, with zero model call."""
+    labelled element wherever it's asked to, regardless of the image
+    actually sent -- enough to exercise the real
+    `evidence.grounding.ground_elements`/`describe_then_ground`/
+    `_map_to_page_points` geometry against `elevations.pdf`'s real
+    rendered page, with zero model call.
+
+    Branches on `response_model` (the same way the real two-stage
+    `describe_then_ground` distinguishes its own two calls): a stage-1
+    describe call gets back one described element (``"window W.1"``, an
+    `ELEVATION`), and a stage-2 (or direct `ground_elements`) call gets
+    back `self._box` under that same label -- so a caller that runs the
+    full `describe_then_ground` pipeline sees the same deterministic
+    geometry a caller that calls `ground_elements` directly for a probe
+    does.
+    """
 
     def __init__(self, box: list[float]) -> None:
         self._box = box
@@ -919,14 +930,133 @@ class _FakeGroundingClient:
     async def generate(
         self, tier: object, prompt: str, response_model: object, **kwargs: object
     ) -> Any:
-        from setback.evidence.grounding import GroundedElement, GroundingResponse
+        from setback.evidence.grounding import (
+            DescribedElement,
+            DrawingDescription,
+            DrawingType,
+            GroundedElement,
+            GroundingResponse,
+        )
         from setback.models.client import ModelResult, TokenUsage
 
+        output: DrawingDescription | GroundingResponse
+        if response_model is DrawingDescription:
+            output = DrawingDescription(
+                drawing_type=DrawingType.ELEVATION,
+                elements=[DescribedElement(name="window W.1", approx_location="upper-left")],
+            )
+        else:
+            output = GroundingResponse(
+                elements=[GroundedElement(label="window W.1", box=self._box)]
+            )
         return ModelResult(
-            output=GroundingResponse(elements=[GroundedElement(label="window W.1", box=self._box)]),
+            output=output,
             usage=TokenUsage(prompt_tokens=10, output_tokens=5),
             model="gemini-3.5-flash-lite",
         )
+
+
+class _SitePlanFakeGroundingClient:
+    """A `ModelClient`-shaped double that describes a page as a `SITE_PLAN`
+    with site-plan-vocabulary elements, then grounds exactly those --
+    CASES.md's Blocker 1, the core wave-11 regression: a document that
+    looks like a site plan must never be grounded with the old hardcoded
+    elevation-only labels (window/door/height datum), regardless of what
+    document it replaced them on."""
+
+    async def generate(
+        self, tier: object, prompt: str, response_model: object, **kwargs: object
+    ) -> Any:
+        from setback.evidence.grounding import (
+            DescribedElement,
+            DrawingDescription,
+            DrawingType,
+            GroundedElement,
+            GroundingResponse,
+        )
+        from setback.models.client import ModelResult, TokenUsage
+
+        output: DrawingDescription | GroundingResponse
+        if response_model is DrawingDescription:
+            output = DrawingDescription(
+                drawing_type=DrawingType.SITE_PLAN,
+                elements=[
+                    DescribedElement(
+                        name="building footprint",
+                        approx_location="centre",
+                        relevant_to=["height_bulk"],
+                    ),
+                    DescribedElement(
+                        name="north boundary setback",
+                        approx_location="left edge",
+                        relevant_to=["overshadowing"],
+                    ),
+                ],
+                orientation_cues="north arrow top-left",
+            )
+        else:
+            output = GroundingResponse(
+                elements=[
+                    GroundedElement(label="building footprint", box=[100.0, 100.0, 400.0, 400.0]),
+                    GroundedElement(label="north boundary setback", box=[0.0, 0.0, 1000.0, 50.0]),
+                ]
+            )
+        return ModelResult(
+            output=output,
+            usage=TokenUsage(prompt_tokens=10, output_tokens=5),
+            model="gemini-3.5-flash-lite",
+        )
+
+
+async def test_ground_annotated_evidence_grounds_site_plan_labels_not_elevation_labels() -> None:
+    """The founder's diagnosis, end to end through the real pipeline call
+    site: a document whose title looks like a site plan (not an elevation)
+    must be grounded in site-plan vocabulary (e.g. "building footprint"),
+    never the old hardcoded elevation-only label list -- CASES.md's
+    Blocker 1, confirmed live on the real `5e791203...` case's Site Plan
+    drawing, the exact defect this wave fixes."""
+    document_source = UserUploadedDocumentSource()
+    store = InMemoryCaseStore()
+    case = await store.create_case(
+        application_number=_APPLICATION_NUMBER, resident_session="resident-1"
+    )
+    case_id = case.case_id
+
+    plan_document_id = "site-plan-doc"
+    # The real bytes don't matter for this fake-model unit test -- only the
+    # filename (routed through `_looks_like_plan_document`/`_select_plan_
+    # document`) and the fake grounding client's own scripted responses do.
+    document_source.add_document(_APPLICATION_NUMBER, plan_document_id, ELEVATIONS_PDF.read_bytes())
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{plan_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": plan_document_id,
+            "filename": "site-plan.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 12345,
+        },
+    )
+
+    async def _no_classification(filename: str, first_page_text: str, *, client: object) -> object:
+        return None
+
+    grounding_client = _SitePlanFakeGroundingClient()
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        grounding_client=grounding_client,  # type: ignore[arg-type]
+        document_classifier=_no_classification,  # type: ignore[arg-type]
+    )
+    resume = await resume_case(store, case_id)
+    dossier, _ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+
+    _dossier, ctx = await runner._ground_annotated_evidence(dossier)  # noqa: SLF001
+
+    assert ctx is not None
+    labels = {box.label for box in ctx.boxes}
+    assert labels == {"building footprint", "north boundary setback"}
+    assert not any("window" in label.lower() or "door" in label.lower() for label in labels)
 
 
 async def test_run_renders_semantic_overlay_colouring_a_shipped_grounds_anchor_green() -> None:
