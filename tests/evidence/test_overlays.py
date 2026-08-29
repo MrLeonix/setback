@@ -25,7 +25,7 @@ from __future__ import annotations
 import io
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
 
 from setback.evidence.dossier import BoundingBox, RenderedPage, render_photo
 from setback.evidence.overlays import (
@@ -33,6 +33,8 @@ from setback.evidence.overlays import (
     AnchoredElement,
     OverlayBox,
     OverlayRole,
+    _draw_label_chip,
+    _label_font,
     build_overlay_boxes,
     classify_role,
     label_for,
@@ -326,3 +328,56 @@ def test_render_semantic_overlay_at_a_real_pdf_pages_dpi_draws_inside_the_image_
     # box's colour -- guards against a degenerate transform that paints the
     # whole canvas or clamps every box to one corner.
     assert image.getpixel((5, 5)) != OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED]
+
+
+# --- label chip word spacing (SMOKE.md wave-6 live finding) -----------------
+#
+# PIL's implicit default font (`ImageDraw.text` called with no `font=`) is
+# a tiny fixed-size bitmap font whose space glyph measures only ~2px wide
+# before anti-aliasing/resizing -- reproduced independently and reported
+# live: a real multi-word caption like "This element" reads as
+# "Thiselement" on screen. `_label_font()` must load a real TTF/TTC
+# instead, whose space glyph is unambiguously wider.
+
+
+def test_label_font_renders_a_visibly_wider_gap_than_pils_bitmap_default() -> None:
+    """`_label_font()` measures a real space glyph, not the ~2px one PIL's
+    own `ImageFont.load_default()` produces (measured directly against the
+    same two strings below)."""
+    from PIL import Image, ImageFont
+
+    image = Image.new("RGB", (10, 10))
+    draw = ImageDraw.Draw(image)
+
+    default_two_word = draw.textbbox((0, 0), "This element", font=ImageFont.load_default())[2]
+    default_concatenated = draw.textbbox((0, 0), "Thiselement", font=ImageFont.load_default())[2]
+    default_gap = default_two_word - default_concatenated
+
+    font = _label_font()
+    two_word = draw.textbbox((0, 0), "This element", font=font)[2]
+    concatenated = draw.textbbox((0, 0), "Thiselement", font=font)[2]
+    real_gap = two_word - concatenated
+
+    assert real_gap > default_gap
+    assert real_gap > 3
+
+
+def test_draw_label_chip_renders_a_two_word_caption_wider_than_the_concatenated_word() -> None:
+    """The actual drawing entry point every overlay box goes through:
+    a chip drawn for "This element" must be measurably wider than the
+    same caption with its space stripped out ("Thiselement"), drawn the
+    same way -- pins the fix at the call site the live finding reproduced
+    against, not just at the font loader in isolation."""
+
+    def _chip_pixel_width(text: str) -> int:
+        blank = Image.new("RGB", (500, 150), color=(255, 255, 255))
+        image = blank.copy()
+        draw = ImageDraw.Draw(image)
+        _draw_label_chip(draw, 10.0, 120.0, text, (0, 0, 0))
+        bbox = ImageChops.difference(image, blank).getbbox()
+        assert bbox is not None, "the chip must draw something"
+        return bbox[2] - bbox[0]
+
+    two_word_width = _chip_pixel_width("This element")
+    concatenated_width = _chip_pixel_width("Thiselement")
+    assert two_word_width - concatenated_width > 3

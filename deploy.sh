@@ -49,17 +49,14 @@ MAPS_SECRET="maps-api-key"
 FIRESTORE_DB="${SETBACK_FIRESTORE_DB:-setback-au}"
 GCS_UPLOADS_BUCKET="${SETBACK_GCS_UPLOADS_BUCKET:-vexcourt-agent-setback-au}"
 # `SETBACK_DOCKET_KEY`: the public docket **list** route's passphrase gate
-# (console/app.py::_docket_key_accepted). Read from the operator's own shell
-# environment only -- never hardcoded here, never committed. If unset, the
-# app's own documented fallback applies and the gate is disabled entirely
-# (fine for local dev; NOT fine for a public deploy, since that's the exact
-# PII-exposure gap this variable exists to close). This script warns, but
-# does not fail, when it's unset, since a first-time/local deploy should
-# still succeed.
-DOCKET_KEY="${SETBACK_DOCKET_KEY:-}"
-if [[ -z "${DOCKET_KEY}" ]]; then
-  log "WARNING: SETBACK_DOCKET_KEY is not set in this shell -- the public docket board's case list will be reachable with NO passphrase on this deploy. Export SETBACK_DOCKET_KEY before running this script for any public-facing deploy."
-fi
+# (console/app.py::_docket_key_accepted). Wired from Secret Manager only,
+# via `--update-secrets` below -- never a literal `--set-env-vars` value --
+# so this script never reads, prints, or holds the passphrase itself; the
+# orchestrator rotates it by updating the `docket-key` secret's value, not
+# by touching this script. `SETBACK_DOCKET_KEY_SECRET` lets a non-default
+# secret resource name be substituted (e.g. per-environment); it names the
+# secret, never the secret's value.
+DOCKET_KEY_SECRET="${SETBACK_DOCKET_KEY_SECRET:-docket-key}"
 
 TAG="$(date -u +%Y%m%dt%H%M%Sz)"
 AR_HOST="${REGION}-docker.pkg.dev"
@@ -68,6 +65,19 @@ IMAGE="${AR_HOST}/${PROJECT_ID}/${REPO}/${IMAGE_NAME}:${TAG}"
 log() { printf '\n>> %s\n' "$*" >&2; }
 
 log "Project: ${PROJECT_ID}  Region: ${REGION}  Image: ${IMAGE}"
+
+# --- 0. Docket-key secret must already exist in Secret Manager ---------------
+# Fails fast, before any build/deploy work starts, if `docket-key` hasn't been
+# created yet -- replaces the old "warn if SETBACK_DOCKET_KEY is unset in this
+# shell" check now that the passphrase is never read from the shell
+# environment at all (it lives only in Secret Manager; see above).
+log "Checking Secret Manager secret '${DOCKET_KEY_SECRET}' exists"
+if ! gcloud secrets describe "${DOCKET_KEY_SECRET}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  echo "ERROR: Secret Manager secret '${DOCKET_KEY_SECRET}' does not exist in project ${PROJECT_ID}." >&2
+  echo "Create it before deploying, e.g.:" >&2
+  echo "  printf '%s' '<passphrase>' | gcloud secrets create ${DOCKET_KEY_SECRET} --project=${PROJECT_ID} --data-file=-" >&2
+  exit 1
+fi
 
 # --- 1. Required APIs (idempotent: enabling an already-enabled API is a no-op) ---
 log "Ensuring required APIs are enabled"
@@ -118,12 +128,23 @@ gcloud builds submit \
   --tag="${IMAGE}" \
   "$(dirname "${BASH_SOURCE[0]}")"
 
+# --- 3b. Least-privilege IAM: sa-console may read exactly the docket-key secret.
+# Granted before the console deploy below, since Cloud Run validates secret
+# access for the target service account at revision-creation time (same
+# reasoning as step 5's maps-secret grant for sa-orchestrator).
+log "Granting sa-console secretAccessor on ${DOCKET_KEY_SECRET} only (resource-scoped)"
+gcloud secrets add-iam-policy-binding "${DOCKET_KEY_SECRET}" \
+  --project="${PROJECT_ID}" \
+  --member="serviceAccount:${CONSOLE_SA}" \
+  --role="roles/secretmanager.secretAccessor"
+
 # --- 4. Deploy setback-console (Cloud Run Service) ---
-# `--clear-secrets`: console never reads the Maps secret (only the tribunal
-# job's evidence/imagery.py Street View fallback does, per ARCHITECTURE.md
-# §5) -- explicit every run so an unspecified `--set-secrets` on a redeploy
-# can never silently inherit a stale secret reference from the prior
-# revision's template.
+# `--update-secrets`: the console's *only* secret is `SETBACK_DOCKET_KEY`,
+# mounted from `docket-key` (never the Maps secret -- only the tribunal
+# job's evidence/imagery.py Street View fallback reads that one, per
+# ARCHITECTURE.md §5). Explicit, named every run so a redeploy always
+# converges the console's secret wiring to exactly this one reference
+# rather than depending on whatever the prior revision's template held.
 log "Deploying Cloud Run service ${CONSOLE_SERVICE}"
 # `--session-affinity`: best-effort cookie-based routing that prefers sending
 # a given browser session's requests back to the same instance, mitigating
@@ -143,8 +164,8 @@ gcloud run deploy "${CONSOLE_SERVICE}" \
   --session-affinity \
   --cpu-throttling \
   --port=8080 \
-  --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID},SETBACK_FIRESTORE_DB=${FIRESTORE_DB},SETBACK_GCS_UPLOADS_BUCKET=${GCS_UPLOADS_BUCKET},SETBACK_DOCKET_KEY=${DOCKET_KEY}" \
-  --clear-secrets \
+  --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID},SETBACK_FIRESTORE_DB=${FIRESTORE_DB},SETBACK_GCS_UPLOADS_BUCKET=${GCS_UPLOADS_BUCKET}" \
+  --update-secrets="SETBACK_DOCKET_KEY=${DOCKET_KEY_SECRET}:latest" \
   --allow-unauthenticated \
   --quiet
 

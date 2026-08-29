@@ -16,7 +16,14 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from setback.evidence.dossier import BoundingBox, RenderedPage, anchor_id_for, render_pdf_pages
+from setback.evidence.dossier import (
+    BoundingBox,
+    EvidenceAnchor,
+    ProvenanceGrade,
+    RenderedPage,
+    anchor_id_for,
+    render_pdf_pages,
+)
 from setback.evidence.grounding import GroundedBox
 from setback.evidence.overlays import OVERLAY_COLOR, OverlayRole
 from setback.gate.validator import GateStatus
@@ -27,6 +34,7 @@ from setback.job.pipeline import (
     _GroundedOverlayContext,
     _load_frozen_ingest,
     _plan_document_title,
+    _propagate_page_level_anchor_status,
     _shrink_png_for_storage,
 )
 from setback.state.firestore import GroundStatus, InMemoryCaseStore, resume_case
@@ -138,7 +146,7 @@ async def test_classify_plan_document_calls_the_injected_classifier() -> None:
 
     runner = RealPipelineRunner(
         document_source=UserUploadedDocumentSource(),
-        grounding_client=object(),  # type: ignore[arg-type] -- truthiness only, never called
+        grounding_client=object(),  # truthiness only, never called  # type: ignore[arg-type]
         document_classifier=fake_classifier,  # type: ignore[arg-type]
     )
     kind = await runner._classify_plan_document(  # noqa: SLF001 -- white-box unit test
@@ -337,6 +345,53 @@ async def _seed_case(
     )
 
     return case_id, overshadowing_id, property_value_id
+
+
+async def _seed_case_single_ground(
+    store: InMemoryCaseStore, *, document_source: UserUploadedDocumentSource
+) -> tuple[str, str]:
+    """Like `_seed_case` but with exactly one confirmed ground -- for tests
+    that need every ground's reviewer citation to land on a single,
+    known ground (`FakeLlm` repeats its last queued body for any call
+    beyond its queue, so a second, unrelated ground in the case would
+    otherwise silently reuse the same fake citation, muddying which
+    ground a given anchor ends up attributed to). Returns
+    `(case_id, ground_id)`."""
+    case = await store.create_case(
+        application_number=_APPLICATION_NUMBER, resident_session="resident-1"
+    )
+    case_id = case.case_id
+
+    plan_document_id = "elevations-doc"
+    document_source.add_document(_APPLICATION_NUMBER, plan_document_id, ELEVATIONS_PDF.read_bytes())
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{plan_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": plan_document_id,
+            "filename": "elevations.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 12345,
+        },
+    )
+
+    overshadowing_id = "ground-overshadowing"
+    await store.propose_ground(
+        case_id, overshadowing_id, claim="The new build will overshadow our north-facing yard."
+    )
+    await store.append_event(
+        case_id,
+        f"ground-category:{overshadowing_id}",
+        "ground_category_assigned",
+        payload={
+            "ground_id": overshadowing_id,
+            "category": "environmental_and_social_impacts",
+            "concern_type": "overshadowing",
+            "evidence_document_ids": [plan_document_id],
+        },
+    )
+    return case_id, overshadowing_id
 
 
 async def test_run_ships_a_resolvable_ground_and_refuses_the_irrelevant_one() -> None:
@@ -724,3 +779,277 @@ def test_semantic_overlay_png_colours_an_undecided_anchor_neutral_blue() -> None
 
     image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     assert image.getpixel((21, 51)) == OVERLAY_COLOR[OverlayRole.EVIDENCE_ANCHOR]
+
+
+# --- page-level anchor status propagation (root cause of neutral overlays --
+# in live runs: a reviewer/gate citing a document's whole-page anchor,
+# rather than one of the fine-grained bbox anchors `_ground_annotated_
+# evidence` registers alongside it, left every drawn bbox with no ground of
+# its own -- see `_propagate_page_level_anchor_status`'s docstring) --------
+
+
+async def _dossier_with_a_bbox_anchor(bbox: BoundingBox) -> tuple[Any, str]:
+    """A real dossier (via `_seed_case`/`_build_dossier`, exactly like the
+    other tests in this module) with one extra, synthetic fine-grained
+    bbox anchor registered on `elevations-doc` page 1 -- standing in for
+    what `_ground_annotated_evidence`'s real grounding pass would have
+    registered. Returns `(dossier, bbox_anchor_id)`."""
+    document_source = UserUploadedDocumentSource()
+    store = InMemoryCaseStore()
+    case_id, _overshadowing_id, _property_value_id = await _seed_case(
+        store, document_source=document_source
+    )
+    runner = RealPipelineRunner(document_source=document_source, grounding_client=None)
+    resume = await resume_case(store, case_id)
+    dossier = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+
+    bbox_anchor_id = anchor_id_for("elevations-doc", 1, bbox)
+    dossier = dossier.with_anchor(
+        EvidenceAnchor(
+            anchor_id=bbox_anchor_id,
+            source_doc="elevations-doc",
+            page=1,
+            bbox=bbox,
+            provenance_grade=ProvenanceGrade.DOCUMENTS_ONLY,
+            caption="window W.1",
+        )
+    )
+    return dossier, bbox_anchor_id
+
+
+async def test_propagate_page_level_anchor_status_reaches_an_uncited_bbox_anchor() -> None:
+    """The exact root-cause fix: a ground's citation of the whole-page
+    anchor (`bbox=None`) -- not any specific bbox anchor -- must still
+    colour a bbox anchor drawn on that same page, rather than leaving it
+    permanently neutral."""
+    bbox = BoundingBox(x0=10, y0=10, x1=50, y1=50)
+    dossier, bbox_anchor_id = await _dossier_with_a_bbox_anchor(bbox)
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+
+    result = _propagate_page_level_anchor_status(
+        dossier,
+        anchor_ground={page_anchor_id: "ground-1"},
+        page_level_ground_ids={page_anchor_id: ["ground-1"]},
+        ground_status={"ground-1": GateStatus.SHIPPED},
+    )
+
+    assert result[bbox_anchor_id] == "ground-1"
+
+
+async def test_propagate_page_level_anchor_status_leaves_other_pages_untouched() -> None:
+    """A page-level citation on one page must never bleed onto a bbox
+    anchor registered on a different page of the same document."""
+    bbox = BoundingBox(x0=10, y0=10, x1=50, y1=50)
+    document_source = UserUploadedDocumentSource()
+    store = InMemoryCaseStore()
+    case_id, _overshadowing_id, _property_value_id = await _seed_case(
+        store, document_source=document_source
+    )
+    runner = RealPipelineRunner(document_source=document_source, grounding_client=None)
+    resume = await resume_case(store, case_id)
+    dossier = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+    other_page_bbox_anchor_id = anchor_id_for("elevations-doc", 2, bbox)
+    dossier = dossier.with_anchor(
+        EvidenceAnchor(
+            anchor_id=other_page_bbox_anchor_id,
+            source_doc="elevations-doc",
+            page=2,
+            bbox=bbox,
+            provenance_grade=ProvenanceGrade.DOCUMENTS_ONLY,
+            caption="window W.1",
+        )
+    )
+    page_1_anchor_id = anchor_id_for("elevations-doc", 1, None)
+
+    result = _propagate_page_level_anchor_status(
+        dossier,
+        anchor_ground={page_1_anchor_id: "ground-1"},
+        page_level_ground_ids={page_1_anchor_id: ["ground-1"]},
+        ground_status={"ground-1": GateStatus.SHIPPED},
+    )
+
+    assert other_page_bbox_anchor_id not in result
+
+
+async def test_propagate_page_level_anchor_status_most_severe_wins_across_grounds() -> None:
+    """When more than one ground cites the same page-level anchor and they
+    end up with different gate outcomes, the bbox anchors on that page
+    must show the most severe (refused > flagged > shipped) of them --
+    never a quiet green just because *some* ground on the page shipped,
+    while another ground the gate refused also cited it."""
+    bbox = BoundingBox(x0=10, y0=10, x1=50, y1=50)
+    dossier, bbox_anchor_id = await _dossier_with_a_bbox_anchor(bbox)
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+
+    result = _propagate_page_level_anchor_status(
+        dossier,
+        anchor_ground={page_anchor_id: "ground-shipped"},
+        page_level_ground_ids={page_anchor_id: ["ground-shipped", "ground-refused"]},
+        ground_status={
+            "ground-shipped": GateStatus.SHIPPED,
+            "ground-refused": GateStatus.REFUSED_UNSUBSTANTIATED,
+        },
+    )
+
+    assert result[bbox_anchor_id] == "ground-refused"
+
+
+async def test_propagate_page_level_anchor_status_most_severe_wins_flagged_over_shipped() -> None:
+    bbox = BoundingBox(x0=10, y0=10, x1=50, y1=50)
+    dossier, bbox_anchor_id = await _dossier_with_a_bbox_anchor(bbox)
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+
+    result = _propagate_page_level_anchor_status(
+        dossier,
+        anchor_ground={page_anchor_id: "ground-shipped"},
+        page_level_ground_ids={page_anchor_id: ["ground-shipped", "ground-flagged"]},
+        ground_status={
+            "ground-shipped": GateStatus.SHIPPED,
+            "ground-flagged": GateStatus.FLAGGED,
+        },
+    )
+
+    assert result[bbox_anchor_id] == "ground-flagged"
+
+
+async def test_propagate_page_level_anchor_status_a_direct_citation_competes_on_equal_footing() -> (
+    None
+):
+    """A bbox anchor that was itself directly cited by a shipped ground
+    must still be overridden to the more severe status when the page it
+    lives on is *also* cited by a ground the gate refused -- direct and
+    inherited citations both enter the same most-severe contest, so a
+    genuinely refused-and-cited box is never masked by its own direct
+    (but less severe) citation."""
+    bbox = BoundingBox(x0=10, y0=10, x1=50, y1=50)
+    dossier, bbox_anchor_id = await _dossier_with_a_bbox_anchor(bbox)
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+
+    result = _propagate_page_level_anchor_status(
+        dossier,
+        anchor_ground={
+            page_anchor_id: "ground-refused",
+            bbox_anchor_id: "ground-shipped",
+        },
+        page_level_ground_ids={page_anchor_id: ["ground-refused"]},
+        ground_status={
+            "ground-shipped": GateStatus.SHIPPED,
+            "ground-refused": GateStatus.REFUSED_UNSUBSTANTIATED,
+        },
+    )
+
+    assert result[bbox_anchor_id] == "ground-refused"
+
+
+async def test_propagate_status_keeps_a_direct_citation_when_no_page_citation_exists() -> None:
+    """A bbox anchor with only a direct citation (no page-level citation on
+    its page at all) must keep exactly that citation, unchanged."""
+    bbox = BoundingBox(x0=10, y0=10, x1=50, y1=50)
+    dossier, bbox_anchor_id = await _dossier_with_a_bbox_anchor(bbox)
+
+    result = _propagate_page_level_anchor_status(
+        dossier,
+        anchor_ground={bbox_anchor_id: "ground-shipped"},
+        page_level_ground_ids={},
+        ground_status={"ground-shipped": GateStatus.SHIPPED},
+    )
+
+    assert result[bbox_anchor_id] == "ground-shipped"
+
+
+async def test_run_colours_a_bbox_anchor_shipped_when_only_the_page_level_anchor_was_cited() -> (
+    None
+):
+    """End-to-end regression test for the root cause itself: reviewers cite
+    only the plan document's whole-page anchor (exactly what a real
+    Gemini reviewer looking at one full-page image, rather than a specific
+    fine-grained crop, plausibly does) while a grounding pass has also
+    registered a fine-grained bbox anchor on that same page. Before this
+    fix, the rendered overlay's box stayed neutral grey; the fix must
+    colour it green (the shipped ground's colour)."""
+    from setback.evidence.grounding import ground_elements
+
+    grounding_client = _FakeGroundingClient(box=[400.0, 400.0, 500.0, 500.0])
+    page = render_pdf_pages(ELEVATIONS_PDF.read_bytes())[0]
+    probe = await ground_elements(grounding_client, page, ("window W.1",))
+    grounded_bbox = probe.boxes[0].bbox
+    grounded_anchor_id = anchor_id_for("elevations-doc", 1, grounded_bbox)
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+    assert grounded_anchor_id != page_anchor_id  # sanity: these are genuinely distinct anchors
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, overshadowing_id = await _seed_case_single_ground(
+        store, document_source=document_source
+    )
+
+    # Both reviewers cite only the page-level anchor -- never the
+    # fine-grained bbox anchor grounding registered alongside it.
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[
+                review_body(
+                    ground_id=overshadowing_id,
+                    stance="support",
+                    confidence=0.95,
+                    cited_anchor_ids=[page_anchor_id],
+                    rationale="clause reviewer supports",
+                )
+            ],
+        ),
+        evidence_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[
+                review_body(
+                    ground_id=overshadowing_id,
+                    stance="support",
+                    confidence=0.9,
+                    cited_anchor_ids=[page_anchor_id],
+                    rationale="evidence reviewer supports",
+                )
+            ],
+        ),
+        grounding_client=grounding_client,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    grounds = {g.ground_id: g for g in await store.list_grounds(case_id)}
+    assert grounds[overshadowing_id].status is GroundStatus.SUPPORTED
+
+    events = await store.list_events(case_id)
+    overlay_events = [e for e in events if e.event_type == "annotated_overlay"]
+    assert len(overlay_events) == 1
+    image = Image.open(
+        io.BytesIO(base64.b64decode(overlay_events[0].payload["image_base64"]))
+    ).convert("RGB")
+    # The grounded box's top-left corner, in this render's real full-res
+    # pixel geometry (same derivation `test_semantic_overlay_png_colours_
+    # a_shipped_anchor_green` uses) -- then rescaled by whatever
+    # `_shrink_png_for_storage` downscaled the stored overlay by, since
+    # this fixture's real full-resolution render (4962px wide) is well
+    # over the storage width cap.
+    pt_to_px = page.dpi / 72.0
+    px_x0 = grounded_bbox.x0 * pt_to_px
+    px_y0 = (page.height_pts - grounded_bbox.y1) * pt_to_px
+    full_res_width = Image.open(io.BytesIO(page.png_bytes)).width
+    scale = image.width / full_res_width
+    center_x, center_y = round(px_x0 * scale), round(px_y0 * scale)
+    # Scan a window around the estimated corner for the shipped colour.
+    # The real `elevations.pdf` render is downscaled ~4x for storage
+    # (`_shrink_png_for_storage`), which both shifts the thin (4px-wide,
+    # pre-shrink) drawn border by tens of pixels from this estimate and
+    # anti-aliases most of it into blended shades -- only a handful of
+    # pixels survive as the exact `OVERLAY_COLOR` value, so the window
+    # must be generous, not pixel-tight.
+    window = [
+        image.getpixel((x, y))
+        for x in range(max(0, center_x - 30), min(image.width, center_x + 30))
+        for y in range(max(0, center_y - 30), min(image.height, center_y + 30))
+    ]
+    assert OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED] in window, (
+        "the grounded bbox must inherit the SHIPPED status from the page-level "
+        "citation its reviewers actually made, not stay neutral grey"
+    )

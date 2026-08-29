@@ -69,6 +69,7 @@ from __future__ import annotations
 import base64
 import io
 import sys
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -477,6 +478,95 @@ def _ground_status_for(status: GateStatus) -> GroundStatus:
     return GroundStatus.REFUSED
 
 
+_STATUS_SEVERITY: Final[Mapping[GateStatus, int]] = {
+    GateStatus.SHIPPED: 1,
+    GateStatus.FLAGGED: 2,
+    GateStatus.REFUSED_UNSUBSTANTIATED: 3,
+    GateStatus.REFUSED_IRRELEVANT: 3,
+}
+"""Ordering used only to resolve which ground "wins" when more than one
+ground ends up in contention for the same evidence anchor (see
+`_propagate_page_level_anchor_status`) -- an outright refusal is the most
+severe outcome to surface to the resident, then flagged (needs a human),
+then shipped; higher wins. Never used to compare `GateStatus` for any
+other purpose -- `_ground_status_for`/`classify_role` remain the source of
+truth for what each status *means*, this is purely a tie-break order."""
+
+
+def _most_severe_ground(
+    ground_ids: Sequence[str], ground_status: Mapping[str, GateStatus]
+) -> str | None:
+    """The single `ground_id` in `ground_ids` whose status is most severe
+    per `_STATUS_SEVERITY` (first one seen wins a tie). `None` if
+    `ground_ids` is empty or none of them has a decided status yet (should
+    not happen when called after the full ground loop, where every ground
+    id already has a `GateDecision`, but handled defensively rather than
+    assumed)."""
+    winner: str | None = None
+    winner_severity = -1
+    for ground_id in ground_ids:
+        status = ground_status.get(ground_id)
+        if status is None:
+            continue
+        severity = _STATUS_SEVERITY.get(status, 0)
+        if severity > winner_severity:
+            winner = ground_id
+            winner_severity = severity
+    return winner
+
+
+def _propagate_page_level_anchor_status(
+    dossier: CaseDossier,
+    anchor_ground: Mapping[str, str],
+    page_level_ground_ids: Mapping[str, Sequence[str]],
+    ground_status: Mapping[str, GateStatus],
+) -> dict[str, str]:
+    """Fix for the root cause of neutral (grey) overlay boxes seen in live
+    runs: `_court_slices` registers a whole-page anchor
+    (``anchor_id_for(doc, page, None)``) alongside every fine-grained bbox
+    anchor `_ground_annotated_evidence` locates on that same page, and a
+    reviewer is free to cite either -- a real reviewer looking at one
+    full-page image plausibly cites the page as a whole rather than a
+    specific crop. When it does, the page-level anchor ends up with a
+    ground in `anchor_ground`, but every *drawn* bbox anchor on that page
+    has none, so `evidence.overlays.classify_role` renders them all as a
+    neutral `EVIDENCE_ANCHOR` even though the page they sit on was in fact
+    cited and decided.
+
+    Propagates every page-level citation's ground down onto every bbox
+    anchor registered on that same ``(source_doc, page)``. A bbox anchor
+    that was itself *also* directly cited competes on equal footing with
+    any inherited page-level ground rather than being overridden
+    unconditionally: when more than one ground is in contention for the
+    same bbox anchor (multiple grounds cited the page, or a direct
+    citation's ground differs from an inherited one), the most severe
+    resulting status wins (`_most_severe_ground`) -- refused beats
+    flagged beats shipped -- so a box already cited by a ground the gate
+    refused is never quietly overwritten green by an unrelated ground
+    that also happens to cite the same page.
+
+    `anchor_ground` is never mutated; a new mapping is returned with an
+    entry for every bbox anchor that ends up with an effective ground
+    (direct, inherited, or both) -- a bbox anchor with neither stays
+    absent, exactly as `anchor_ground` already represents "no ground"
+    today (renders `EVIDENCE_ANCHOR`, per `classify_role`).
+    """
+    result = dict(anchor_ground)
+    for anchor in dossier.anchors.values():
+        if anchor.bbox is None:
+            continue  # only propagating *onto* fine-grained bbox anchors
+        page_anchor_id = anchor_id_for(anchor.source_doc, anchor.page, None)
+        inherited = page_level_ground_ids.get(page_anchor_id)
+        if not inherited:
+            continue  # nothing cited this bbox's page-level anchor
+        direct = anchor_ground.get(anchor.anchor_id)
+        candidates = list(inherited) + ([direct] if direct is not None else [])
+        winner = _most_severe_ground(candidates, ground_status)
+        if winner is not None:
+            result[anchor.anchor_id] = winner
+    return result
+
+
 class RealPipelineRunner:
     """The production `job.main.PipelineRunner`: ingest -> evidence dossier
     -> court -> gate -> dispatch, for the one demo case this build supports.
@@ -662,6 +752,12 @@ class RealPipelineRunner:
         # ground's gate outcome) is rendered and emitted below, after the
         # ground loop -- see `_ground_annotated_evidence`'s docstring.
         anchor_ground: dict[str, str] = {}
+        # Every ground_id that cited a *page-level* (bbox=None) anchor,
+        # keyed by that page-level anchor's own id -- multi-valued (unlike
+        # `anchor_ground` above) so `_propagate_page_level_anchor_status`
+        # can resolve the most severe outcome when more than one ground
+        # cites the same page. See that function's docstring.
+        page_level_ground_ids: dict[str, list[str]] = defaultdict(list)
 
         ledger = resume.ledger or Ledger()
         adjudicator_breaker = resume.breakers.get(_ADJUDICATOR_BREAKER_NAME) or CircuitBreaker(
@@ -716,6 +812,12 @@ class RealPipelineRunner:
             for anchor_id in result.verdict.cited_anchor_ids:
                 anchor_ground[anchor_id] = ground.ground_id
                 anchor = dossier.anchors.get(anchor_id)
+                if anchor is not None and anchor.bbox is None:
+                    # A page-level citation -- tracked separately (multi-
+                    # valued) so `_propagate_page_level_anchor_status` can
+                    # spread it onto every bbox anchor on the same page
+                    # once every ground's gate decision is known, below.
+                    page_level_ground_ids[anchor_id].append(ground.ground_id)
                 if anchor is not None and anchor.bbox is not None:
                     await store.add_evidence_anchor(
                         case_id,
@@ -812,8 +914,11 @@ class RealPipelineRunner:
 
         if grounding_ctx is not None:
             ground_status: dict[str, GateStatus] = {d.ground_id: d.status for d in decisions}
+            effective_anchor_ground = _propagate_page_level_anchor_status(
+                dossier, anchor_ground, page_level_ground_ids, ground_status
+            )
             overlay_png = self._semantic_overlay_png(
-                grounding_ctx, ground_status=ground_status, anchor_ground=anchor_ground
+                grounding_ctx, ground_status=ground_status, anchor_ground=effective_anchor_ground
             )
             await store.append_event(
                 case_id,

@@ -63,13 +63,14 @@ has no opinion on how a caller assembles that mapping -- see
 
 from __future__ import annotations
 
+import functools
 import io
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from setback.evidence.dossier import BoundingBox, RenderedPage
 from setback.gate.validator import GateStatus
@@ -233,19 +234,70 @@ _BOX_WIDTH_PX: Final[int] = 4
 _CHIP_PADDING_PX: Final[int] = 4
 _CHIP_TEXT_COLOR: Final[tuple[int, int, int]] = (255, 255, 255)
 
+_LABEL_FONT_SIZE_PX: Final[int] = 16
+_LABEL_FONT_PATHS: Final[tuple[str, ...]] = (
+    # macOS (dev boxes, screenshots taken locally).
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/Library/Fonts/Arial.ttf",
+    # Linux (Debian/Ubuntu-family container base images, e.g. this repo's
+    # own `python:3.12-slim` -- present only if a font package such as
+    # `fonts-dejavu-core`/`fonts-liberation` is installed in the image).
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _label_font() -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+    """A real TTF/TTC font for label-chip captions, tried in order down
+    `_LABEL_FONT_PATHS`.
+
+    Fixes a live-reported bug: `ImageDraw.text`/`textbbox` called with no
+    `font=` (this module's previous behaviour) falls back to PIL's own
+    ``ImageFont.load_default()`` -- a tiny fixed-size bitmap font whose
+    space glyph measures only ~2px wide, which disappears entirely once
+    the annotated overlay is downscaled for storage
+    (`job/pipeline.py::_shrink_png_for_storage`) or simply anti-aliased on
+    screen. A multi-word caption like ``"This element"`` reads as
+    ``"Thiselement"`` -- reproduced independently in a 3-line PIL script
+    and confirmed against every real multi-word evidence caption, not
+    just this module's own fixtures (see `SMOKE.md`, wave 6).
+
+    Falls back to `ImageFont.load_default()` only if none of
+    `_LABEL_FONT_PATHS` exists on this machine at all, so this function
+    never raises -- a missing font package on a given deploy target
+    degrades the chip's legibility, it must never crash the overlay
+    render. Cached (`lru_cache`) since every call in one process resolves
+    to the same font -- filesystem probing on every box drawn would be
+    wasteful over a page with many anchors.
+    """
+    for path in _LABEL_FONT_PATHS:
+        try:
+            return ImageFont.truetype(path, _LABEL_FONT_SIZE_PX)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
 
 def _draw_label_chip(
     draw: ImageDraw.ImageDraw, x: float, y: float, text: str, color: tuple[int, int, int]
 ) -> None:
     """Draw a filled, coloured tag with white text, anchored just above
     `(x, y)` (a box's top-left corner) -- clamped so it never draws above
-    the image's top edge."""
-    left, top, right, bottom = draw.textbbox((0, 0), text)
+    the image's top edge.
+
+    Uses `_label_font()` (a real TTF, not PIL's implicit bitmap default)
+    so a multi-word caption's spaces render as real, visible gaps -- see
+    that function's docstring."""
+    font = _label_font()
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
     width = (right - left) + 2 * _CHIP_PADDING_PX
     height = (bottom - top) + 2 * _CHIP_PADDING_PX
     chip_top = max(0.0, y - height)
     draw.rectangle((x, chip_top, x + width, chip_top + height), fill=color)
-    draw.text((x + _CHIP_PADDING_PX, chip_top + _CHIP_PADDING_PX), text, fill=_CHIP_TEXT_COLOR)
+    draw.text(
+        (x + _CHIP_PADDING_PX, chip_top + _CHIP_PADDING_PX), text, fill=_CHIP_TEXT_COLOR, font=font
+    )
 
 
 def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> bytes:

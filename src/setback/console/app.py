@@ -708,7 +708,7 @@ def create_app(
             )
         cases: list[tuple[CaseRecord, tuple[GroundRecord, ...]]] = []
         for case in await store.list_cases():
-            if _looks_like_a_resident_session(case.resident_session):
+            if not _is_hygiene_excluded(case):
                 cases.append((case, await store.list_grounds(case.case_id)))
         return render_docket_board(cases, force_theme=theme)
 
@@ -751,6 +751,41 @@ _DOCKET_KEY_ENV_VAR: Final[str] = "SETBACK_DOCKET_KEY"
 _UUID_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
+
+
+_JUNK_METADATA_PATTERNS: Final[tuple[str, ...]] = ("smoke", "test", "wiring-proof", "rate-limit")
+"""Case-insensitive substrings that mark a case as test/smoke/deploy-
+verification debris even when `_looks_like_a_resident_session` alone would
+let it through -- e.g. a scripted/curl-created case given a real
+`window.crypto.randomUUID()`-shaped `resident_session` on purpose, or one
+whose junk label lives in `application_number` rather than
+`resident_session` (a `SMOKE-TEST-PHOTO`/`wave6-wiring-proof`/`rate-limit-
+check` application number). Found live: SMOKE.md v4's own docket-hygiene
+finding, a case that passed the purely structural UUID check but was
+still an obvious smoke artifact by its own label."""
+
+
+def _mentions_a_junk_pattern(text: str) -> bool:
+    lowered = text.lower()
+    return any(pattern in lowered for pattern in _JUNK_METADATA_PATTERNS)
+
+
+def _is_hygiene_excluded(case: CaseRecord) -> bool:
+    """True when `case` should never appear on the public docket-board
+    *list* (its own `/cases/{case_id}` page is unaffected either way --
+    see `docket_board`, which never calls this for the case-page route):
+    a `resident_session` that isn't UUID-shaped (`_looks_like_a_resident_
+    session`), or a `resident_session`/`application_number`/`case_id` that
+    contains one of `_JUNK_METADATA_PATTERNS`. The two checks are
+    deliberately independent (not just "non-UUID OR junk-keyword-in-
+    session") so a case with a genuine random UUID session is still caught
+    when the junk label was put in `application_number` instead."""
+    if not _looks_like_a_resident_session(case.resident_session):
+        return True
+    return any(
+        _mentions_a_junk_pattern(field)
+        for field in (case.resident_session, case.application_number, case.case_id)
+    )
 
 
 def _looks_like_a_resident_session(resident_session: str) -> bool:
@@ -828,7 +863,16 @@ def _docket_status_for(grounds: Sequence[GroundRecord]) -> tuple[str, str]:
     return _DOCKET_STATUS_MODIFIER_AND_LABEL["ready"]
 
 
-def _render_docket_card(case: CaseRecord, grounds: Sequence[GroundRecord]) -> str:
+def _earlier_cases_note(earlier_count: int) -> str:
+    if earlier_count <= 0:
+        return ""
+    noun = "case" if earlier_count == 1 else "cases"
+    return f'<span class="docket-card__earlier">+{earlier_count} earlier {noun}</span>'
+
+
+def _render_docket_card(
+    case: CaseRecord, grounds: Sequence[GroundRecord], *, earlier_count: int = 0
+) -> str:
     modifier, label = _docket_status_for(grounds)
     return f"""
         <a class="docket-card" href="/cases/{_esc(case.case_id)}" title="{_esc(case.case_id)}">
@@ -836,6 +880,7 @@ def _render_docket_card(case: CaseRecord, grounds: Sequence[GroundRecord]) -> st
             <span class="docket-card__app">{_esc(case.application_number)}</span>
             <span class="docket-card__id">{_esc(case.case_id)}</span>
           </div>
+          {_earlier_cases_note(earlier_count)}
           <span class="tag tag--{modifier}">{_esc(label)}</span>
         </a>
         """
@@ -860,6 +905,39 @@ def _html_tag(force_theme: str | None) -> str:
     return "<html>"
 
 
+def _collapse_to_latest_per_application_number(
+    cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ...]]],
+) -> list[tuple[CaseRecord, tuple[GroundRecord, ...], int]]:
+    """Collapse the docket board to one row per `application_number` -- the
+    most recently created case for that application number wins, annotated
+    with how many earlier cases for that same number were folded in (an
+    `earlier_count`, shown as "+N earlier cases"). HIDE only: this only
+    changes what the docket *list* shows -- every older case's data is
+    untouched in `store` and still reachable at its own `/cases/{case_id}`
+    URL (see `docket_board`) -- addressing SMOKE.md v4's own "duplicate
+    app-number labels" docket-hygiene finding (`PAN-661190` appearing
+    twice, `DA2026/0359` three times, all shown as separate "Ready to
+    submit" rows).
+
+    Row order otherwise follows `cases`' own order (i.e. `store.list_
+    cases()`'s order) by the *kept* case, not by grouping/dict-iteration
+    order -- so collapsing duplicates never reshuffles the rest of the
+    board.
+    """
+    by_application: dict[str, list[tuple[CaseRecord, tuple[GroundRecord, ...]]]] = {}
+    for case, grounds in cases:
+        by_application.setdefault(case.application_number, []).append((case, grounds))
+
+    kept_by_case_id: dict[str, tuple[CaseRecord, tuple[GroundRecord, ...], int]] = {}
+    for group in by_application.values():
+        latest_case, latest_grounds = max(group, key=lambda item: item[0].created_at)
+        kept_by_case_id[latest_case.case_id] = (latest_case, latest_grounds, len(group) - 1)
+
+    return [
+        kept_by_case_id[case.case_id] for case, _grounds in cases if case.case_id in kept_by_case_id
+    ]
+
+
 def render_docket_board(
     cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ...]]],
     *,
@@ -867,8 +945,15 @@ def render_docket_board(
 ) -> str:
     """Render the docket board: every case this console instance has
     created, each as a `.docket-card` (UI-SPEC.md §3.1) carrying a derived
-    overall-status tag rather than a bare grounds count."""
-    rows = "".join(_render_docket_card(case, grounds) for case, grounds in cases)
+    overall-status tag rather than a bare grounds count -- collapsed to one
+    row per `application_number` (`_collapse_to_latest_per_application_
+    number`) so duplicate variants of the same real DA number don't each
+    get their own row."""
+    collapsed = _collapse_to_latest_per_application_number(cases)
+    rows = "".join(
+        _render_docket_card(case, grounds, earlier_count=earlier_count)
+        for case, grounds, earlier_count in collapsed
+    )
     if not rows:
         rows = '<p class="empty">No cases yet -- create one to get started.</p>'
     return f"""

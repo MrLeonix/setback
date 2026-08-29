@@ -622,6 +622,104 @@ def test_docket_board_includes_a_case_created_with_a_real_uuid_session(
     assert "PAN-REAL" in response.text
 
 
+@pytest.mark.parametrize(
+    "junk_application_number",
+    [
+        "SMOKE-TEST-PHOTO",
+        "smoke-test-photo",  # lowercase: the match is case-insensitive
+        "wave6-wiring-proof",
+        "rate-limit-check",
+        "Test Run 3",
+    ],
+)
+def test_docket_board_excludes_case_with_a_junk_application_number_despite_a_real_uuid_session(
+    client: TestClient, junk_application_number: str
+) -> None:
+    """`_looks_like_a_resident_session`'s structural check alone lets a
+    scripted/curl-created case through the moment it happens to be given a
+    real UUID `resident_session` -- exactly what let a `SMOKE-TEST-PHOTO`
+    case slip onto the live docket board despite the wave-6 filter (SMOKE.md
+    v4's docket-hygiene finding). This case's `application_number` itself
+    reads as test/smoke/deploy-verification debris (case-insensitive
+    contains: smoke, test, wiring-proof, rate-limit), so the docket-list
+    hygiene filter must exclude it on content, not just session-id shape."""
+    case_id = _create_case(
+        client, application_number=junk_application_number, session=_REAL_SESSION
+    )
+
+    response = client.get("/")
+    assert response.status_code == 200
+    assert junk_application_number not in response.text
+
+    # Hide only -- never delete: the case's own page is still reachable.
+    case_response = client.get(f"/cases/{case_id}")
+    assert case_response.status_code == 200
+    assert junk_application_number in case_response.text
+
+
+def test_docket_board_does_not_exclude_a_genuine_application_number(
+    client: TestClient,
+) -> None:
+    """The content check must not be so eager it flags a real DA number --
+    none of the junk keywords appear in an ordinary application number."""
+    _create_case(client, application_number="DA2026/0359", session=_REAL_SESSION)
+    response = client.get("/")
+    assert "DA2026/0359" in response.text
+
+
+# --- docket hygiene: collapsing duplicate application numbers --------------
+
+
+def test_docket_board_collapses_duplicate_application_numbers_to_the_latest_case(
+    client: TestClient,
+) -> None:
+    """Two real, UUID-sessioned cases for the same `application_number`
+    (e.g. two separate live smoke/demo runs against the same real DA
+    number, `PAN-661190`/`DA2026/0359` in SMOKE.md's own duplicate-labels
+    finding) collapse to a single docket-board row -- the most recently
+    created one -- rather than showing every variant as its own "Ready to
+    submit" row."""
+    older_case_id = _create_case(client, application_number="PAN-661190", session=_REAL_SESSION)
+    newer_case_id = _create_case(client, application_number="PAN-661190", session=_REAL_SESSION_2)
+
+    response = client.get("/")
+    assert response.status_code == 200
+    assert newer_case_id in response.text
+    assert older_case_id not in response.text
+
+    # Hide only -- never delete: the older case's own page still works.
+    older_case_response = client.get(f"/cases/{older_case_id}")
+    assert older_case_response.status_code == 200
+
+
+def test_docket_board_shows_an_earlier_cases_note_for_a_collapsed_application_number(
+    client: TestClient,
+) -> None:
+    _create_case(client, application_number="PAN-661190", session=_REAL_SESSION)
+    _create_case(client, application_number="PAN-661190", session=_REAL_SESSION_2)
+
+    response = client.get("/")
+    assert "+1 earlier case" in response.text
+
+
+def test_docket_board_pluralizes_the_earlier_cases_note(client: TestClient) -> None:
+    third_session = "33333333-3333-4333-8333-333333333333"
+    _create_case(client, application_number="PAN-661190", session=_REAL_SESSION)
+    _create_case(client, application_number="PAN-661190", session=_REAL_SESSION_2)
+    _create_case(client, application_number="PAN-661190", session=third_session)
+
+    response = client.get("/")
+    assert "+2 earlier cases" in response.text
+
+
+def test_docket_board_shows_no_earlier_cases_note_for_a_single_case(
+    client: TestClient,
+) -> None:
+    _create_case(client, application_number="PAN-SOLO", session=_REAL_SESSION)
+    response = client.get("/")
+    assert "earlier case" not in response.text
+
+
 # --- docket access gate (SETBACK_DOCKET_KEY) --------------------------------
 
 
