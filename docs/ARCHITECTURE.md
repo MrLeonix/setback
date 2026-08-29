@@ -12,11 +12,18 @@ as of this wave (was `us-central1`; see §3 and `deploy.sh`).
 
 This document is the spec the build executes against and the judges read. Names below
 are the literal module/collection/field names the code uses — treat them as contracts,
-not suggestions. **Docs-truth note (wave 4):** the table and prose below were reconciled
-against the actual `src/setback/` tree as it stands this wave; a handful of narrower
-claims further down are known to still describe the original design intent rather than
-what shipped, and are called out inline as "**Docs-truth note**"/"**Docs-truth
-correction**" paragraphs (see §2, §4, §5, and §7) rather than silently asserted as true.
+not suggestions. **Docs-truth note (wave 4, extended wave 6):** the table and prose below
+were reconciled against the actual `src/setback/` tree; several claims further down were
+found — by an architecture-focused review, then verified against the code with a
+full-tree grep — to describe original design intent that was never built, or to have
+drifted from what actually shipped. Every one of those is now corrected in place rather
+than silently asserted as true, marked inline as "**Docs-truth note**"/"**Docs-truth
+correction**" paragraphs (see §3, §4, §5, §6, §7, and §8). Two corrections are the most
+consequential: **there is no sweeper** (§4) — a crashed or stuck job has no automated
+recovery today — and **the s4.15 category list is a Python dict, not a YAML/Firestore
+pair** (§6). If a claim elsewhere in this document isn't backed by one of these notes,
+it should still be independently verifiable against the code; treat any that isn't as a
+bug in this document, not as license to distrust the corrected sections.
 
 ---
 
@@ -79,7 +86,7 @@ run = one graph execution.
 | `ClauseReviewerNode` | yes | `gemini-3.5-flash-lite` MINIMAL → escalates to `gemini-3.7-flash` LOW on breaker | LEP/DCP clause text, zoning controls (height/FSR), the s4.15(1) heads-of-consideration list | photos, plans, bounding boxes |
 | `EvidenceReviewerNode` | yes | same tiers as above | resident photos, architectural plans/elevations, bbox-anchored image crops | legislation text, clause numbers, DCP text |
 | `AdjudicatorNode` | yes | `gemini-3.7-flash` LOW only (never degrades further) | the **structured findings** (not raw evidence) from both reviewers, only when triggered | raw photos or raw clause text directly — it adjudicates conclusions, not source material |
-| `S415GateNode` | no | — | every `GroundFinding`, the `s415_grounds` reference list, Firestore evidence/clause existence | — |
+| `S415GateNode` | no | — | every `GroundFinding`, the in-code s4.15 category data (`gate/s415.py`'s `PLANNING_HEADS`/`NON_PLANNING_GROUNDS`), Firestore evidence/clause existence | — |
 | `ComposerNode` | partial | `gemma-4-26b-a4b-it-maas` for resident-facing prose only | gated grounds, evidence anchors | — (legal content is templated, not generated) |
 
 ### Edges
@@ -196,7 +203,7 @@ cases/{case_id}
 
 cases/{case_id}/grounds/{ground_id}
   ground_id          = sha256(clause_ref + normalize(ground_text))[:16]   # deterministic
-  clause_ref, category         # category ∈ s415_grounds reference list, §6
+  clause_ref, category         # category ∈ gate/s415.py's category ids, §6
   raised_by          ∈ {clause, evidence, both}
   status             ∈ {proposed, adjudicated, gated_in, gated_out}
   rationale
@@ -224,23 +231,31 @@ cases/{case_id}/breakers/{stage}
 cases/{case_id}/ledger/{call_id}
   call_id            = ULID()
   model, input_tokens, output_tokens, cost_usd, stage, at
-
-config/s415_grounds        # single doc, the deterministic legal relevance list, §6
 ```
+
+**Docs-truth correction:** an earlier design intended a `config/s415_grounds` Firestore
+doc mirroring a `shared/s415_grounds.yaml` file, so a judge could confirm the statutory
+category list independently of the code. Neither exists: a full-tree grep for
+`s415_grounds`/`shared/`/`collection("config")` turns up nothing. The category list is
+plain Python data — `gate/s415.py`'s `PLANNING_HEADS`/`NON_PLANNING_GROUNDS` dicts — with
+no YAML file and no Firestore mirror. See §6 for what's actually there.
 
 **Deterministic IDs, idempotent writes.** `ground_id` and `anchor_id` are content hashes,
 not auto-IDs — re-running `IngestNode` or a reviewer after a crash writes the *same*
 document ID with `set(..., merge=True)`, so retries never duplicate a ground or an
 evidence anchor. `event_id` and `call_id` are ULIDs (need ordering, not idempotency —
-each represents a discrete occurrence, duplicates there are harmless to detect and drop
-via the sweeper if they ever occur).
+each represents a discrete occurrence). A duplicate `event_id`/`call_id` row is merely a
+doubled entry, not a correctness or double-billing risk on its own, since nothing
+downstream trusts row count over content — but nothing in the codebase today scans for or
+drops one if it occurs; see §4's docs-truth note for the actual (limited) failure-recovery
+story.
 
 **Resume semantics.** On start, `setback-tribunal` reads `cases/{case_id}`. If
 `ingest_complete_at` is set and the `evidence` subcollection is non-empty, `IngestNode` is
 skipped and the job resumes at the reviewer fan-out. If `status` is already `gated` or
 `composed`, the job exits immediately (no-op) — this makes re-triggering a job for an
-already-finished case safe, which matters because the sweeper (§4) and manual retries both
-re-trigger by case ID, not by run ID.
+already-finished case safe, which matters because a manual retry (the only re-trigger path
+that exists today — see §4's docs-truth note) re-triggers by case ID, not by run ID.
 
 ---
 
@@ -285,12 +300,23 @@ Only after all 5 attempts fail does it register as one breaker failure. This sep
 
 ### What happens when a worker agent loops or hallucinates (rubric question, answered directly)
 
-- **Loops:** every node has a hard `max_tool_calls` / `max_turns` counter enforced in
-  Python state (not a prompt instruction asking the model to stop) — e.g. 4 for the
-  reviewers. Hitting the counter is treated as a stage failure and increments the breaker;
-  it is never silently retried past the limit. There is no code path that can call a model
-  in an unbounded loop — the counter is checked before every call, in the same function
-  that checks the budget ledger.
+- **Loops:** **Docs-truth correction:** an earlier design intended a hard
+  `max_tool_calls`/`max_turns` counter, enforced in Python state and checked before every
+  call in the same function that checks the budget ledger. A full-tree grep for
+  `max_tool_calls`/`max_turns` finds no such counter anywhere in `court/`,
+  `job/pipeline.py`, or the ADK graph — it was never built. What actually limits repeated
+  calls today: the court graph is a fixed DAG of single-shot node calls (Ingest →
+  reviewers → conditional adjudicator → gate → compose), not an iterative tool-calling
+  agent loop, so there is currently no code path where a node *decides* to call a model
+  again — each node calls its model (at most) once per run. That is an accidental
+  consequence of the current design, not an enforced guarantee: nothing would stop a
+  future change (e.g. giving a court `Agent` its own tool-calling loop) from looping
+  unboundedly with zero counter in place to catch it. The one real backstop against
+  runaway cost from repeated calls, loop or not, is the $2/run ledger self-abort below —
+  that part is real and enforced. The only *turn* limit that exists anywhere in the
+  codebase is `console/guards.py`'s `DEFAULT_INTERVIEW_TURN_LIMIT` (60/day) — a
+  resident-chat abuse guard on the interview, unrelated to the court graph and not a
+  worker-agent loop protection.
 - **Hallucinates:** three independent nets, not one:
   1. **Schema validation.** Every model call requests structured output against a Pydantic
      schema; a parse failure is treated as a stage failure (feeds the breaker), not
@@ -302,15 +328,45 @@ Only after all 5 attempts fail does it register as one breaker failure. This sep
   3. **Conservative adjudication default** (§2). An unresolved conflict is dropped from
      the submission, never guessed.
 
-### Sweeper (outside the agent loop)
+### Stuck-case recovery: no sweeper exists — here is what actually covers it
 
-A separate Cloud Scheduler-triggered Cloud Run function (`sweeper/main.py`), **not** part
-of the ADK graph or any node — it never calls a model. It scans `cases` for `status` stuck
-in a running state (`ingesting`/`reviewing`/`adjudicating`) for longer than 10 minutes
-(covers a crashed job, an OOM kill, or a Cloud Run Job hard timeout that the job process
-itself never got to handle) and marks the case `failed` with an events entry, so
-`setback-console`'s SSE stream terminates cleanly for the resident instead of hanging
-indefinitely waiting for an event that will never arrive.
+**Docs-truth correction:** an earlier design (see `DESIGN-DECISIONS.md` D6) called for a
+standalone Cloud Scheduler → Cloud Run function (`sweeper/main.py`) that would scan
+`cases` for a `status` stuck in a running state (`ingesting`/`reviewing`/`adjudicating`)
+past a timeout and mark it `failed`. It was never built: there is no `sweeper/` anywhere
+in this repo, no Cloud Scheduler job, and no code path that watches for a stalled case
+from outside the job that's running it. A full-tree grep for `sweeper` turns up only two
+comments in `job/main.py` referring forward to this section, and this section itself —
+nothing else.
+
+**What this actually means today:** if `setback-tribunal` crashes, is OOM-killed, or hits
+its Cloud Run Job hard timeout (`--task-timeout=1800s`) mid-run, the case is left with
+`status` stuck at whatever it was mid-run (e.g. `reviewing`) forever, with no automated
+process to notice or recover it. `setback-console`'s SSE stream for that case has nothing
+to terminate it — a resident watching would see the interview simply stop producing
+events. Recovery today is manual: re-triggering the job for the same `case_id` is safe
+(the resume semantics in §3 make it a no-op if the case already finished, and pick up
+after `IngestNode` if evidence was already written), but nothing calls that trigger
+automatically. This is a real, currently-unmitigated gap, not a documented cut with an
+accepted workaround.
+
+**What genuinely does cover failure today** (the real story, none of it a sweeper):
+
+- **Conservative defaults.** An adjudicator conflict that can't be resolved, or a
+  citation that doesn't resolve, never ships guessed content — it's refused or gated out
+  explicitly (§2, §6). This covers *content* correctness, not a stuck process.
+- **Per-stage breakers** (`AdjudicatorNode`'s only, see below) stop a persistently
+  failing stage from being retried forever within a single run.
+- **The $2/run ledger self-abort** stops a single run's spend from growing unbounded even
+  without a turn counter (see above).
+- **`--session-affinity`** on `setback-console` (see `deploy.sh`) keeps a resident's
+  in-flight interview routed back to the same instance, reducing (not eliminating) one
+  specific hazard — a mid-interview redeploy or cold start silently starting a second,
+  duplicate interview state — but this is an interview-side mitigation, unrelated to a
+  stuck tribunal job.
+
+None of the above detects or recovers a genuinely stuck/crashed job execution. That
+capability does not exist yet.
 
 ### $2/run ledger abort
 
@@ -339,20 +395,33 @@ checkpoint (see this doc's revision history / the integrator's notes for status)
   AI and Firestore purely via Application Default Credentials (the Cloud Run service
   identity). Zero API keys appear in code, environment variables, or config for any Google
   API.
-- **Service accounts, least privilege, one per deployable:**
-  - `setback-console-sa`: `roles/datastore.user` (scoped in application logic to
-    `cases`/`events` only — Firestore has no native per-collection IAM, so this is enforced
-    in the repository layer, §7, not IAM alone), `roles/aiplatform.user` (interview chat
-    calls only), `roles/run.invoker` on the `setback-tribunal` job (to trigger it). No
-    external egress permission needed beyond calling the job.
-  - `setback-tribunal-sa`: `roles/datastore.user` (full case subcollections),
-    `roles/aiplatform.user` (review/adjudication/composition calls), outbound egress to
-    `onlineda.*`, `api.apps1.nsw.gov.au`, and `etrack.georgesriver.nsw.gov.au` (no IAM
-    role for this — it's network egress, not a GCP permission — but it is the only SA
-    whose runtime has a reason to reach those hosts). `roles/secretmanager.secretAccessor`
-    scoped to exactly the Maps secret, if and when one exists (see below).
-  - Neither SA is `roles/editor` or `roles/owner`. Neither SA can read the other's scope
-    it doesn't need.
+- **Service accounts, least privilege, one per deployable — with a real gap, stated
+  honestly:**
+  - `setback-console-sa` (`sa-console`): `roles/datastore.user`, `roles/aiplatform.user`
+    (interview chat calls), `roles/run.jobsExecutorWithOverrides` scoped to the
+    `setback-tribunal` job resource only (to trigger it with a `CASE_ID` override — see
+    `deploy.sh`'s inline note on why plain `run.invoker` isn't sufficient for that call).
+    No Maps secret access (`--clear-secrets` passed explicitly on every console deploy).
+  - `setback-tribunal-sa` (`sa-orchestrator`): `roles/datastore.user`,
+    `roles/aiplatform.user` (review/adjudication/composition/grounding calls), outbound
+    egress to `onlineda.*`, `api.apps1.nsw.gov.au`, and `etrack.georgesriver.nsw.gov.au`
+    (network egress, not a GCP IAM permission, but this is the only SA whose runtime has a
+    reason to reach those hosts), `roles/secretmanager.secretAccessor` scoped to exactly
+    the Maps secret.
+  - **Docs-truth correction — the claim this replaces was false.** An earlier revision of
+    this section claimed `sa-console`'s `datastore.user` grant was "scoped in application
+    logic to `cases`/`events` only... enforced in the repository layer, not IAM alone."
+    That enforcement does not exist: `console/app.py` and `job/main.py` both construct the
+    identical `state.firestore.FirestoreCaseStore` (grep confirms no subclass, wrapper, or
+    constructor argument narrows either deployable's instance to a collection subset), and
+    `roles/datastore.user` itself is a project/database-level IAM role — Firestore has no
+    native per-collection IAM to enforce a narrower scope at the platform layer either.
+    In practice, `sa-console` has exactly the same database-wide read/write reach as
+    `sa-orchestrator` today; the two SAs differ in their Vertex AI/egress/secret grants
+    (real, IAM-enforced differences), not in their Firestore reach. Application-layer
+    per-collection scoping for `FirestoreCaseStore` is a genuine gap, not a built feature —
+    tracked here rather than left as a false claim a judge could disprove with one grep.
+  - Neither SA is `roles/editor` or `roles/owner`.
 - **The one API key that exists (Maps → Street View fallback):** zoning itself is still
   resolved via the ePlanning `layerintersect` API directly, never a rendered map (see §8) —
   but `evidence/imagery.py`'s Street View fallback (the resident's "away from home" or
@@ -376,26 +445,45 @@ judge reading the code in under a minute.
 
 ### The legal relevance list, as data
 
-`config/s415_grounds` (a single Firestore doc, mirrored from `shared/s415_grounds.yaml` at
-deploy time so it's both version-controlled and runtime-checkable) enumerates the EP&A Act
-s4.15(1) heads of consideration as category codes:
+**Docs-truth correction:** an earlier revision of this section described a
+`config/s415_grounds` Firestore doc, mirrored from a `shared/s415_grounds.yaml` file at
+deploy time, enumerating seven category codes (`a_planning_instruments`,
+`a1_draft_instruments`, `b_dcp`, `c_impacts`, `d_site_suitability`, `e_submissions`,
+`f_public_interest`). None of that exists: no `shared/` directory, no `.yaml` file, no
+Firestore `config` collection anywhere in the repo (confirmed by grep). What's actually
+built, in `gate/s415.py`, is plain Python data — two `dict[str, RelevanceRuling]`
+constants, `PLANNING_HEADS` (five s4.15(1) heads a ground *can* be relevant under) and
+`NON_PLANNING_GROUNDS` (five explicit categories residents commonly raise that are *not*
+s4.15(1) matters, each with its own plain-English explanation) — no YAML, no Firestore
+mirror, and the category codes themselves are named differently from the earlier design:
 
-```yaml
-- code: a_planning_instruments     # s4.15(1)(a) — LEPs / environmental planning instruments
-- code: a1_draft_instruments       # s4.15(1)(a1)
-- code: b_dcp                      # s4.15(1)(b) — development control plans
-- code: c_impacts                  # s4.15(1)(c) — natural/built/social/economic impacts
-- code: d_site_suitability         # s4.15(1)(d)
-- code: e_submissions              # s4.15(1)(e) — public submissions
-- code: f_public_interest          # s4.15(1)(f)
+```python
+# PLANNING_HEADS (relevant=True) — gate/s415.py
+"epi_dcp_provisions"  # s4.15(1)(a) — SEPP / LEP / DCP / s7.4 agreement clause
+
+"environmental_and_social_impacts"  # s4.15(1)(b) — natural/built/social/economic impacts
+"site_suitability"  # s4.15(1)(c)
+"public_submissions"  # s4.15(1)(d)
+"public_interest"  # s4.15(1)(e)
+
+# NON_PLANNING_GROUNDS (relevant=False) — gate/s415.py
+"property_value"
+"private_view_loss"
+"commercial_competition"
+"applicant_personal_circumstances"
+"neighbourhood_character_no_control_hook"
 ```
 
-Every `GroundFinding` a reviewer produces must be tagged with exactly one `category` from
-this list. `is_planning_relevant(category) -> bool` is a pure lookup against this list —
-not a model judgment call. A ground whose category isn't on the list (or whose category
-tag is missing/malformed) is rejected with `refusal_reason=non_planning_ground` before
-anything else is checked. This is what stops Setback from ever forwarding a "the new
-owners seem unfriendly" or "I don't like their car" style objection into a formal
+The pattern the original design was going for — the list is data a judge can read
+directly, not a model's self-reported judgment call — did ship, just as an in-repo Python
+dict rather than a YAML/Firestore pair. Every `GroundFinding` a reviewer produces must be
+tagged with exactly one `category` string; `classify_relevance(category)`
+(`gate/relevance.py`) is a pure lookup against these two dicts — not a model judgment
+call — and conservatively treats any category matching neither dict as not
+planning-relevant. A ground whose category isn't recognised is rejected with
+`refusal_reason=non_planning_ground` (via `GateStatus.REFUSED_IRRELEVANT`, see below)
+before anything else is checked. This is what stops Setback from ever forwarding a "the
+new owners seem unfriendly" or "I don't like their car" style objection into a formal
 submission — it's structurally impossible, not just discouraged by prompting.
 
 ### Citation resolution
@@ -503,7 +591,7 @@ Written so a judge scoring "clean, modularized, maintainable" finds the answer f
 | Live map / rendered-map UI | Zoning is resolved via the ePlanning `layerintersect` API without needing a rendered map. (The Maps key itself *is* used — §5 — but only for the Street View fallback still-image fetch, not for any interactive map UI.) |
 | Cloud Run Job concurrency / autoscaling tuning | Demo processes one case at a time; not a cost or latency concern inside the hackathon window. |
 | Firestore security rules per resident user | No auth system to hang per-user rules off yet; service-level IAM is the only access boundary in MVP. |
-| Dead-letter queue / retry-forever infra | The sweeper (§4) plus per-stage breakers cover every failure mode the demo can hit without extra queueing infrastructure. |
+| Dead-letter queue / retry-forever infra, and a stuck-case sweeper | Per-stage breakers, the conservative-default gate, and the $2/run ledger self-abort cover the *model-call* failure modes the demo can hit. A crashed/OOM-killed job leaving a case stuck mid-run with no automated recovery is a real, currently-open gap, not a covered one — see §4's docs-truth note. |
 | Token-by-token streamed model output to the frontend | SSE streams stage-*completion* events, not token deltas — a reviewer's full structured JSON is more useful mid-stream than partial tokens, and far simpler to implement reliably under a deadline. |
 
 ---

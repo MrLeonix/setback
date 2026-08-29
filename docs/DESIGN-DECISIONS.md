@@ -118,17 +118,35 @@ model could still have resolved.
 
 ---
 
-## D6. Sweeper lives outside the ADK graph as a separate scheduled process
+## D6. Stuck-case recovery: designed as a sweeper, never built — docs-truth correction
 
-**Decision:** the sweeper is a standalone Cloud Scheduler → Cloud Run Function, not a node
-or a wrapper around the graph (ARCHITECTURE.md §4).
+**What this entry originally claimed:** a standalone Cloud Scheduler → Cloud Run Function
+("the sweeper"), living outside the ADK graph entirely, would scan `cases` for a `status`
+stuck in a running state past a timeout and mark it `failed` — the reasoning being that a
+watchdog living *inside* the thing it watches can't detect that thing crashing, so it has
+to be a separate execution context checking Firestore state from outside to be a
+meaningful safety net rather than a comforting illusion of one.
 
-**Why:** a watchdog that lives *inside* the thing it's watching can't detect that thing
-crashing — if the sweeper were a node in the same process as the graph it's monitoring, an
-OOM kill or hard Cloud Run Job timeout takes the sweeper down with the graph, which is
-exactly the failure mode it exists to catch. It has to be a separate execution context on
-its own schedule, checking Firestore state from outside, to be a meaningful safety net
-rather than a comforting illusion of one.
+**Docs-truth correction (wave 6):** that reasoning still holds as an argument for *why* a
+sweeper should be architected this way if one is ever built — but no sweeper was built.
+There is no `sweeper/` directory, no Cloud Scheduler job, and no code anywhere in this
+repo that watches a running case from outside its own job execution. A full-tree grep for
+`sweeper` finds only two comments in `job/main.py` pointing forward to
+`ARCHITECTURE.md` §4, and that section's own subsection on this exact topic. This was a
+genuine design-intent-vs-shipped gap, not a deliberate MVP cut recorded honestly at the
+time — it was written up as if built, which is worse than a gap left silent, because it
+told a judge a specific, checkable claim that a grep disproves.
+
+**What actually covers case-run failure today**, none of it a sweeper:
+per-stage circuit breakers (the adjudicator's only — see D5), the conservative-default
+gate (an unresolved conflict or citation is refused, never guessed — ARCHITECTURE.md §2,
+§6), the $2/run ledger self-abort (ARCHITECTURE.md §4), and `--session-affinity` on
+`setback-console` (mitigates one specific interview-side hazard, unrelated to a stuck
+tribunal job). None of these detects or recovers a crashed/OOM-killed/timed-out job
+execution — that case is left stuck with no automated recovery, and needs a manual
+re-trigger by `case_id` (safe, by the resume semantics in ARCHITECTURE.md §3, but not
+automatic). Building the actual sweeper described above remains a reasonable next step;
+it just isn't done, and this entry now says so.
 
 ---
 
@@ -173,19 +191,29 @@ actually enforced, for the reason above.
 
 ---
 
-## D8. Legal relevance list as data (YAML/Firestore doc), not a model classification
+## D8. Legal relevance list as data (a plain Python dict), not a model classification
 
-**Decision:** `is_planning_relevant(category)` is a lookup against a static list of s4.15
-categories, not an LLM call asked "is this planning-relevant?" (ARCHITECTURE.md §6).
+**Decision:** `classify_relevance(category)` (`gate/relevance.py`) is a lookup against a
+static list of s4.15 categories, not an LLM call asked "is this planning-relevant?"
+(ARCHITECTURE.md §6).
 
 **Why:** this is the deterministic gate the whole pitch's trust story rests on
 ("deterministic s4.15 gate that refuses non-planning grounds"). A gate implemented as
 another model call is not deterministic — it has its own hallucination surface, its own
 non-planning-relevant confident-sounding wrong answer, and would need its *own* gate to be
 trustworthy, which is an infinite regress. Making the list data means a judge (or a
-resident, or a council officer) can read `shared/s415_grounds.yaml` directly and verify
-exactly what Setback considers admissible, with no model in the loop for this specific
-check at all.
+resident, or a council officer) can read the source directly and verify exactly what
+Setback considers admissible, with no model in the loop for this specific check at all.
+
+**Docs-truth correction (wave 6):** this entry originally said the list lived in a
+`shared/s415_grounds.yaml` file, version-controlled and mirrored into a Firestore config
+doc for runtime checkability. Neither exists — see ARCHITECTURE.md §6's docs-truth
+correction. What ships is `gate/s415.py`'s `PLANNING_HEADS`/`NON_PLANNING_GROUNDS`, two
+plain Python `dict[str, RelevanceRuling]` constants. The "data, not a model call, judge
+can verify it directly" property this decision is actually about still holds — reading a
+Python dict is no less verifiable than reading a YAML file — but the specific file path
+this entry named never existed, and is corrected here rather than left as a dangling
+reference to a file a judge would search for and not find.
 
 **Alternative considered:** ask the reviewer models to self-tag relevance and trust that
 tag. Rejected outright — that's exactly the "trust the LLM to police itself" pattern the
