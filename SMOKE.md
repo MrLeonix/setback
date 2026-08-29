@@ -1161,3 +1161,187 @@ residual (chip legibility at small box sizes) rather than either hidden.
 One security incident reported per this round's standing instruction (see
 above) — needs Leo to rotate `docket-key` again. Pushed to `main` after
 this file was updated.
+
+---
+
+# SMOKE.md v6 — wave-8 close-out (final for the build phase, 2026-08-29)
+
+Wave 8 closed the three visual defects v5 named as gating the flagship
+demo shot. `docket-key` was rotated to version 2 (version 1 disabled)
+before this wave started, per Leo's standing instruction from v5's
+security incident — this wave verified that rotation live rather than
+performing it.
+
+## Fixes landed (`ebc1336`, full detail in that commit)
+
+1. **Font**: `Dockerfile` now installs `fonts-dejavu-core`, so the
+   deployed container's `evidence.overlays._label_font` finds a real TTF
+   at `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` instead of
+   silently falling back to PIL's tiny bitmap default. Guarded by a new
+   `tests/test_dockerfile.py` (parses the `Dockerfile` itself, no image
+   build).
+2. **Chip legibility**: `evidence/overlays.py`'s label-chip font is now
+   sized as a ratio of the image width being drawn on
+   (`_label_font_size_for_width`, floor 16px, ratio 0.02) instead of a
+   fixed 16px — survives `job/pipeline.py::_shrink_png_for_storage`'s
+   ~4x downscale for Firestore's document limit. Measured: a chip's own
+   glyph height is >=18px on a 1600px-wide output (this wave's stated
+   acceptance bar); the actual re-rendered flagship shot below (1280px
+   stored width, the pipeline's own storage cap) measures well past that.
+3. **Anchor-status propagation**: `job/pipeline.py::_propagate_page_level_
+   anchor_status` now applies three ordered rules — (a) a bbox anchor a
+   reviewer cited *directly* always keeps that citation's own ground and
+   status, never overridden by an inherited page-level claim, however
+   more severe; (b) page-level inheritance only reaches anchors with no
+   direct citation of their own; (c) among competing page-level-only
+   claims, prefer the ground whose evidence slice actually included this
+   document before falling back to severity. TDD's three named cases plus
+   one full pipeline-wiring regression test all pass. Documented in the
+   module's own docstring per this wave's instruction.
+
+Full suite: **532 passed** (up from 522), ruff check/format clean, mypy
+clean (verbatim `uv run mypy`). Security diff check on the full wave-8
+diff: clean — no secrets, personal identifiers, or hostnames. Committed
+(conventional commit) and pushed to `origin/main`.
+
+## Redeploy
+
+`./deploy.sh` (`australia-southeast1`, no arguments, defaults unchanged).
+Clean run:
+
+- Console revision: **`setback-console-00013-smf`** (100% traffic),
+  image `setback:20260829t074250z`.
+- Tribunal job: **`setback-tribunal` generation 12**.
+- Both IAM grants (`datastore.user`/`aiplatform.user` on both service
+  accounts, `secretAccessor` scoped to `docket-key`/`maps-api-key` only)
+  idempotently reconciled.
+
+**Docket gate, verified live** (key fetched into a shell variable from
+Secret Manager, never echoed; only HTTP codes printed):
+
+```
+GET /               -> 401  (no key)
+GET /?key=<wrong>   -> 401  (wrong key)
+GET /?key=<v2 key>  -> 200  (fetched via `gcloud secrets versions access 2`)
+```
+
+v1 request check: `gcloud secrets versions access 1 --secret=docket-key`
+itself fails (`FAILED_PRECONDITION: DISABLED`) — the v1 value cannot even
+be retrieved to construct a request with it, and this session's shell had
+no `SETBACK_DOCKET_KEY` left over in its environment either. The gate's
+"v1 must now fail" property holds by construction, not just by omission.
+
+## Flagship overlay re-render — film case `f3f8c3475e2646537212677fbf7c8075`
+
+Stored data was sufficient; **the tribunal was not re-run** (0 of the
+budgeted max-1 run used). Read the case's real Firestore state directly
+(`state.firestore.FirestoreCaseStore`, read-only) and reconstructed
+exactly the two facts the fix concerns, cross-checked against the
+deterministic `anchor_id_for` hash rather than assumed:
+
+- Ground `ground-21788e4bac131559` (overshadowing): **SHIPPED**. Its
+  evidence-reviewer `review_verdict` event directly cited bbox anchor
+  `77a2be8944045f64` — `elevations.pdf` page 1,
+  bbox `(155.98, 691.21, 1032.30, 704.68)`, the architect's "9m height
+  limit" datum line (`evidence_anchored` event confirms this is the
+  ground's one stored bbox anchor).
+- Ground `ground-7a1fcaac5e39e132` (property value): **REFUSED**
+  (irrelevant). Its evidence reviewer's citations included
+  `16c1a742b031af0b` — confirmed by hash to be exactly this same page's
+  **page-level** anchor (`anchor_id_for("179d3b568c2834c6", 1, None)`).
+
+This is the precise pre-fix collision `v5` flagged: a more-severe,
+page-level REFUSED citation of the same page a directly-cited SHIPPED
+bbox anchor sits on. Re-ran `_propagate_page_level_anchor_status` (the
+fixed function, imported live from the wave-8 tree, not reimplemented)
+against these real inputs and asserted `effective_anchor_ground[bbox] ==
+"ground-21788e4bac131559"` — it holds. Rendered via the real, fixed
+`evidence.overlays.render_semantic_overlay` +
+`job.pipeline._shrink_png_for_storage` against the actual stored PDF
+bytes (downloaded from the live GCS bucket,
+`cases/.../uploads/179d3b568c2834c6.pdf`, sha256-confirmed identical to
+the repo's `elevations.pdf` fixture — the real film-day upload, not a
+substitute).
+
+**Result, read back and confirmed**: the datum-line box renders **green**
+(`SUPPORTS_SHIPPED`), sitting on real drawing content (not blank space),
+with a chip reading "9m height limit datum line — included in your
+submission" in large, clearly word-spaced text. The gallery composite
+(below) adds a legend bar built directly from `evidence.overlays`' own
+`OVERLAY_COLOR`/`ROLE_LEGEND_TEXT` constants — the same source of truth
+`console/app.py`'s real `.doc-viewer__legend` HTML draws from — so its
+colours/text cannot drift from what the live app actually renders. This
+is a **composited PNG** (card chrome matched to `style.css`'s real light-
+theme tokens), not a browser screenshot: this round deliberately avoided
+all browser/tab tooling given the prior two exposures traced to stale
+`list_pages` state, per this wave's standing security instruction.
+
+The case's own live-served Firestore `annotated_overlay` event still
+holds the original (pre-fix) image — an append-only event log,
+by this project's own design, is never rewritten after the fact. The
+re-rendered PNG below is this wave's verification artifact and the new
+gallery shot; it is not a retroactive edit of what actually happened
+during that live run.
+
+## Gallery — final inventory (8 shots, `.../scratchpad/gallery-assets/`)
+
+Every file below was read and visually verified this round, not just
+listed:
+
+| # | File | Status |
+|---|------|--------|
+| 01 | `01-docket-board.png` | unchanged — carried from v5, content unaffected by this wave's fix |
+| 02 | `02-interview-with-chips.png` | unchanged |
+| 03 | `03-doc-cards.png` | unchanged |
+| 04 | `04-courtroom-timeline-mid-run.png` | unchanged |
+| 05 | `05-disruption-adjudication-card.png` | unchanged |
+| 06 | `06-refusal-card.png` | unchanged — spot-read this round, text matches the film case's real stored `gate_decision` events verbatim |
+| 07 | `07-overlay-viewer-with-legend.png` | **replaced** — the fixed re-render above (green box, legible chip, matching legend) |
+| 08 | `08-output-documents.png` | unchanged |
+
+Only #07 was invalidated by this wave's fix (font/chip-scale/anchor-colour
+are exclusively overlay-rendering concerns); the other seven show no
+overlay content and were confirmed unaffected.
+
+## Paste-pack cleanup
+
+Deleted the four superseded draft duplicates from
+`.../scratchpad/paste-pack/`: `devpost-challenges-and-learnings.md`,
+`devto-content-piece-draft.md`, `disclosure-md-addition-draft.md`,
+`social-post-draft.md`. Five canonical files remain:
+`devpost-challenges-learnings.md`, `devto-draft.md`,
+`disclosure-addition.md`, `social-post.md`, `testing-instructions.md`.
+
+## Verification (verbatim)
+
+```
+$ uv run pytest -q
+532 passed, 220 warnings in 41.93s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+81 files already formatted
+
+$ uv run mypy
+Success: no issues found in 38 source files
+```
+
+**Live budget this round**: 0 model calls (offline re-render only; no
+tribunal execution, no interview turns). **Security**: no secret value
+read, printed, or transmitted — the docket-key v2 value was fetched into
+a shell variable and used only inside a `curl` URL argument, never
+displayed; `v1`'s value was never retrieved (Secret Manager itself
+refuses, being disabled). No personal identifier introduced. No browser
+tool was used this round.
+
+## Status
+
+**Build phase closed.** All three SMOKE.md v5 visual defects fixed,
+tested, deployed (`setback-console-00013-smf` / `setback-tribunal`
+generation 12), and verified against the live docket gate. The flagship
+overlay shot now shows the fix working on the film case's own real stored
+data. Gallery (8 shots) and paste-pack (5 canonical files) are both
+final. Remaining work from here is film-day/founder-only (per STATUS.md's
+wave-6/7 checklists) — no further build-wave agent pass is expected.

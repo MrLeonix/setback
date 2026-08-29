@@ -1,3 +1,36 @@
+# STATUS — wave 8 landed: build phase closed (2026-08-29)
+
+Final build wave. Closed the three visual defects SMOKE.md v5 flagged as gating the
+flagship demo shot:
+
+- **Dockerfile**: installs `fonts-dejavu-core` so the deployed container's overlay
+  label chips use a real TTF instead of silently falling back to PIL's bitmap default.
+- **Chip legibility**: `evidence/overlays.py` sizes the label-chip font as a ratio of
+  the image width being drawn on, so chips stay legible (>=18px glyph height on a
+  1600px-wide output) after the working page is downscaled ~4x for Firestore storage.
+- **Anchor-status propagation**: `job/pipeline.py::_propagate_page_level_anchor_status`
+  now applies three ordered rules — a directly-cited bbox anchor always keeps its own
+  ground's status (never overridden by a page-level inheritance from a different,
+  more severe ground); page-level inheritance only reaches anchors with no direct
+  citation; among competing page-level-only claims, prefer the ground whose evidence
+  slice actually included the document before falling back to severity.
+
+Full suite: **532 passed** (up from 522), ruff check/format clean, mypy clean. Security
+diff check clean. Committed (`ebc1336`) and pushed to `origin/main`.
+
+Redeployed (`setback-console-00013-smf`, `setback-tribunal` generation 12); docket
+gate verified live (401 no-key, 401 wrong-key, 200 with the Secret-Manager-fetched v2
+key; v1 confirmed disabled/inaccessible). Re-rendered the flagship overlay for the
+film-day case (`f3f8c3475e2646537212677fbf7c8075`) from its stored anchors and gate
+outcomes using the fixed renderer — no live tribunal run needed. Gallery's #07 shot
+replaced; the other seven confirmed unaffected. Full detail in `SMOKE.md`'s "SMOKE.md
+v6" section, including the exact stored-anchor reconstruction and its cross-checks.
+
+**Build phase closed.** Everything remaining is film-day/founder-only work — see the
+wave-6/7 checklists below, unchanged.
+
+---
+
 # STATUS — wave 7 landed (2026-08-29)
 
 Final-polish wave. The orchestrator rotated the docket passphrase after a prior
