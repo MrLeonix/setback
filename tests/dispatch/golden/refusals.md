@@ -4,13 +4,13 @@ Not every ground you raised made it into the submission. This isn't a judgement 
 
 ## Refused grounds
 
-### ground-property-value
+### Property value
 
 **Statutory basis:** Environmental Planning and Assessment Act 1979 (NSW) s4.15(1) (not a listed matter)
 
 A development's effect on nearby property values is not a matter listed in s4.15(1). NSW courts have consistently held that diminution in property value is not, by itself, a relevant planning consideration — it is a private financial consequence, not an environmental, social, or planning-instrument impact of the development. This ground cannot be submitted as an objection.
 
-### ground-view-loss
+### Private view loss
 
 **Statutory basis:** Environmental Planning and Assessment Act 1979 (NSW) s4.15(1) (not a listed matter, absent a control hook)
 
@@ -18,7 +18,7 @@ Loss of a private view is not, by itself, a matter under s4.15(1) — there is n
 
 **What would make this viable:** This could still become a viable ground if it names a specific planning control — a DCP view-sharing provision, a scenic-protection clause, or an LEP desired-character objective that applies to this site. Find that control and cite it, and the same concern can be resubmitted as a planning-relevant ground.
 
-### ground-fsr
+### Epi dcp provisions
 
 **Statutory basis:** Environmental Planning and Assessment Act 1979 (NSW) s4.15(1)(a)
 
@@ -30,7 +30,7 @@ This ground is planning-relevant, but one or more of its citations could not be 
 
 These grounds are genuine planning matters, but their citations couldn't be automatically verified after repeated attempts. A person will review them before the submission is finalised, rather than refusing them outright.
 
-### ground-heritage
+### Site suitability
 
 **Statutory basis:** Environmental Planning and Assessment Act 1979 (NSW) s4.15(1)(c)
 

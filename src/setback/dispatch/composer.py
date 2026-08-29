@@ -162,6 +162,40 @@ def _content_for(ground_id: str, ground_content: Mapping[str, GroundContent]) ->
     return content
 
 
+_HEADING_TRUNCATE_LIMIT: Final[int] = 80
+
+
+def _truncate(text: str, *, limit: int = _HEADING_TRUNCATE_LIMIT) -> str:
+    """Shorten `text` to a heading-length label, cutting on the last word
+    boundary at or before `limit` chars rather than mid-word, with a
+    trailing ellipsis when anything was actually cut."""
+    stripped = " ".join(text.split())
+    if len(stripped) <= limit:
+        return stripped
+    cut = stripped[:limit].rsplit(" ", 1)[0]
+    return f"{cut}…" if cut else f"{stripped[:limit]}…"
+
+
+def _refusal_heading(decision: GateDecision, ground_content: Mapping[str, GroundContent]) -> str:
+    """A human-readable heading for an unshipped ground in the refusals
+    explainer — never the raw internal `ground_id` (a content hash, e.g.
+    ``ground-b72d23845dda7b8e``, meaningless and unpolished to a resident).
+
+    Prefers a short form of the resident's own claim text, when the caller
+    has supplied a `GroundContent` entry for this ground (today only
+    `job/pipeline.py`'s shipped-ground path does this; an unshipped ground
+    that gets one too — e.g. from a future caller change — automatically
+    gets the richer heading with no composer change needed). Falls back to
+    a plain-English label derived from the ground's `category`, which is
+    always present on every `GateDecision` regardless of shipped status, so
+    the heading is never the bare hash even when no `GroundContent` exists.
+    """
+    content = ground_content.get(decision.ground_id)
+    if content is not None and content.statement.strip():
+        return _truncate(content.statement)
+    return decision.category.replace("_", " ").capitalize()
+
+
 def _encouraging_note(decision: GateDecision) -> str | None:
     """A note on what would make an unshipped ground viable, where the
     category or the citation issues admit a concrete fix. Categories with no
@@ -283,7 +317,9 @@ def _submission_html(
 # --- deterministic assembly: refusals explainer -------------------------------
 
 
-def _refusals_explainer_markdown(unshipped: Sequence[GateDecision]) -> str:
+def _refusals_explainer_markdown(
+    unshipped: Sequence[GateDecision], ground_content: Mapping[str, GroundContent]
+) -> str:
     refused = [d for d in unshipped if d.status is not GateStatus.FLAGGED]
     flagged = [d for d in unshipped if d.status is GateStatus.FLAGGED]
 
@@ -292,7 +328,7 @@ def _refusals_explainer_markdown(unshipped: Sequence[GateDecision]) -> str:
         lines.append("## Refused grounds")
         lines.append("")
         for decision in refused:
-            lines.append(f"### {decision.ground_id}")
+            lines.append(f"### {_refusal_heading(decision, ground_content)}")
             lines.append("")
             lines.append(f"**Statutory basis:** {decision.statutory_basis}")
             lines.append("")
@@ -308,7 +344,7 @@ def _refusals_explainer_markdown(unshipped: Sequence[GateDecision]) -> str:
         lines.append(_UNDER_REVIEW_NOTE)
         lines.append("")
         for decision in flagged:
-            lines.append(f"### {decision.ground_id}")
+            lines.append(f"### {_refusal_heading(decision, ground_content)}")
             lines.append("")
             lines.append(f"**Statutory basis:** {decision.statutory_basis}")
             lines.append("")
@@ -318,7 +354,9 @@ def _refusals_explainer_markdown(unshipped: Sequence[GateDecision]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _refusals_explainer_html(unshipped: Sequence[GateDecision]) -> str:
+def _refusals_explainer_html(
+    unshipped: Sequence[GateDecision], ground_content: Mapping[str, GroundContent]
+) -> str:
     esc = html_lib.escape
     refused = [d for d in unshipped if d.status is not GateStatus.FLAGGED]
     flagged = [d for d in unshipped if d.status is GateStatus.FLAGGED]
@@ -332,7 +370,7 @@ def _refusals_explainer_html(unshipped: Sequence[GateDecision]) -> str:
         parts.append("<h2>Refused grounds</h2>")
         for decision in refused:
             parts.append('<section class="refused-ground">')
-            parts.append(f"<h3>{esc(decision.ground_id)}</h3>")
+            parts.append(f"<h3>{esc(_refusal_heading(decision, ground_content))}</h3>")
             parts.append(
                 f"<p><strong>Statutory basis:</strong> {esc(decision.statutory_basis)}</p>"
             )
@@ -346,7 +384,7 @@ def _refusals_explainer_html(unshipped: Sequence[GateDecision]) -> str:
         parts.append(f"<p>{esc(_UNDER_REVIEW_NOTE)}</p>")
         for decision in flagged:
             parts.append('<section class="flagged-ground">')
-            parts.append(f"<h3>{esc(decision.ground_id)}</h3>")
+            parts.append(f"<h3>{esc(_refusal_heading(decision, ground_content))}</h3>")
             parts.append(
                 f"<p><strong>Statutory basis:</strong> {esc(decision.statutory_basis)}</p>"
             )
@@ -437,8 +475,8 @@ async def compose_dispatch_package(
 
     submission_markdown = _submission_markdown(case, shipped, ground_content)
     submission_html = _submission_html(case, shipped, ground_content)
-    explainer_markdown = _refusals_explainer_markdown(unshipped)
-    explainer_html = _refusals_explainer_html(unshipped)
+    explainer_markdown = _refusals_explainer_markdown(unshipped, ground_content)
+    explainer_html = _refusals_explainer_html(unshipped, ground_content)
 
     submission_markdown = await _polish(
         submission_markdown, "council objection submission", polisher

@@ -412,7 +412,13 @@ async def test_run_ships_a_resolvable_ground_and_refuses_the_irrelevant_one() ->
     submission_event = next(e for e in events if e.event_type == "submission_composed")
     assert "overshadow" in submission_event.payload["submission_markdown"].lower()
     assert "property value" not in submission_event.payload["submission_markdown"].lower()
-    assert property_value_id in submission_event.payload["refusals_markdown"]
+    # Docs-truth-fix wave: `dispatch/composer.py` no longer headers a refusal
+    # with the raw internal `ground_id` hash -- it renders a human-readable
+    # category label instead (see that module's `_refusal_heading`). This
+    # assertion previously checked for `property_value_id` itself, which was
+    # exactly the bug being fixed here.
+    assert property_value_id not in submission_event.payload["refusals_markdown"]
+    assert "### Property value" in submission_event.payload["refusals_markdown"]
     assert "not a matter listed in s4.15(1)" in submission_event.payload["refusals_markdown"]
 
 

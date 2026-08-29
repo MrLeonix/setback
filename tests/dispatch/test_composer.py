@@ -206,14 +206,65 @@ async def test_property_value_refusal_renders_with_no_encouraging_note() -> None
     package = await compose_dispatch_package(decisions, _case(), {})
 
     md = package.refusals_explainer.markdown
-    assert "ground-property-value" in md
+    assert "### Property value" in md
     assert NON_PLANNING_GROUNDS["property_value"].statutory_basis in md
     assert NON_PLANNING_GROUNDS["property_value"].explanation in md
     assert "What would make this viable" not in md
 
     html = package.refusals_explainer.html
-    assert "ground-property-value" in html
+    assert "<h3>Property value</h3>" in html
     assert "What would make this viable" not in html
+
+
+async def test_refusal_heading_never_leaks_the_raw_internal_ground_id() -> None:
+    """Regression test for the docs-truth-fix wave: `ground_id` (a content
+    hash like `sha256(...)[:16]`, e.g. `ground-b72d23845dda7b8e` in
+    production) must never appear anywhere in the resident-facing refusals
+    explainer -- it is an internal identifier, not something a resident
+    should ever see. The heading must use a human-readable label derived
+    from the ground's `category` instead, since that's the one piece of
+    human-legible data always present on a `GateDecision` regardless of
+    whether the caller has supplied a `GroundContent` entry for this
+    (unshipped) ground."""
+    decisions = [_property_value_ground(), _view_loss_ground(), _flagged_ground()]
+
+    package = await compose_dispatch_package(decisions, _case(), {})
+
+    for decision in decisions:
+        assert decision.ground_id not in package.refusals_explainer.markdown
+        assert decision.ground_id not in package.refusals_explainer.html
+
+    assert "### Property value" in package.refusals_explainer.markdown
+    assert "### Private view loss" in package.refusals_explainer.markdown
+    assert "### Site suitability" in package.refusals_explainer.markdown
+
+
+async def test_refusal_heading_prefers_supplied_claim_text_over_category_label() -> None:
+    """When a caller *does* supply a `GroundContent` entry for an unshipped
+    ground (today only shipped grounds get one from `job/pipeline.py`, but
+    the composer's own contract supports any ground so a future caller can
+    extend that), the heading uses a short form of the resident's actual
+    claim text rather than the generic category label -- the richer, more
+    specific heading wins when it's available."""
+    decision = _view_loss_ground()
+    claim_content = GroundContent(
+        statement=(
+            "The new second storey will completely block the harbour view we've had "
+            "from our back deck for twenty years, which is the whole reason we bought "
+            "this house in the first place."
+        ),
+        document_title="Objection narrative",
+        page=1,
+    )
+
+    package = await compose_dispatch_package(
+        [decision], _case(), {decision.ground_id: claim_content}
+    )
+
+    md = package.refusals_explainer.markdown
+    assert decision.ground_id not in md
+    assert "### Private view loss" not in md
+    assert "The new second storey will completely block the harbour view" in md
 
 
 async def test_unanchored_view_loss_gets_an_encouraging_note() -> None:
@@ -243,7 +294,8 @@ async def test_flagged_ground_appears_under_review_not_refused() -> None:
     md = package.refusals_explainer.markdown
     assert "Still under review" in md
     assert "Refused grounds" not in md
-    assert "ground-heritage" in md
+    assert "### Site suitability" in md
+    assert "ground-heritage" not in md
 
 
 async def test_no_shipped_grounds_yields_empty_grounds_section() -> None:
