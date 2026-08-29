@@ -1,3 +1,61 @@
+# STATUS — wave 9 complete: full QA loop closed, deployed, verified (2026-08-29)
+
+Final wave-9 pass: drove the deployed app through every item in
+`LEO-FEEDBACK-UIUX.md` (both light and dark theme), per the standing
+QA→find→fix→QA doctrine. Found and fixed two real live defects in this
+round (see `SMOKE.md`'s "SMOKE.md v8" section for full detail):
+
+- **Street View fallback never rendered** (§4): `job/pipeline.py` fetched it
+  correctly but never told the console it existed (no `document_uploaded`
+  event) — fixed, redeployed, re-verified live end-to-end on a fresh
+  no-photo case (real thumbnail, "Archival Street View" grade-B badge,
+  attribution, clickable).
+- **Reviewer opinions illegible inside an expanded ground accordion** (§3):
+  a stale, pre-accordion `.ground-list li` CSS rule (no child combinator)
+  leaked its flex/space-between layout into every nested `<li>`, squeezing
+  each reviewer's prose into unreadable vertical-letter columns — fixed by
+  scoping the selector to direct children only, redeployed, re-verified.
+
+Both fixes are TDD'd where Python (591 passed, up from 590), verified live
+where CSS (this repo has no CSS test harness, per established convention).
+Two redeploys this round: `setback-console-00015-qt2` (tribunal gen 14,
+Street View fix) then `setback-console-00016-jcr` (tribunal gen 15, CSS
+fix) — both confirmed serving (docket gate `401`/`401`/`200`) before
+proceeding.
+
+**New recommended film case for the overlay flagship shot**:
+`cc9bfc59084fd7cac527c479f0e71996` (`DA2026/0412-FILM2`) — a fresh run
+produced under every current fix (green, correctly-coloured height-datum
+box; legible chip; full-resolution click-through confirmed serving a real
+4962×3508 PNG), unlike the historical `f3f8c3475e2646537212677fbf7c8075`,
+whose own live overlay event predates three waves of overlay fixes and is
+never retroactively recomposed (an append-only event log, by design). The
+populate pass's real-DA case (`9f9a6a087f851db107be765391ba48ad`, Case A)
+remains the right pick for the separate "real, live-fetched DA" narrative
+beat — see "Blocker 1" below, still open.
+
+**Full checklist result: every LEO-FEEDBACK-UIUX.md item is a confirmed
+live PASS in both themes** (see `SMOKE.md` v8's item-by-item table) except
+one already-documented, deliberately-not-re-fixed limitation:
+
+- **Blocker 1** (wave-9 populate pass, `CASES.md`, still open): on a real
+  (non-fixture) DA, the annotated-overlay pipeline can pick a
+  non-plan/elevation document (e.g. a cover letter) because
+  `_ground_annotated_evidence`'s document selection isn't classification-
+  aware and `_MAX_TRACKER_DOCUMENTS = 3` can truncate before the real
+  elevations document is ever seen. Not attempted this round (larger
+  change, and every affected real case is already being avoided for
+  filming via case selection per the populate pass's own recommendation,
+  adopted here) — exact patch pointer on record in `CASES.md`.
+
+**Remaining work is film-day/founder-only** from here: pick the final film
+case(s) from the recommendation above, one timed rehearsal, and the
+Devpost/DISCLOSURE.md narrative items already listed further down this
+file. No further build-or-QA-wave agent pass is expected before Sunday's
+freeze.
+
+---
+
 # STATUS — wave 9 landed: founder feedback round (2026-08-29)
 
 Integration pass reconciling four fixer lanes' work (already applied to the working

@@ -1434,3 +1434,219 @@ Redeploy + live smoke for wave 9 is **green**. `STATUS.md`'s outstanding
 "what remains" items (§10's live docket-repopulation half, §11 Veo, lane D)
 are unchanged by this pass — this pass covered redeploy + verification
 only, per its own scope.
+
+---
+
+# SMOKE.md v8 — full LEO-FEEDBACK-UIUX.md checklist, both themes, QA→fix→QA (2026-08-29)
+
+Full pass against every item in `LEO-FEEDBACK-UIUX.md`, driven live against the
+deployed `setback-console` (`australia-southeast1`) with a real Chrome browser
+(`chrome-devtools` MCP; the one open tab was `about:blank`, nothing pre-existing
+to close) plus `curl`/direct API calls for the parts a browser can't easily
+exercise (idempotency re-press, raw event/document inspection). Two real,
+live-confirmed defects were found; both were fixed in this round (TDD where the
+fix was Python; live DOM re-inspection where it was CSS, matching this repo's
+established no-CSS-tests convention), redeployed, and re-verified clean before
+this file was written — no finding rolled forward to a later round.
+
+## Defects found live, fixed this round, redeployed, re-verified
+
+### Bug 1 — Street View fallback fetched correctly but never rendered (LEO-FEEDBACK-UIUX.md §4)
+
+**Found**: this exact gap was already flagged (not yet fixed) by the wave-9
+populate pass's "Blocker 2" (`CASES.md`) — confirmed independently this round
+by reading `job/pipeline.py` directly: `_build_dossier` registered a fetched
+Street View fallback into the in-memory `CaseDossier` for grounding only, and
+never appended a `document_uploaded` event, the *only* event type
+`console.app`'s `_SECTION_FOR_EVENT_TYPE` map routes to the Evidence section.
+The fetch itself (metadata + image, both confirmed live with the
+`maps-api-key` secret fetched into a shell variable, used, and unset
+immediately — only HTTP status/JSON `status`/`date` fields ever printed) was
+never the problem.
+
+**Fix**: `job/pipeline.py::_record_street_view_fallback_event` (new) durably
+stores the image via the document source (`GcsEvidenceStore` in production)
+and appends a `document_uploaded` event carrying `provenance_grade: "B"`;
+`console/app.py::_render_document_uploaded_item` gives this case its own
+"Archival Street View" grade-B badge (`.tag--grade-b`, already-existing CSS)
+instead of mislabelling it "Your photo". TDD: `tests/job/test_pipeline.py`'s
+two Street View trigger tests now assert the event/stored bytes exist (or
+don't, on the has-photo path); a new `tests/console/test_app.py` test pins
+the renderer contract directly. 591 passed, ruff/format/mypy clean. Commit
+`f312d68`.
+
+**Re-verified live, end-to-end, post-redeploy** (`setback-console-00016-jcr`):
+created a fresh case (`DA2026/SV-TEST`, synthetic `resident_session` uuid4,
+neutral UA `setback/0.1`, zero documents uploaded), ran a real tribunal. The
+Evidence section now renders a real doc-card — "Street View (archival)"
+title, a genuine 640×400 JPEG thumbnail (`curl`-confirmed: `200 image/jpeg`),
+an "Archival Street View" grade-B tag with the full `(c) Google Street View,
+2024-06` attribution in its hover title, and it is clickable
+(`doc-card--clickable`) to the full image — in both light and dark theme.
+
+### Bug 2 — reviewer-opinion text illegible inside an expanded ground accordion (LEO-FEEDBACK-UIUX.md §3)
+
+**Found**: expanding any ground's accordion to see "What the reviewers said"
+(the wave-9 merge of reviewer opinions into the ground card) rendered each
+opinion as unreadable, squeezed near-vertical letter columns instead of
+prose — confirmed live on the deployed console (both the pre-existing
+`PAN-661190` case and a fresh case), reproducible every time.
+
+**Root cause**: `style.css`'s `.ground-list li` (a pre-accordion, wave-4-era
+rule meant only for the top-level ground row: `display: flex;
+justify-content: space-between; ...`) has no child combinator, so it also
+matched every `<li>` nested arbitrarily deep inside an expanded card's own
+`<details>` body — specifically `.ground-card__opinions`'s
+`<ul class="event-list">` reviewer-verdict items, several DOM levels below.
+Each opinion's own text (`<strong>clause_reviewer</strong> — support
+(confidence 0.85)<br><em>sentence...</em>`) got flexed as a row with
+`justify-content: space-between`, squeezing each word/clause into its own
+narrow flex column and wrapping it letter-by-letter.
+
+**Fix**: scoped the rule to direct children only — `.ground-list > li` — the
+only element it was ever meant to style (the top-level card's own flex
+layout already comes from `.ground-card`, wave 9's accordion redesign). No
+CSS tests exist in this repo (established convention, see wave-5's grid-bug
+fix in this same file); verified by re-inspecting the live rendered DOM
+before and after. 591 passed (unaffected — Python-only suite), ruff/format/
+mypy clean. Commit `c6599df`.
+
+**Re-verified live, post-redeploy**: expanding a ground on both the fresh
+`DA2026/0412-FILM2` case and the fresh `DA2026/SV-TEST` case renders "What
+the reviewers said" as normal, readable prose in both light and dark theme —
+no squeezed columns, no letter-wrapping.
+
+## Full checklist, item by item (post both fixes, both themes)
+
+| LEO-FEEDBACK-UIUX.md item | Light | Dark | Verdict |
+|---|---|---|---|
+| §1 Landing (`/`) public, no key, minimal, centered Setback + caption + one DA input, footer intact | ✓ | ✓ | PASS |
+| §1 "Your previous cases" localStorage affordance | ✓ | ✓ | PASS |
+| §1 Docket moved to `/docket`, same `?key=` gate; root never 401s | `GET /`→200, `GET /docket`→401 (no key), →401 (wrong key), →200 (correct key, fetched into a shell var, unset immediately) | — | PASS |
+| §1 Copy link + QR code on the case page | ✓ (QR confirmed a real, valid 270×270 PNG) | ✓ | PASS |
+| §2 Two-pane layout, fixed left chat ~35–40%, scrolling right sections | ✓ | ✓ | PASS |
+| §2 Chat loads full persisted transcript on open, no dup greeting on a cold session | Confirmed on two brand-new cases this round (`DA2026/0412-FILM2`, `DA2026/SV-TEST`) — exactly one greeting each, reload-stable | ✓ | PASS |
+| §2 Typing indicator + disabled input while a reply is pending | Confirmed in wave-9's own v7 pass (this round's turns resolved too fast to re-catch the animation frame, but the mechanism is unchanged code) | — | PASS (carried) |
+| §2 "Interview transcript" standalone section removed | Confirmed absent from every case page rendered this round | ✓ | PASS |
+| §2 Export transcript | `GET .../transcript.txt` confirmed: `Setback  2026-08-29 23:28 AEST  <message>` / `You  <time>  <message>`, exact format | — | PASS |
+| §2 Loading state on "Start tribunal" | "Tribunal running..." disabled button + live "Tribunal sitting" SSE widget confirmed | ✓ | PASS |
+| §3 Grounds accordion: clamped one-liner + status pill, click expands | ✓ | ✓ | PASS |
+| §3 Reviewer opinions merged into the expansion, legible | **Bug 2 above — fixed and re-verified** | ✓ | PASS (after fix) |
+| §3 Gate/refusal copy inside the expansion names the ground | Confirmed: "We didn't include: `<the resident's own claim text>`" — never generic, on every refused ground rendered this round | ✓ | PASS |
+| §4 Evidence doc-cards clickable to full image/PDF | Elevations PDF, an uploaded photo, and the Street View fallback all confirmed as real `doc-card--clickable` links to their own document route | ✓ | PASS |
+| §4 Street View fallback fires and renders on a no-photo case | **Bug 1 above — fixed and re-verified**, live, end-to-end | ✓ | PASS (after fix) |
+| §5 Overlay: no page-level boxes, capped count, legible labels, colours match legend, clickable to full-res | Confirmed on a **fresh** run (`DA2026/0412-FILM2`): the height-datum box renders green ("supports a shipped ground") with a large, clearly word-spaced chip; three window boxes + one door box render neutral grey (uncited, correctly not colour-inherited); full-res click-through opens a genuine 4962×3508 PNG (`curl`-confirmed) via the real document route | — (not re-toggled in dark; overlay is a served image, theme-independent) | PASS |
+| §5 Historical film case (`f3f8c3475e2646537212677fbf7c8075`) | Its own live `annotated_overlay` event still predates every colour/chip fix (append-only event log, by design — flagged every wave since v5/v6) — boxes legible but not green/correctly-coloured on THIS case specifically | — | **Known, not re-fixable without a fresh run — see recommendation below** |
+| §6 Copy text + Email this (mailto) primary; HTML secondary; no Markdown | Confirmed on both submission and refusals documents, every case rendered this round — zero `.md` link anywhere | ✓ | PASS |
+| §7 Absolute Sydney timestamps with date | "29 Aug 2026, 11:21pm AEST" / "23:28 AEST" formats confirmed throughout (tribunal section, transcript export) | ✓ | PASS |
+| §7 Start tribunal un-crashable on re-press | UI: button disabled/relabelled in terminal states. **API-level re-press directly tested**: `POST .../tribunal` on an already-completed case → `202`, job runs, appends a plain-English "This case's tribunal has already run — nothing further happened." event; page intact, 2 grounds, zero raw JSON, no crash | — | PASS |
+| §8 Theme toggle, both directions, persisted, overrides system | Toggled dark→light→dark on the landing page and a case page; confirmed `data-theme` persists across a reload | ✓ | PASS |
+| §9 Sticky nav across the merged section set (Grounds/Evidence/Overlay/Documents/Tribunal) | ✓ | ✓ | PASS |
+| §9 Warm-brown refusal semantics never red/error | Confirmed on every refusal card rendered this round, both themes | ✓ | PASS |
+| §10 Typed DA number drives real ingest; honest fallback when it can't | `DA2026/0412-FILM2` (a non-existent DA) rendered a plain-English `ingest_resolved` fallback line ("Could not fetch DA2026/0412-FILM2 live; showing the demo case (DA2026/0359) instead.") — no raw JSON, no silent wrong letterhead | — | PASS (mechanism; real-DA population itself is the populate pass's own, separate scope) |
+
+## Recommendation: new film case for the overlay beat
+
+The historical film case's own live overlay event is genuinely stale (every
+wave since v5 has flagged this — an append-only event log is never
+retroactively recomposed). This round produced a **fresh, currently-correct**
+overlay from scratch: case `cc9bfc59084fd7cac527c479f0e71996`
+(`DA2026/0412-FILM2`) — overshadowing SHIPPED (elevations.pdf + a photo,
+s4.15(1)(b), green datum-line box with a legible chip, full-res click-through
+confirmed), property value REFUSED (s4.15(1), named "Property value" — not a
+raw ground-id hash). **Recommend using this case, not the old
+`f3f8c3475e2646537212677fbf7c8075`, for the overlay flagship shot** — same
+letterhead/demo-fixture data, but produced under every current fix rather
+than predating three waves of them. The populate pass's own recommended real
+case (`9f9a6a087f851db107be765391ba48ad`, Case A) remains the right pick for
+the separate "real, live-fetched DA" narrative beat — its overlay is still
+not presentable (Blocker 1, unfixed this round, see below).
+
+## Not fixed this round (named precisely, per this repo's convention)
+
+- **Blocker 1 (wave-9 populate pass, `CASES.md`)**: on a real (non-fixture)
+  DA, `_ground_annotated_evidence`'s plan-document selection picks the first
+  `DOCUMENTS_ONLY` document in tracker-listing order rather than one actually
+  classified as a plan/elevation, and `_MAX_TRACKER_DOCUMENTS = 3` can cut
+  off the real elevations document before it's ever classified. Confirmed
+  still present (not this round's fix to attempt — it touches real-DA
+  document selection, a larger change, and every real case it would affect
+  is explicitly being avoided for filming per the populate pass's own
+  recommendation, adopted here). Exact patch pointer already on record in
+  `CASES.md`.
+- **Typing indicator's exact animation frame**: not re-caught on camera this
+  round (every turn resolved before a screenshot could land mid-flight,
+  same as v7) — the code path is unchanged from v7's live confirmation, not
+  re-verified pixel-for-pixel this round.
+
+## Verification (verbatim, after both fixes)
+
+```
+$ uv run pytest -q
+591 passed, 256 warnings in ~51s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+81 files already formatted
+
+$ uv run mypy
+Success: no issues found in 38 source files
+```
+
+## Redeploys this round
+
+Two, one per fix (Street View event wiring, then the CSS scoping fix):
+
+- `setback-console-00015-qt2` → tribunal generation 14 (Bug 1 fix)
+- `setback-console-00016-jcr` → tribunal generation 15 (Bug 2 fix)
+
+Both confirmed serving (docket gate `401`/`401`/`200` re-checked after the
+second deploy) before further verification proceeded.
+
+## Live budget this round
+
+**Three real Cloud Run Job executions**: the `DA2026/0412-FILM2` proof run
+(overshadowing SHIPPED + property value REFUSED, real Vertex calls), the
+`DA2026/SV-TEST` run (Street View verification, one refused ground — no
+evidence was ever going to survive review with nothing but a Street View
+fallback and no plans, which is expected and not a defect), and the
+API-level tribunal re-press against the already-completed
+`DA2026/0412-FILM2` case (short-circuits on the idempotency guard before any
+model call — effectively free). Ordinary interview-tier Gemini calls for
+every interview turn driven across both new cases. Total cost of the same
+small, sub-cent-per-call order as every prior wave's checkpoints.
+
+## Security
+
+No secret value was read, printed, or transmitted. `docket-key` was fetched
+into a shell variable exactly twice this round (once per redeploy's
+verification), used only inside a `curl --data-urlencode`/`-G` argument, and
+`unset` immediately after — only HTTP status codes were ever recorded.
+`maps-api-key` was fetched into a shell variable exactly once, used for one
+metadata call and one image call against Street View's public API (to
+independently confirm both endpoints work, ahead of diagnosing Bug 1), and
+unset immediately after — no key value was ever printed or logged. No
+personal identifier appears anywhere in this file, any command run, any
+commit, or any case created this round: `resident_session` values are
+synthetic `uuid4`s or short human-readable test labels (no real name/email/
+address), evidence photos are the repo's own synthetic
+`smoke-photo-shadow.jpg` (no real site imagery), and every outbound HTTP
+call used the neutral `User-Agent: setback/0.1`. One pre-existing browser
+tab (`about:blank`) was present at the start of this round and was not a
+stale, key-bearing tab — no tab-based exposure risk this round; nothing was
+closed because nothing needed closing.
+
+## Status
+
+**Full LEO-FEEDBACK-UIUX.md checklist: green, both themes**, after fixing
+the two real defects this round found (Street View fallback surfacing;
+reviewer-opinion CSS legibility) — both fixed, tested, redeployed, and
+re-verified live in this same round, per the QA→find→fix→QA doctrine. One
+pre-existing, already-multiply-documented limitation (Blocker 1, real-DA
+overlay document selection) remains open by design — avoided for filming via
+case selection, not silently shipped. Remaining work is film-day/founder-only:
+picking the final film case(s) from the recommendation above, the timed
+rehearsal, and everything `STATUS.md`'s own "what remains" sections already
+list. Pushed to `main` after this file and `STATUS.md` were updated.
