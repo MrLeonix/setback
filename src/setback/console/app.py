@@ -951,7 +951,15 @@ _UUID_PATTERN: Final[re.Pattern[str]] = re.compile(
 )
 
 
-_JUNK_METADATA_PATTERNS: Final[tuple[str, ...]] = ("smoke", "test", "wiring-proof", "rate-limit")
+_JUNK_METADATA_PATTERNS: Final[tuple[str, ...]] = (
+    "smoke",
+    "test",
+    "wiring-proof",
+    "rate-limit",
+    "qa",
+    "deploy",
+    "sv-test",
+)
 """Case-insensitive substrings that mark a case as test/smoke/deploy-
 verification debris even when `_looks_like_a_resident_session` alone would
 let it through -- e.g. a scripted/curl-created case given a real
@@ -960,7 +968,23 @@ whose junk label lives in `application_number` rather than
 `resident_session` (a `SMOKE-TEST-PHOTO`/`wave6-wiring-proof`/`rate-limit-
 check` application number). Found live: SMOKE.md v4's own docket-hygiene
 finding, a case that passed the purely structural UUID check but was
-still an obvious smoke artifact by its own label."""
+still an obvious smoke artifact by its own label.
+
+`qa`/`deploy`/`sv-test` (wave 9.5) close a second real leak: the wave-9
+populate/redeploy-verification passes created live, real-UUID-session
+cases with application numbers like `DA2026/DEPLOY-QA` and
+`DA2026/SV-TEST` (SMOKE.md v8's Street View verification case) that would
+otherwise sit on the public docket board next to genuine resident
+objections and the film cases. `sv-test` is listed explicitly even though
+the pre-existing `test` pattern already matches it, so the specific,
+named regression this wave's brief called out has its own on-the-record
+pattern rather than relying solely on a broader substring incidentally
+covering it. None of these substrings can appear in a hex-shaped
+`resident_session`/`case_id` (no `q` in `0-9a-f`) or in a real DA
+number/film-case label (`DA2026/0359`, `DA2026/0412-FILM2`, and the
+populate pass's own real-DA case ids all miss every one of them), so this
+extension carries no risk of hiding a genuine or film case -- see the
+tests pinning FILM/FILM2 and Case A stay visible."""
 
 
 def _mentions_a_junk_pattern(text: str) -> bool:

@@ -830,6 +830,76 @@ def test_docket_board_does_not_exclude_a_genuine_application_number(
     assert "DA2026/0359" in response.text
 
 
+# --- docket hygiene: wave 9 QA/deploy-verification leaks (wave 9.5) --------
+
+
+@pytest.mark.parametrize(
+    "junk_application_number",
+    [
+        "DA2026/DEPLOY-QA",
+        "da2026/deploy-qa",  # lowercase: the match is case-insensitive
+        "DA2026/SV-TEST",
+        "DA2026/QA-CHECK",
+        "deploy-verify-au-002",
+    ],
+)
+def test_docket_board_excludes_wave9_qa_and_deploy_verification_cases(
+    client: TestClient, junk_application_number: str
+) -> None:
+    """Wave-9 populate/redeploy-verification passes created real (real
+    UUID `resident_session`) cases with application numbers like
+    `DA2026/DEPLOY-QA` and `DA2026/SV-TEST` (SMOKE.md v8) that leaked onto
+    the public docket board next to genuine resident objections -- neither
+    `smoke`/`test`/`wiring-proof`/`rate-limit` alone caught `qa` or
+    `deploy` on their own (only `SV-TEST` happened to also contain
+    `test`)."""
+    case_id = _create_case(
+        client, application_number=junk_application_number, session=_REAL_SESSION
+    )
+
+    response = client.get("/docket")
+    assert response.status_code == 200
+    assert junk_application_number not in response.text
+
+    # Hide only -- never delete: the case's own page is still reachable.
+    case_response = client.get(f"/cases/{case_id}")
+    assert case_response.status_code == 200
+    assert junk_application_number in case_response.text
+
+
+@pytest.mark.parametrize(
+    "presentable_application_number",
+    [
+        "DA2026/0412-FILM2",
+        "DA2026/0359",
+    ],
+)
+def test_docket_board_keeps_film_cases_visible_after_the_qa_deploy_extension(
+    client: TestClient, presentable_application_number: str
+) -> None:
+    """The extended exclusion list must not catch the flagship film cases
+    (`DA2026/0412-FILM2`, and the frozen demo case's own `DA2026/0359`,
+    the same number Case A's real-DA narrative resolves to) -- none of
+    `qa`/`deploy`/`sv-test` appear in either."""
+    _create_case(client, application_number=presentable_application_number, session=_REAL_SESSION)
+    response = client.get("/docket")
+    assert presentable_application_number in response.text
+
+
+def test_docket_board_keeps_case_a_visible_after_the_qa_deploy_extension(
+    client: TestClient,
+) -> None:
+    """Case A (`9f9a6a087f851db107be765391ba48ad`, the populate pass's real,
+    live-fetched-DA film beat) must stay visible -- its case id is a plain
+    hex hash, which cannot contain `q` (not a hex digit) and so can never
+    match `qa`, and neither its `resident_session` nor its
+    `application_number` reference this fix's new patterns."""
+    case_id = _create_case(client, application_number="PAN-661190", session=_REAL_SESSION)
+    response = client.get("/docket")
+    assert response.status_code == 200
+    assert case_id in response.text
+
+
 # --- docket hygiene: collapsing duplicate application numbers --------------
 
 

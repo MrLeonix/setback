@@ -164,6 +164,7 @@ from setback.evidence.dossier import (
     CaseDossier,
     ProvenanceGrade,
     RenderedPage,
+    SourceDocument,
     anchor_id_for,
     build_dossier,
     to_gate_dossier,
@@ -349,6 +350,74 @@ def _plan_document_title(filename: str, kind: Any) -> str:
     if kind is None or getattr(kind, "name", None) == "OTHER":
         return filename
     return f"{str(kind).replace('_', ' ').title()} ({filename})"
+
+
+_PLAN_TITLE_KEYWORDS: Final[tuple[str, ...]] = ("elevation", "plan", "drawing", "section", "site")
+"""Title-heuristic keywords for "this exhibited document is probably a
+plan/drawing, not an administrative letter" (CASES.md's Blocker 1,
+case-insensitive). Deliberately broad -- it is fine for this to also match
+"Notification plan" or "Site Plan" alongside "Elevations"; the point is
+distinguishing a plan-shaped document from a cover letter/notice, not
+picking exactly one document kind. Reused by both
+`_rank_tracker_documents` (ranks a tracker's raw listing before the
+`_MAX_TRACKER_DOCUMENTS` cap truncates it) and `_select_plan_document`
+(picks which dossier document to ground/overlay) so both ends of Blocker 1
+agree on what "looks like a plan" means. When `_plan_document_title` has
+already classified a document, its kind name (e.g. "Elevations") is baked
+into the title this same heuristic reads, so a real clerk classification
+is automatically preferred over the raw-filename fallback with no extra
+branching -- a title such as "Elevations (elevations.pdf)" matches on
+"elevation" whether that word came from the model's classification or the
+original filename."""
+
+
+def _looks_like_plan_document(title: str) -> bool:
+    """True if `title` looks like a plan/elevation/drawing rather than an
+    administrative letter or notice -- see `_PLAN_TITLE_KEYWORDS`."""
+    lowered = title.lower()
+    return any(keyword in lowered for keyword in _PLAN_TITLE_KEYWORDS)
+
+
+def _rank_tracker_documents(listed: Sequence[ExhibitedDocument]) -> list[ExhibitedDocument]:
+    """Re-rank a tracker's raw document listing so plan-shaped titles sort
+    ahead of everything else, each group keeping its own relative (real
+    eTrack: most-recently-lodged-first) order -- CASES.md's Blocker 1 (a):
+    a real council register lists documents by lodgement date, not by
+    type, so the actual Elevations drawing can sit past
+    `_MAX_TRACKER_DOCUMENTS`'s cap while an administrative cover letter
+    lodged more recently occupies a slot ahead of it. Ranking *before* the
+    cap is applied (rather than raising the cap) lets a real, larger
+    register still degrade gracefully: every plan-like document gets a
+    slot first, and a non-plan document (a notification letter, a
+    statement) still fills any slot that remains once they do -- never an
+    all-or-nothing exclusion of ordinary paperwork."""
+    plan_docs = [d for d in listed if _looks_like_plan_document(d.title)]
+    other_docs = [d for d in listed if not _looks_like_plan_document(d.title)]
+    return plan_docs + other_docs
+
+
+def _select_plan_document(documents: Sequence[SourceDocument]) -> SourceDocument | None:
+    """Pick the `DOCUMENTS_ONLY` document to ground/overlay -- CASES.md's
+    Blocker 1 (b): the prior behaviour picked the first `DOCUMENTS_ONLY`
+    document in dict insertion order, with no preference for one actually
+    classified (or, absent classification, title-heuristically
+    identified, see `_looks_like_plan_document`) as a plan/elevation. On a
+    real DA register a Resident Notification Letter can easily be the
+    first such document in tracker-listing order, landing the annotated
+    overlay's boxes -- and the objection's own evidence citation -- on an
+    administrative cover letter instead of a drawing.
+
+    Prefers the first `DOCUMENTS_ONLY` document whose title looks like a
+    plan; falls back to the first `DOCUMENTS_ONLY` document in dict order
+    (the prior, still-correct behaviour) when none of them do, so a
+    dossier with no plan-classified/plan-titled document at all is
+    unaffected by this change. `None` if there is no `DOCUMENTS_ONLY`
+    document at all."""
+    candidates = [d for d in documents if d.provenance_grade is ProvenanceGrade.DOCUMENTS_ONLY]
+    for candidate in candidates:
+        if _looks_like_plan_document(candidate.title):
+            return candidate
+    return candidates[0] if candidates else None
 
 
 def _fixture_transport(request: httpx.Request) -> httpx.Response:
@@ -875,14 +944,7 @@ class RealPipelineRunner:
         ground in this run has a `GateDecision`. `run` renders the actual
         overlay once, after its ground loop, from the context this method
         returns."""
-        plan_document = next(
-            (
-                d
-                for d in dossier.documents.values()
-                if d.provenance_grade is ProvenanceGrade.DOCUMENTS_ONLY
-            ),
-            None,
-        )
+        plan_document = _select_plan_document(list(dossier.documents.values()))
         if plan_document is None or self._grounding_client is None or not plan_document.pages:
             return dossier, None
 
@@ -1039,7 +1101,7 @@ class RealPipelineRunner:
             return []
 
         documents: list[tuple[str, str, bytes]] = []
-        for exhibited in listed[:_MAX_TRACKER_DOCUMENTS]:
+        for exhibited in _rank_tracker_documents(listed)[:_MAX_TRACKER_DOCUMENTS]:
             try:
                 content = await source.download_document(exhibited)
             except TrackerError as exc:

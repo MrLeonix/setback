@@ -23,6 +23,7 @@ from setback.evidence.dossier import (
     EvidenceAnchor,
     ProvenanceGrade,
     RenderedPage,
+    SourceDocument,
     anchor_id_for,
     render_pdf_pages,
 )
@@ -39,14 +40,18 @@ from setback.ingest.tracker import (
     UserUploadedDocumentSource,
 )
 from setback.job.pipeline import (
+    _MAX_TRACKER_DOCUMENTS,
     _STREET_VIEW_DOCUMENT_ID,
     RealPipelineRunner,
     _first_page_text,
     _GroundedOverlayContext,
     _load_frozen_ingest,
     _load_ingest_for_application,
+    _looks_like_plan_document,
     _plan_document_title,
     _propagate_page_level_anchor_status,
+    _rank_tracker_documents,
+    _select_plan_document,
     _shrink_png_for_storage,
 )
 from setback.state.firestore import GroundStatus, InMemoryCaseStore, resume_case
@@ -226,6 +231,225 @@ def test_plan_document_title_falls_back_to_filename_when_kind_is_none() -> None:
 def test_plan_document_title_falls_back_to_filename_for_other_kind() -> None:
     """`OTHER` adds no information over the filename alone."""
     assert _plan_document_title("mystery.pdf", _FakeDocumentKind("OTHER")) == "mystery.pdf"
+
+
+# --- Blocker 1 (CASES.md): real-DA overlay/citation grounds on the wrong ----
+# document -- a Resident Notification Letter, not the real Elevations
+# drawing -- because (a) `_exhibited_tracker_documents` truncated a real
+# eTrack listing at `_MAX_TRACKER_DOCUMENTS` before the letter's later-ranked
+# plan documents were ever seen, and (b) `_ground_annotated_evidence` picked
+# the first `DOCUMENTS_ONLY` document by dict order, with no preference for
+# one actually classified/titled as a plan. Both ends fixed via the shared
+# `_looks_like_plan_document` title heuristic.
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Elevations",
+        "elevations.pdf",
+        "Site Plan",
+        "Site analysis plan",
+        "SECTION A-A",
+        "Roof drawing",
+        "SITE ANALYSIS",
+    ],
+)
+def test_looks_like_plan_document_matches_plan_shaped_titles(title: str) -> None:
+    assert _looks_like_plan_document(title) is True
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Resident Notification Letter",
+        "Cover letter",
+        "Fee receipt",
+        "Statement of Environmental Effects",
+        "BASIX Certificate",
+    ],
+)
+def test_looks_like_plan_document_rejects_administrative_titles(title: str) -> None:
+    assert _looks_like_plan_document(title) is False
+
+
+def _document_only(document_id: str, title: str) -> SourceDocument:
+    return SourceDocument(
+        document_id=document_id,
+        title=title,
+        provenance_grade=ProvenanceGrade.DOCUMENTS_ONLY,
+        pages=(),
+    )
+
+
+def test_select_plan_document_prefers_a_plan_titled_document_over_dict_order() -> None:
+    """CASES.md's Blocker 1 (b), reproduced directly: the Resident
+    Notification Letter is first in dict order (exactly the real eTrack
+    listing's own order, most-recently-lodged first), but the real
+    Elevations document -- present, just later in the dict -- must be
+    preferred."""
+    documents = [
+        _document_only("etrack-5200464", "Resident Notification Letter"),
+        _document_only("etrack-5197134", "Elevations (Elevations.pdf)"),
+    ]
+
+    selected = _select_plan_document(documents)
+
+    assert selected is not None
+    assert selected.document_id == "etrack-5197134"
+
+
+def test_select_plan_document_falls_back_to_dict_order_when_nothing_looks_like_a_plan() -> None:
+    """No regression for a dossier with no plan-shaped title at all -- the
+    prior, still-correct "first DOCUMENTS_ONLY document" behaviour."""
+    documents = [
+        _document_only("doc-1", "Resident Notification Letter"),
+        _document_only("doc-2", "Fee receipt"),
+    ]
+
+    selected = _select_plan_document(documents)
+
+    assert selected is not None
+    assert selected.document_id == "doc-1"
+
+
+def test_select_plan_document_ignores_non_documents_only_grade() -> None:
+    """A resident photo (grade A) titled "site plan photo" is never picked
+    as the plan document -- selection is scoped to `DOCUMENTS_ONLY`
+    documents exactly as before this fix."""
+    photo = SourceDocument(
+        document_id="photo-1",
+        title="My site plan photo",
+        provenance_grade=ProvenanceGrade.RESIDENT_PHOTO,
+        pages=(),
+    )
+
+    assert _select_plan_document([photo]) is None
+
+
+def test_select_plan_document_returns_none_for_no_documents() -> None:
+    assert _select_plan_document([]) is None
+
+
+def _tracker_document(document_id: str, title: str) -> ExhibitedDocument:
+    return ExhibitedDocument(document_id=document_id, title=title, source="etrack")
+
+
+def test_rank_tracker_documents_promotes_plan_titles_ahead_of_the_cap() -> None:
+    """The real `DA2026/0359` eTrack listing from CASES.md's Blocker 1
+    section, in its own real (most-recently-lodged-first) order: the
+    Elevations drawing is rank 4, past `_MAX_TRACKER_DOCUMENTS = 3`'s raw
+    cutoff, behind a Resident Notification Letter it should never lose to."""
+    listed = [
+        _tracker_document("5200464", "Resident Notification letter"),
+        _tracker_document("5197136", "Site plan"),
+        _tracker_document("5197135", "Site analysis plan"),
+        _tracker_document("5197134", "Elevations"),
+        _tracker_document("5197132", "Notification plan"),
+        _tracker_document("5197131", "Perspectives"),
+        _tracker_document("5197130", "BASIX Certificate"),
+        _tracker_document("5197129", "Waste management plan"),
+        _tracker_document("5197128", "Statement of Environmental Effects"),
+        _tracker_document("5197127", "Landscape plan"),
+        _tracker_document("5197126", "Arborist report"),
+        _tracker_document("5197125", "Fee receipt"),
+    ]
+    assert len(listed) == 12  # matches CASES.md's "12 total" real listing
+
+    ranked = _rank_tracker_documents(listed)
+    top = ranked[:_MAX_TRACKER_DOCUMENTS]
+
+    assert [d.document_id for d in top] == ["5197136", "5197135", "5197134"]
+    # The exact regression: the letter no longer occupies a top-3 slot, and
+    # the real Elevations document does.
+    assert "5197134" in [d.document_id for d in top]
+    assert "5200464" not in [d.document_id for d in top]
+
+
+def test_rank_tracker_documents_keeps_a_non_plan_document_when_room_remains() -> None:
+    """Ranking never turns into an all-or-nothing exclusion of ordinary
+    paperwork -- once every plan-like document has a slot, a ordinary
+    document still fills whatever room is left."""
+    listed = [
+        _tracker_document("1", "Resident Notification letter"),
+        _tracker_document("2", "Elevations"),
+        _tracker_document("3", "Fee receipt"),
+    ]
+
+    ranked = _rank_tracker_documents(listed)
+    top = ranked[:_MAX_TRACKER_DOCUMENTS]
+
+    assert {d.document_id for d in top} == {"1", "2", "3"}
+
+
+def test_rank_tracker_documents_preserves_relative_order_within_each_group() -> None:
+    listed = [
+        _tracker_document("1", "Perspectives"),
+        _tracker_document("2", "Site plan"),
+        _tracker_document("3", "Resident Notification letter"),
+        _tracker_document("4", "Elevations"),
+    ]
+
+    ranked = _rank_tracker_documents(listed)
+
+    assert [d.document_id for d in ranked] == ["2", "4", "1", "3"]
+
+
+@respx.mock
+async def test_exhibited_tracker_documents_selects_the_real_elevations_document() -> None:
+    """End-to-end through `_exhibited_tracker_documents` (not just the pure
+    `_rank_tracker_documents` helper above): a real 12-document eTrack
+    listing modeled on CASES.md's Blocker 1, with the Elevations drawing
+    ranked 4th (past the raw `_MAX_TRACKER_DOCUMENTS = 3` cutoff), must
+    still be fetched and registered."""
+    _mock_live_onlineda_and_spatial_for_other_pan()
+    respx.get(ETRACK_SEARCH_URL, params={"ApplicationNumber": _OTHER_COUNCIL_REF}).mock(
+        return_value=httpx.Response(200, text=_OTHER_SEARCH_FORM_HTML)
+    )
+    respx.post(ETRACK_SEARCH_URL, params={"ApplicationNumber": _OTHER_COUNCIL_REF}).mock(
+        return_value=httpx.Response(302, headers={"Location": _OTHER_DETAIL_URL})
+    )
+    documents_html = (
+        "<html><body><table>"
+        + "".join(
+            f"<tr><td>{title}</td><td>"
+            f'<a href="../../Common/Integration/FileDownload.ashx?id={doc_id}&amp;ext=PDF'
+            f'&amp;filesize=1000">Download</a></td></tr>'
+            for doc_id, title in [
+                ("5200464", "Resident Notification letter"),
+                ("5197136", "Site plan"),
+                ("5197135", "Site analysis plan"),
+                ("5197134", "Elevations"),
+                ("5197132", "Notification plan"),
+                ("5197131", "Perspectives"),
+            ]
+        )
+        + "</table></body></html>"
+    )
+    respx.get(url__startswith=_OTHER_DETAIL_URL.split("?")[0]).mock(
+        return_value=httpx.Response(200, text=documents_html)
+    )
+    respx.get(ETRACK_DOWNLOAD_URL).mock(
+        return_value=httpx.Response(200, content=ELEVATIONS_PDF.read_bytes())
+    )
+    _mock_no_street_view_coverage()
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(application_number=_OTHER_PAN, resident_session="resident-1")
+    case_id = case.case_id
+
+    async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+        runner = RealPipelineRunner(
+            document_source=document_source, ingest_client=ingest_client, grounding_client=None
+        )
+        resume = await resume_case(store, case_id)
+        dossier, _ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+
+    titles = {doc.document_id: doc.title for doc in dossier.documents.values()}
+    assert "etrack-5197134" in titles
+    assert "Elevations" in titles["etrack-5197134"]
+    assert "etrack-5200464" not in titles  # the notification letter lost its slot
 
 
 async def test_classify_plan_document_returns_none_without_a_model_client() -> None:
