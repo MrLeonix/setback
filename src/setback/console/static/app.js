@@ -328,6 +328,74 @@
   recordPreviousCase(caseId, document.title.replace(/^Setback -- /, ""));
 
   // ===========================================================================
+  // Round-2 UI feedback, item 1: real tabs, not a ref-link nav -- the
+  // founder's own correction: "the tabs rendered on the right side do not
+  // show which one is selected, and content should only be rendered for
+  // the selected tab (it's not a ref link for the page block, it's an
+  // interactive component that renders the associated content when it's
+  // selected)." console/app.py server-renders every panel plus the full
+  // WAI-ARIA tablist markup (role="tab"/"tabpanel", aria-selected,
+  // aria-controls, tabindex) with Grounds selected by default -- this
+  // wires the switching behaviour (click + full arrow-key/Home/End
+  // keyboard support per the ARIA Authoring Practices tabs pattern) by
+  // toggling `hidden`, never `style.display` (a stray inline style would
+  // permanently defeat the `[hidden]` CSS contract every other component
+  // in this file already relies on -- see the typing-indicator/lightbox
+  // `[hidden]` fixes above).
+  // ===========================================================================
+
+  const sectionTabs = Array.from(document.querySelectorAll('.section-tabs [role="tab"]'));
+
+  function switchToTab(tabId) {
+    let switched = false;
+    for (const tab of sectionTabs) {
+      const isTarget = tab.id === `tab-${tabId}`;
+      tab.setAttribute("aria-selected", isTarget ? "true" : "false");
+      tab.tabIndex = isTarget ? 0 : -1;
+      const panel = document.getElementById(tab.getAttribute("aria-controls"));
+      if (panel) panel.hidden = !isTarget;
+      if (isTarget) switched = true;
+    }
+    return switched;
+  }
+
+  sectionTabs.forEach((tab, index) => {
+    tab.addEventListener("click", () => {
+      switchToTab(tab.id.replace(/^tab-/, ""));
+    });
+    tab.addEventListener("keydown", (event) => {
+      let targetIndex = null;
+      if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+        targetIndex = (index + 1) % sectionTabs.length;
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+        targetIndex = (index - 1 + sectionTabs.length) % sectionTabs.length;
+      } else if (event.key === "Home") {
+        targetIndex = 0;
+      } else if (event.key === "End") {
+        targetIndex = sectionTabs.length - 1;
+      }
+      if (targetIndex === null) return;
+      event.preventDefault();
+      const targetTab = sectionTabs[targetIndex];
+      switchToTab(targetTab.id.replace(/^tab-/, ""));
+      targetTab.focus();
+    });
+  });
+
+  // Used by the citation-chip jump-to-evidence behaviour below: a chip can
+  // point at content living inside a currently-hidden tabpanel (e.g. the
+  // Overlay tab while Grounds is showing) -- switch to that tab first so
+  // "scroll to and flash the cited evidence" actually shows the resident
+  // something, rather than scrolling inside an invisible panel.
+  function ensureVisibleInTabs(el) {
+    if (!el) return;
+    const panel = el.closest('[role="tabpanel"]');
+    if (panel && panel.hidden) {
+      switchToTab(panel.id.replace(/^panel-/, ""));
+    }
+  }
+
+  // ===========================================================================
   // Shared helpers
   // ===========================================================================
 
@@ -354,8 +422,9 @@
   const transcriptEl = document.getElementById("interview-transcript");
   const interviewForm = document.getElementById("interview-form");
   const interviewInput = document.getElementById("interview-input");
-  const uploadForm = document.getElementById("upload-form");
+  const uploadTriggerBtn = document.getElementById("upload-trigger");
   const uploadInput = document.getElementById("upload-input");
+  const uploadStatusChip = document.getElementById("upload-status-chip");
   const startTribunalBtn = document.getElementById("start-tribunal");
   const typingIndicatorEl = document.getElementById("typing-indicator");
   const interviewSendBtn = interviewForm ? interviewForm.querySelector("button[type=submit]") : null;
@@ -571,17 +640,41 @@
     });
   }
 
-  if (uploadForm) {
-    uploadForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
+  // ===========================================================================
+  // Round-2 UI feedback, item 3: "upload button is spilling out of the chat
+  // container... remove the 'Choose file / No file chosen' part. Make it a
+  // one-liner: User answer input text | Send button | Upload button."
+  //
+  // The native `<input type="file">` (`#upload-input`) is visually hidden
+  // (`.visually-hidden`, see console/app.py) -- `#upload-trigger` is the
+  // styled button a resident actually sees and clicks, which just opens the
+  // browser's own file picker; selecting a file uploads it immediately
+  // (no separate "confirm" step), with feedback shown as a small chip
+  // (`#upload-status-chip`) rather than the native input's own "Choose
+  // file / No file chosen" text, which is never shown at all now.
+  // ===========================================================================
+
+  function setUploadStatus(message, isError) {
+    if (!uploadStatusChip) return;
+    if (!message) {
+      uploadStatusChip.hidden = true;
+      uploadStatusChip.textContent = "";
+      uploadStatusChip.classList.remove("upload-chip--error");
+      return;
+    }
+    uploadStatusChip.textContent = message;
+    uploadStatusChip.hidden = false;
+    uploadStatusChip.classList.toggle("upload-chip--error", !!isError);
+  }
+
+  if (uploadTriggerBtn && uploadInput) {
+    uploadTriggerBtn.addEventListener("click", () => uploadInput.click());
+
+    uploadInput.addEventListener("change", async () => {
       const file = uploadInput.files[0];
       if (!file) return;
-      const uploadBtn = uploadForm.querySelector("button[type=submit]");
-      const originalLabel = uploadBtn ? uploadBtn.textContent : "";
-      if (uploadBtn) {
-        uploadBtn.disabled = true;
-        uploadBtn.textContent = "Uploading...";
-      }
+      setUploadStatus(`Uploading ${file.name}…`, false);
+      uploadTriggerBtn.disabled = true;
       const formData = new FormData();
       formData.append("file", file);
       try {
@@ -594,19 +687,20 @@
           // system` variant) -- an upload isn't something either party
           // "said", so it shouldn't render as a resident bubble.
           appendTurn("ai-system", `Evidence added: ${file.name}`);
+          setUploadStatus(`${file.name} uploaded`, false);
+          window.setTimeout(() => setUploadStatus(null), 2500);
           await loadInterview();
         } else {
+          setUploadStatus("We couldn't upload that file just now.", true);
           renderTranscriptError("We couldn't upload that file just now.", null);
         }
       } catch (err) {
+        setUploadStatus("We couldn't reach the server just now.", true);
         renderTranscriptError("We couldn't reach the server just now.", null);
       } finally {
-        if (uploadBtn) {
-          uploadBtn.disabled = false;
-          uploadBtn.textContent = originalLabel;
-        }
+        uploadTriggerBtn.disabled = false;
+        uploadInput.value = "";
       }
-      uploadInput.value = "";
     });
   }
 
@@ -885,6 +979,7 @@
 
     function flashElement(el) {
       if (!el) return;
+      ensureVisibleInTabs(el);
       el.scrollIntoView({ behavior: "smooth", block: "center" });
       const previousOutline = el.style.outline;
       const previousOffset = el.style.outlineOffset;
@@ -1037,7 +1132,11 @@
 
   function ensureTribunalRun() {
     if (tribunalRunEl) return tribunalRunEl;
-    const anchor = document.querySelector(".case-layout__sections");
+    // Lives inside the Grounds tabpanel (round-2 UI feedback, item 1) --
+    // the live "courtroom sitting" timeline is about how the grounds are
+    // being checked, so it belongs in the same tab as the grounds
+    // themselves, not the page-level sections container at large.
+    const anchor = document.getElementById("panel-grounds");
     if (!anchor) return null;
     tribunalRunEl = document.createElement("section");
     tribunalRunEl.className = "card tribunal-run";
@@ -1064,10 +1163,11 @@
     // Wave 9 (LEO-FEEDBACK-UIUX.md §3): "Reviewer opinions"/"Adjudication"/
     // "Gate decisions" no longer exist as standalone sections at all (they
     // render inside each ground's own accordion server-side now) -- only
-    // "Annotated evidence overlay" and "Tribunal" still have a flat,
-    // server-rendered fallback worth hiding once this richer live view has
-    // its own data to show in their place.
-    const titles = ["Annotated evidence overlay", "Tribunal"];
+    // "Annotated evidence overlay" still has a flat, server-rendered
+    // fallback worth hiding once this richer live view has its own data to
+    // show in its place. "Tribunal" is gone as a section entirely (round-2
+    // UI feedback, item 4) -- nothing left here to hide for it.
+    const titles = ["Annotated evidence overlay"];
     document.querySelectorAll(".case-layout__sections section.card").forEach((section) => {
       const heading = section.querySelector("h3");
       if (heading && titles.includes(heading.textContent.trim())) {
@@ -1261,7 +1361,11 @@
     // legend entry explaining it at all, reported live as "empty floating
     // boxes" with no visible meaning.
     hideFlatSectionsOnce();
-    const anchor = document.querySelector(".case-layout__sections");
+    // Lives inside the Overlay tabpanel (round-2 UI feedback, item 1),
+    // not the page-level sections container -- a live overlay event on a
+    // case with no prior server-rendered overlay must still land in the
+    // right tab, not float outside the tab structure entirely.
+    const anchor = document.getElementById("panel-overlay");
     if (!anchor) return;
     let viewer = document.querySelector(".doc-viewer");
     if (!viewer) {

@@ -16,7 +16,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from setback.console.app import RealJobTrigger, create_app
+from setback.console.app import RealJobTrigger, create_app, render_landing_page
 from setback.ingest.tracker import ExhibitedDocument, UserUploadedDocumentSource
 from setback.interview.flow import NormalisedConcern
 from setback.state.firestore import GroundStatus, InMemoryCaseStore, case_id_for
@@ -698,6 +698,31 @@ def test_docket_board_loads_the_client_script_so_the_create_case_form_renders(
     response = client.get("/docket")
     assert response.status_code == 200
     assert '<script src="/static/app.js"></script>' in response.text
+
+
+_VIEWPORT_META = '<meta name="viewport" content="width=device-width, initial-scale=1">'
+
+
+def test_docket_board_has_a_viewport_meta_tag(client: TestClient) -> None:
+    """Round-2 UI feedback, item 2: without this tag, a mobile browser lays
+    the page out at a virtual ~980px width and scales it down -- text
+    reads tiny, requires pinch-zoom, and every `max-width` media query in
+    style.css never actually triggers on a real phone. Found live during
+    this round's own browser QA pass (`window.innerWidth` reported 980 at
+    an emulated 390px viewport before this fix): this is the root cause
+    behind "layout on mobile is terrible," not merely a missing nicety."""
+    response = client.get("/docket")
+    assert _VIEWPORT_META in response.text
+
+
+def test_landing_page_has_a_viewport_meta_tag() -> None:
+    assert _VIEWPORT_META in render_landing_page()
+
+
+def test_case_page_has_a_viewport_meta_tag(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert _VIEWPORT_META in response.text
 
 
 def test_docket_board_does_not_hardcode_a_light_theme(client: TestClient) -> None:
@@ -1571,10 +1596,13 @@ def test_document_uploaded_pdf_still_renders_the_placeholder_icon(client: TestCl
     )
     response = client.get(f"/cases/{case_id}")
     assert "doc-card__thumb--placeholder" in response.text
-    # Scoped to the Evidence section -- the page header's own QR code
-    # (`<img class="case-actions__qr">`) is an unrelated `<img>`.
-    evidence_section = response.text.split('id="evidence"')[1].split("</section>")[0]
-    assert "<img" not in evidence_section
+    # Scoped to the Evidence tabpanel -- the page header's own QR code
+    # (`<img class="case-actions__qr">`) is an unrelated `<img>`. Bounded by
+    # the *next* panel's own id (rather than a naive `</div>` split, which
+    # would truncate at the first nested closing div inside this panel's
+    # own markup) since panels render in `_SECTION_TABS`' fixed order.
+    evidence_panel = response.text.split('id="panel-evidence"')[1].split('id="panel-overlay"')[0]
+    assert "<img" not in evidence_panel
 
 
 def test_get_uploaded_document_serves_the_stored_bytes(client: TestClient) -> None:
@@ -2012,11 +2040,12 @@ def test_case_page_exposes_zero_run_cost_with_no_ledger(client: TestClient) -> N
 
 
 def test_tribunal_requested_timestamp_is_converted_from_utc_to_sydney_not_read_verbatim() -> None:
-    """LEO-FEEDBACK-UIUX.md §7: timestamps must be absolute Australia/
-    Sydney, not the stored UTC clock value read as if it were already
-    local. 03:00 UTC in the southern-hemisphere winter (AEST, UTC+10)
-    renders as 1pm the same day -- a bug that read the raw UTC hour would
-    show 3am instead."""
+    """Round-2 UI feedback, item 4: the tribunal-start timestamp now lives
+    in the case header, in the exact `DD/MM/YYYY HH:MM AM/PM` format
+    requested (never a bare ISO string, never the stored UTC value read as
+    if it were already local). 03:00 UTC in the southern-hemisphere winter
+    (AEST, UTC+10) renders as 1:00 PM the same day -- a bug that read the
+    raw UTC hour would show 03:00 AM instead."""
     from datetime import UTC, datetime
 
     fixed_recorded_at = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
@@ -2030,14 +2059,16 @@ def test_tribunal_requested_timestamp_is_converted_from_utc_to_sydney_not_read_v
         fixed_store.append_event(case_id, "tribunal-requested:x", "tribunal_requested", payload={})
     )
     response = fixed_client.get(f"/cases/{case_id}")
-    assert "1:00pm" in response.text
-    assert "15 Jul 2026" in response.text
-    assert "3:00am" not in response.text
+    assert "Tribunal started 15/07/2026 01:00 PM" in response.text
+    assert "03:00 AM" not in response.text
 
 
-def test_tribunal_requested_event_renders_with_no_raw_json(
+def test_tribunal_requested_renders_in_the_header_meta_line_with_no_raw_json(
     client: TestClient, store: InMemoryCaseStore
 ) -> None:
+    """Round-2 UI feedback, item 4: the standalone "Tribunal" tab/section
+    is gone entirely -- its one piece of resident-facing content (the
+    start time) now lives in the case header's own `.case-meta` line."""
     case_id = _create_case(client)
     asyncio.run(
         store.append_event(case_id, "tribunal-requested:x", "tribunal_requested", payload={})
@@ -2045,17 +2076,26 @@ def test_tribunal_requested_event_renders_with_no_raw_json(
     response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
     assert "{}" not in response.text
-    assert "{" not in response.text.split('id="tribunal"')[1].split("</section>")[0]
-    assert "Tribunal run started" in response.text
+    assert '<p class="case-meta">Tribunal started' in response.text
+    assert "<h3>Tribunal</h3>" not in response.text
+
+
+def test_case_meta_line_absent_before_any_tribunal_run(client: TestClient) -> None:
+    """No "Tribunal started ..." line should appear before a tribunal has
+    ever been requested -- there is nothing yet to report."""
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert 'class="case-meta"' not in response.text
 
 
 def test_ingest_resolved_event_renders_live_success_with_no_raw_json(
     client: TestClient, store: InMemoryCaseStore
 ) -> None:
-    """Wave-9 handoff: `job.pipeline`'s new `ingest_resolved` event (the
-    un-frozen-ingest outcome) must render in plain English inside the
-    merged "Tribunal" section, never fall through to the raw-JSON
-    fallback."""
+    """Wave-9 handoff, relocated by round 2, item 4: `job.pipeline`'s
+    `ingest_resolved` event (the un-frozen-ingest outcome) must render in
+    plain English inside the Grounds tab's small "Notes" card, never fall
+    through to the raw-JSON fallback."""
     case_id = _create_case(client)
     asyncio.run(
         store.append_event(
@@ -2073,8 +2113,8 @@ def test_ingest_resolved_event_renders_live_success_with_no_raw_json(
     )
     response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
-    tribunal_html = response.text.split('id="tribunal"')[1].split("</section>")[0]
-    assert "{" not in tribunal_html
+    notes_html = response.text.split('class="card case-notes"')[1].split("</section>")[0]
+    assert "{" not in notes_html
     assert "used_demo_fixture" not in response.text
     assert "Fetched live council data for DA2026/0512" in response.text
 
@@ -2125,8 +2165,8 @@ def test_tribunal_rerun_ignored_event_renders_with_no_raw_json(
     )
     response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
-    tribunal_html = response.text.split('id="tribunal"')[1].split("</section>")[0]
-    assert "{" not in tribunal_html
+    notes_html = response.text.split('class="card case-notes"')[1].split("</section>")[0]
+    assert "{" not in notes_html
     assert "already" in response.text.lower()
     assert "run" in response.text.lower()
 
@@ -2216,3 +2256,106 @@ def test_resident_refusal_feedback_event_renders_with_no_raw_json(
     assert "original_explanation" not in response.text
     assert "I still think this should count." in response.text
     assert "Your disagreement is on record." in response.text
+
+
+# --- round-2 UI feedback, item 1: real tabs, not a ref-link nav ------------
+#
+# The founder's own correction: "the tabs rendered on the right side do not
+# show which one is selected, and content should only be rendered for the
+# selected tab (it's not a ref link for the page block, it's an interactive
+# component that renders the associated content when it's selected)." These
+# pin the server-rendered half of the contract (real ARIA tablist markup,
+# exactly one visible panel, Grounds selected by default) -- the client-side
+# `hidden`-toggling behaviour on click/arrow-key is `app.js`'s lane and has
+# no Python test harness in this repo (documented convention: CSS/JS
+# behaviour is verified live via a real browser, not unit-tested here).
+
+
+def test_case_page_renders_a_real_tablist_not_a_ref_link_nav(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert 'role="tablist"' in response.text
+    assert response.text.count('role="tab"') == 4
+    assert response.text.count('role="tabpanel"') == 4
+    # The old anchor-link nav is gone entirely, not just renamed.
+    assert "<nav" not in response.text
+    assert 'class="section-nav"' not in response.text
+
+
+def test_case_page_defaults_to_the_grounds_tab_selected(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert (
+        'id="tab-grounds" aria-controls="panel-grounds" aria-selected="true" tabindex="0"'
+        in response.text
+    )
+    # Every non-default tab starts deselected, keyboard-inert, and hidden.
+    for tab_id in ("evidence", "overlay", "documents"):
+        expected = f'aria-controls="panel-{tab_id}" aria-selected="false" tabindex="-1"'
+        assert expected in response.text
+    grounds_panel = response.text.split('id="panel-grounds"')[1].split(">", 1)[1]
+    assert "hidden" not in response.text.split('id="panel-grounds"')[1].split(">", 1)[0]
+    for tab_id in ("evidence", "overlay", "documents"):
+        panel_open_tag = response.text.split(f'id="panel-{tab_id}"')[1].split(">", 1)[0]
+        assert "hidden" in panel_open_tag
+    assert grounds_panel  # sanity: content exists to be shown
+
+
+def test_case_page_has_no_tribunal_tab_or_section(client: TestClient) -> None:
+    """Round-2 UI feedback, item 4: the Tribunal tab/section is removed
+    entirely, not merely hidden or relabelled."""
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert 'id="tab-tribunal"' not in response.text
+    assert 'id="panel-tribunal"' not in response.text
+    assert "<h3>Tribunal</h3>" not in response.text
+    assert ">Tribunal<" not in response.text
+
+
+# --- round-2 UI feedback, item 3: the chat input row is one line -----------
+#
+# "Upload button is spilling out of the chat container... remove the
+# 'Choose file / No file chosen' part. Make it a one-liner: User answer
+# input text | Send button | Upload button."
+
+
+def test_chat_input_row_is_a_single_form_with_no_native_file_input_text(
+    client: TestClient,
+) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    # One form holds the text input, Send, and the upload trigger together
+    # -- not two separate `<form>` rows stacked on top of each other.
+    assert response.text.count('<form id="interview-form"') == 1
+    assert '<form id="upload-form"' not in response.text
+    chat_form = response.text.split('<form id="interview-form"')[1].split("</form>")[0]
+    assert 'id="interview-input"' in chat_form
+    assert 'class="chat-form__send"' in chat_form
+    assert 'id="upload-trigger"' in chat_form
+    assert 'id="upload-input"' in chat_form
+    # The native file input is present (for the browser's own file picker)
+    # but visually hidden -- no "Choose file"/"No file chosen" text is ever
+    # shown, since that text belongs to the native, non-hidden control.
+    assert 'class="visually-hidden" tabindex="-1" aria-hidden="true"' in chat_form
+    assert "No file chosen" not in response.text
+    # The upload trigger is a styled button (icon + "Upload" label), never
+    # a bare submit button with the raw "Upload photo/document" copy the
+    # old two-form layout used.
+    assert "Upload photo/document" not in response.text
+    assert "chat-form__upload-label" in chat_form
+
+
+def test_chat_input_row_selected_file_feedback_is_a_chip_not_native_text(
+    client: TestClient,
+) -> None:
+    """The selected/uploaded-file feedback element exists as a distinct
+    chip/toast (`#upload-status-chip`), separate from the native file
+    input's own text, and starts hidden (nothing selected yet)."""
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert '<p id="upload-status-chip" class="upload-chip" hidden' in response.text

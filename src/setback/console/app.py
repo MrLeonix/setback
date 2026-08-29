@@ -1193,6 +1193,7 @@ def render_docket_board(
 {_html_tag(force_theme)}
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Setback -- Docket Board</title>
   {_PAGE_STYLE}
 </head>
@@ -1239,6 +1240,7 @@ def render_landing_page(*, force_theme: str | None = None) -> str:
 {_html_tag(force_theme)}
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Setback</title>
   {_PAGE_STYLE}
 </head>
@@ -1279,10 +1281,13 @@ _EVENT_SECTION_TITLES: Mapping[str, str] = {
     "resident_refusal_feedback": "Resident feedback on refusals",
     "submission_composed": "Submission documents",
     # `tribunal_requested`/`ingest_resolved`/`tribunal_rerun_ignored` are
-    # deliberately absent here (wave 9): they render together as one
-    # merged, chronological "Tribunal" card via `_render_tribunal_section`,
-    # called explicitly from `render_case_page` -- not through this
-    # generic one-type-per-card dispatch (see that function's docstring).
+    # deliberately absent here (round-2 UI feedback, item 4): the standalone
+    # "Tribunal" tab/section they used to render in no longer exists at
+    # all -- the start timestamp moved to the case header
+    # (`_format_started_at`/`_render_case_meta_line`), and the other two
+    # moved into the Grounds tab's small "Notes" card
+    # (`_render_case_notes_section`), called explicitly from
+    # `render_case_page` rather than through this generic dispatch.
 }
 
 
@@ -1557,6 +1562,22 @@ def _format_sydney_timestamp(dt: datetime) -> str:
     return f"{sydney.day} {sydney.strftime('%b %Y')}, {_format_clock_time(dt)} {sydney.tzname()}"
 
 
+def _format_started_at(dt: datetime) -> str:
+    """`"29/08/2026 06:35 AM"` -- the exact `DD/MM/YYYY HH:MM AM/PM` format
+    (round-2 UI feedback, item 4) for showing when the tribunal was started
+    directly in the case header, in Australia/Sydney time. This replaces
+    the standalone "Tribunal" tab/section, whose only irreplaceable
+    resident-facing content was this timestamp (see `_render_case_meta_
+    line`/`_render_case_notes_section` for where its other two contents --
+    the run-cost figure and the live-ingest line -- moved to instead)."""
+    sydney = _to_sydney(dt)
+    hour = sydney.hour % 12 or 12
+    period = "AM" if sydney.hour < 12 else "PM"
+    return (
+        f"{sydney.day:02d}/{sydney.month:02d}/{sydney.year} {hour:02d}:{sydney.minute:02d} {period}"
+    )
+
+
 def _is_photo_upload(filename: str, content_type: object) -> bool:
     """Mirrors `job.pipeline._UploadedDocument.is_pdf`'s exact rule (a
     non-PDF upload is treated as a photo) so the doc-card's provenance
@@ -1634,17 +1655,6 @@ def _render_document_uploaded_item(case_id: str, event: CaseEvent) -> str:
     return f"<li>{card}</li>"
 
 
-def _render_tribunal_requested_item(event: CaseEvent) -> str:
-    """A `tribunal_requested` marker event carries an empty payload (`{}`)
-    by design (`start_tribunal` in this module) -- it exists only to mark
-    a run's start time for the concurrency guard, so there is no field to
-    show beyond that. Found live on the deployed console rendering as a
-    bare `{}` before this fix (fallthrough to the raw-JSON branch below),
-    violating founder requirement #3."""
-    started_at = _format_sydney_timestamp(event.recorded_at)
-    return f'<li class="tribunal-event">Tribunal run started {_esc(started_at)}.</li>'
-
-
 def _render_ingest_resolved_item(event: CaseEvent) -> str:
     """`job.pipeline.RealPipelineRunner.run`'s `ingest_resolved` event
     (wave 9's un-frozen ingest) -- plain-English handoff for whoever owns
@@ -1657,13 +1667,11 @@ def _render_ingest_resolved_item(event: CaseEvent) -> str:
     if payload.get("used_demo_fixture"):
         council_number = str(payload.get("council_application_number", ""))
         return (
-            '<li class="tribunal-event">Could not fetch '
+            '<li class="case-note">Could not fetch '
             f"{_esc(application_number)} live; showing the demo case "
             f"({_esc(council_number)}) instead.</li>"
         )
-    return (
-        f'<li class="tribunal-event">Fetched live council data for {_esc(application_number)}.</li>'
-    )
+    return f'<li class="case-note">Fetched live council data for {_esc(application_number)}.</li>'
 
 
 def _render_tribunal_rerun_ignored_item(event: CaseEvent) -> str:
@@ -1672,41 +1680,43 @@ def _render_tribunal_rerun_ignored_item(event: CaseEvent) -> str:
     already-decided case makes no changes -- told here in plain English
     rather than dropped or raw-JSON-dumped."""
     return (
-        '<li class="tribunal-event">This case&rsquo;s tribunal has already '
+        '<li class="case-note">This case&rsquo;s tribunal has already '
         "run &mdash; nothing further happened.</li>"
     )
 
 
-_TRIBUNAL_SECTION_EVENT_TYPES: Final[tuple[str, ...]] = (
-    "ingest_resolved",
-    "tribunal_requested",
-    "tribunal_rerun_ignored",
-)
-"""Every event type the merged "Tribunal" section (`_render_tribunal_
-section`) draws from, combined into one chronological list rather than one
-same-titled card per type -- `ground_rerun_skipped` is deliberately absent
-(an internal resume-safety signal with no resident-facing value, per the
+_CASE_NOTES_EVENT_TYPES: Final[tuple[str, ...]] = ("ingest_resolved", "tribunal_rerun_ignored")
+"""Every event type the small "Notes" card (`_render_case_notes_section`)
+draws from -- what remains of the round-2-removed standalone "Tribunal"
+tab/section once its start-timestamp moved to the case header
+(`_format_started_at`/`_render_case_meta_line`) and `tribunal_requested`
+itself needed no other rendering (its only resident-facing content *was*
+that timestamp). `ground_rerun_skipped` is deliberately absent (an
+internal resume-safety signal with no resident-facing value, per the
 fixer's own cross-lane note)."""
 
 
-def _render_tribunal_section(case_id: str, events: Sequence[CaseEvent]) -> str:
-    """The merged "Tribunal" card: `ingest_resolved`, `tribunal_requested`,
-    and `tribunal_rerun_ignored` events, interleaved in the order they
-    actually happened (`event.sequence`) rather than split across three
-    separate same-titled cards."""
+def _render_case_notes_section(events: Sequence[CaseEvent]) -> str:
+    """A small "Notes" card living inside the Grounds tab (round-2 UI
+    feedback, item 4): the live-ingest-source line and the tribunal-rerun-
+    ignored notice that used to live in the now-removed standalone
+    "Tribunal" tab/section. Demo-valuable info, never dropped -- only
+    relocated, per the item's own instruction. Renders nothing (not even
+    an empty-state card) when this case has neither event yet, since an
+    empty "Notes" card ahead of the grounds list would be visual noise for
+    the overwhelmingly common case (a fresh interview, no tribunal run
+    yet)."""
     renderers: Mapping[str, Callable[[CaseEvent], str]] = {
         "ingest_resolved": _render_ingest_resolved_item,
-        "tribunal_requested": _render_tribunal_requested_item,
         "tribunal_rerun_ignored": _render_tribunal_rerun_ignored_item,
     }
-    relevant = sorted((e for e in events if e.event_type in renderers), key=lambda e: e.sequence)
+    relevant = sorted(
+        (e for e in events if e.event_type in _CASE_NOTES_EVENT_TYPES), key=lambda e: e.sequence
+    )
     if not relevant:
-        return (
-            '<section class="card" id="tribunal"><h3>Tribunal</h3>'
-            '<p class="empty">Nothing yet.</p></section>'
-        )
+        return ""
     items = "".join(renderers[e.event_type](e) for e in relevant)
-    return f'<section class="card" id="tribunal"><h3>Tribunal</h3><ul class="event-list">{items}</ul></section>'  # noqa: E501
+    return f'<section class="card case-notes"><h3>Notes</h3><ul class="event-list">{items}</ul></section>'  # noqa: E501
 
 
 _ADJUDICATION_STANCE_LABELS: Mapping[str, str] = {
@@ -1769,13 +1779,15 @@ see `render_case_page`."""
 def _render_events_section(
     case_id: str, event_type: str, title: str, events: Sequence[CaseEvent]
 ) -> str:
-    id_attr = ""
-    anchor_id = _SECTION_ANCHOR_IDS.get(event_type)
-    if anchor_id is not None:
-        id_attr = f' id="{_esc(anchor_id)}"'
+    # No section-level `id` here (round-2 UI feedback, item 1): each of
+    # these sections now renders as the sole content of its own tabpanel
+    # (`_render_section_panel`), which already carries the addressable
+    # `id="panel-<tab>"` -- a second, redundant anchor id on the section
+    # itself served no purpose once the sticky anchor-link nav it supported
+    # was replaced by real tabs.
     if not events:
         return (
-            f'<section class="card"{id_attr}><h3>{_esc(title)}</h3>'
+            f'<section class="card"><h3>{_esc(title)}</h3>'
             '<p class="empty">Nothing yet.</p></section>'
         )
     renderer = _EVENT_ITEM_RENDERERS.get(event_type)
@@ -1788,8 +1800,7 @@ def _render_events_section(
             for e in events
         )
     return (
-        f'<section class="card"{id_attr}><h3>{_esc(title)}</h3>'
-        f'<ul class="event-list">{items}</ul></section>'
+        f'<section class="card"><h3>{_esc(title)}</h3><ul class="event-list">{items}</ul></section>'
     )
 
 
@@ -1931,30 +1942,67 @@ def _tribunal_button_state(events: Sequence[CaseEvent]) -> tuple[bool, str]:
     return False, "Start tribunal"
 
 
-_SECTION_NAV_LINKS: Final[tuple[tuple[str, str], ...]] = (
+_SECTION_TABS: Final[tuple[tuple[str, str], ...]] = (
     ("grounds", "Grounds"),
     ("evidence", "Evidence"),
     ("overlay", "Overlay"),
     ("documents", "Documents"),
-    ("tribunal", "Tribunal"),
 )
-"""In-page anchors for the right pane's sticky nav (LEO-FEEDBACK-UIUX.md
-§9) -- reduces scroll fatigue across the merged post-accordion section
-set (Grounds, Evidence, Annotated overlay, Documents, Tribunal & cost)."""
+"""The case page's right-pane tab set (round-2 UI feedback, item 1). The
+former sticky anchor-link nav (LEO-FEEDBACK-UIUX.md §9) rendered every
+section at once and merely scrolled to one on click -- not a real tab
+component, per the founder's own correction ("it's not a ref link for the
+page block, it's an interactive component that renders the associated
+content when it's selected"). Every panel is still server-rendered in
+full (progressive enhancement, and so a reader with JS disabled can at
+least read every section by disabling `[hidden]` in devtools); `app.js`
+toggles which single one is visible via the `hidden` attribute and
+`aria-selected`, driven by real WAI-ARIA tablist keyboard semantics
+(arrow keys/Home/End). Default active tab is Grounds (index 0) -- the
+founder's own instruction. "Tribunal" was removed as its own tab (item
+4): see `_format_started_at`/`_render_case_meta_line` and
+`_render_case_notes_section` for where its three pieces of content moved
+instead."""
 
-_SECTION_ANCHOR_IDS: Mapping[str, str] = {
-    "document_uploaded": "evidence",
-    "annotated_overlay": "overlay",
-    "submission_composed": "documents",
-    # "tribunal" is no longer looked up here -- `_render_tribunal_section`
-    # hardcodes its own `id="tribunal"` since it is called explicitly
-    # rather than through the generic per-event-type dispatch loop.
-}
+
+def _render_section_tabs() -> str:
+    buttons = "".join(
+        f'<button type="button" role="tab" id="tab-{tab_id}" aria-controls="panel-{tab_id}" '
+        f'aria-selected="{"true" if i == 0 else "false"}" tabindex="{0 if i == 0 else -1}" '
+        f'class="tab">{_esc(label)}</button>'
+        for i, (tab_id, label) in enumerate(_SECTION_TABS)
+    )
+    return f'<div class="section-tabs" role="tablist" aria-label="Case sections">{buttons}</div>'
 
 
-def _render_section_nav() -> str:
-    links = "".join(f'<a href="#{aid}">{_esc(label)}</a>' for aid, label in _SECTION_NAV_LINKS)
-    return f'<nav class="section-nav" aria-label="Jump to a section">{links}</nav>'
+def _render_section_panel(tab_id: str, tab_index: int, content: str) -> str:
+    hidden_attr = "" if tab_index == 0 else " hidden"
+    return (
+        f'<div role="tabpanel" id="panel-{tab_id}" aria-labelledby="tab-{tab_id}" '
+        f'tabindex="0"{hidden_attr}>{content}</div>'
+    )
+
+
+def _render_case_meta_line(events: Sequence[CaseEvent], ledger: Ledger | None) -> str:
+    """The case header's small meta line (round-2 UI feedback, item 4): the
+    tribunal-start timestamp (in the exact `DD/MM/YYYY HH:MM AM/PM` format
+    requested, Australia/Sydney) and, once non-zero, the run-cost figure --
+    both demoted from the now-removed standalone "Tribunal" tab/section
+    rather than dropped. Renders nothing before a tribunal has ever been
+    requested (there is nothing yet to report)."""
+    start_event = max(
+        (e for e in events if e.event_type == "tribunal_requested"),
+        key=lambda e: e.sequence,
+        default=None,
+    )
+    if start_event is None:
+        return ""
+    parts = [f"Tribunal started {_esc(_format_started_at(start_event.recorded_at))}"]
+    run_cost_usd = ledger.total_cost_usd if ledger is not None else 0.0
+    if run_cost_usd > 0:
+        cost_text = f"${run_cost_usd:.2f}" if run_cost_usd >= 0.01 else f"${run_cost_usd:.4f}"
+        parts.append(f"Run cost: {_esc(cost_text)}")
+    return f'<p class="case-meta">{" &middot; ".join(parts)}</p>'
 
 
 def render_case_page(
@@ -1996,24 +2044,64 @@ def render_case_page(
         str(e.payload.get("ground_id", "")): e for e in by_type.get("adjudication_decision", ())
     }
 
-    sections = "".join(
-        _render_events_section(case.case_id, event_type, title, by_type.get(event_type, ()))
-        for event_type, title in _EVENT_SECTION_TITLES.items()
-    ) + _render_tribunal_section(case.case_id, events)
     grounds_section = _render_grounds_section(
         grounds, gate_decisions_by_ground, review_verdicts_by_ground, adjudication_by_ground
     )
     check_answers_section = _render_check_answers_section(grounds, events)
+    case_notes_section = _render_case_notes_section(events)
+    resident_feedback_section = _render_events_section(
+        case.case_id,
+        "resident_refusal_feedback",
+        _EVENT_SECTION_TITLES["resident_refusal_feedback"],
+        by_type.get("resident_refusal_feedback", ()),
+    )
+    evidence_section = _render_events_section(
+        case.case_id,
+        "document_uploaded",
+        _EVENT_SECTION_TITLES["document_uploaded"],
+        by_type.get("document_uploaded", ()),
+    )
+    overlay_section = _render_events_section(
+        case.case_id,
+        "annotated_overlay",
+        _EVENT_SECTION_TITLES["annotated_overlay"],
+        by_type.get("annotated_overlay", ()),
+    )
+    documents_section = _render_events_section(
+        case.case_id,
+        "submission_composed",
+        _EVENT_SECTION_TITLES["submission_composed"],
+        by_type.get("submission_composed", ()),
+    )
+    # Tab order/ids/labels come from `_SECTION_TABS` -- the single source
+    # of truth both `_render_section_tabs` (the tablist buttons) and this
+    # panel assembly read from, so a tab button and its panel can never
+    # drift out of sync (round-2 UI feedback, item 1).
+    panel_content: Mapping[str, str] = {
+        "grounds": check_answers_section
+        + case_notes_section
+        + grounds_section
+        + resident_feedback_section,
+        "evidence": evidence_section,
+        "overlay": overlay_section,
+        "documents": documents_section,
+    }
+    panels = "".join(
+        _render_section_panel(tab_id, i, panel_content[tab_id])
+        for i, (tab_id, _label) in enumerate(_SECTION_TABS)
+    )
     last_sequence = max((e.sequence for e in events), default=-1)
     run_cost_usd = ledger.total_cost_usd if ledger is not None else 0.0
     tribunal_disabled, tribunal_label = _tribunal_button_state(events)
     tribunal_disabled_attr = " disabled" if tribunal_disabled else ""
+    case_meta_line = _render_case_meta_line(events, ledger)
 
     return f"""
 <!doctype html>
 {_html_tag(force_theme)}
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Setback -- {_esc(case.application_number)}</title>
   {_PAGE_STYLE}
 </head>
@@ -2022,6 +2110,7 @@ def render_case_page(
   <header class="topbar">
     <h1><a href="/">Setback</a></h1>
     <p class="tagline">Case {_esc(case.application_number)} &middot; {_esc(case.case_id)}</p>
+    {case_meta_line}
     <div class="case-actions">
       <button type="button" id="copy-link-button" class="button--secondary"
               data-case-path="/cases/{_esc(case.case_id)}">Copy link</button>
@@ -2039,14 +2128,19 @@ def render_case_page(
           <span></span><span></span><span></span>
         </div>
         <form id="interview-form" class="chat-form">
+          <label for="interview-input" class="visually-hidden">Your answer</label>
           <input id="interview-input" type="text" placeholder="Type your answer..."
                  autocomplete="off">
-          <button type="submit">Send</button>
+          <button type="submit" class="chat-form__send">Send</button>
+          <input id="upload-input" type="file" accept="image/*,application/pdf"
+                 class="visually-hidden" tabindex="-1" aria-hidden="true">
+          <button type="button" id="upload-trigger" class="button--secondary chat-form__upload"
+                  aria-label="Upload a photo or document">
+            <span aria-hidden="true">&#128206;</span>
+            <span class="chat-form__upload-label">Upload</span>
+          </button>
         </form>
-        <form id="upload-form" class="upload-form">
-          <input id="upload-input" type="file" accept="image/*,application/pdf">
-          <button type="submit">Upload photo/document</button>
-        </form>
+        <p id="upload-status-chip" class="upload-chip" hidden aria-live="polite"></p>
         <button id="start-tribunal" type="button"
                 data-idle-label="Start tribunal"{tribunal_disabled_attr}>
           {_esc(tribunal_label)}
@@ -2056,10 +2150,10 @@ def render_case_page(
       </section>
     </aside>
     <div class="case-layout__sections">
-      {_render_section_nav()}
-      {check_answers_section}
-      {grounds_section}
-      {sections}
+      {_render_section_tabs()}
+      <div class="section-tabpanels">
+        {panels}
+      </div>
     </div>
   </main>
 {_DISCLAIMER_FOOTER}

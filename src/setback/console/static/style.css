@@ -392,15 +392,15 @@ input:focus-visible,
   color: var(--accent-contrast);
 }
 
-.chat-form,
-.upload-form {
+.chat-form {
   display: flex;
+  align-items: center;
   gap: 0.5rem;
 }
 
-.chat-form input[type="text"],
-.upload-form input[type="file"] {
-  flex: 1;
+.chat-form input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 0;
   padding: 0.5rem 0.7rem;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -1688,9 +1688,16 @@ button:hover {
   }
 }
 
-/* --- sticky in-page section nav (§9): reduces scroll fatigue -------------- */
+/* --- real tabs (round 2, item 1): replaces the sticky ref-link nav -------
+   Was a `<nav>` of `<a href="#id">` anchors -- every section always
+   rendered, "selected" was purely a matter of scroll position, and there
+   was no visible selected state at all (the founder's own bug report).
+   `.tab`/`.section-tabs` implement a real WAI-ARIA tablist: exactly one
+   `[role="tabpanel"]` visible at a time (`app.js` toggles `hidden`), a
+   clear selected state via `aria-selected`, built from the same design
+   tokens as every other component on this page. */
 
-.section-nav {
+.section-tabs {
   position: sticky;
   top: 0;
   z-index: 5;
@@ -1698,24 +1705,45 @@ button:hover {
   flex-wrap: wrap;
   gap: var(--space-2);
   padding: var(--space-2) 0 var(--space-3);
-  margin-bottom: var(--space-2);
+  margin-bottom: var(--space-3);
   background: var(--bg);
-  border-bottom: 1px solid var(--border);
 }
 
-.section-nav a {
-  padding: var(--space-1) var(--space-3);
+.tab {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
   border-radius: var(--radius-pill);
+  padding: var(--space-2) var(--space-4);
   font-size: var(--text-sm);
   font-weight: 600;
   color: var(--text-muted);
-  text-decoration: none;
-  border: 1px solid transparent;
+  cursor: pointer;
+  min-height: 44px;
 }
 
-.section-nav a:hover {
+.tab:hover {
   color: var(--accent);
   border-color: var(--border-strong);
+}
+
+.tab[aria-selected="true"] {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-color: var(--accent);
+}
+
+.tab:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.section-tabpanels {
+  min-width: 0;
+}
+
+.section-tabpanels > [role="tabpanel"]:focus-visible {
+  outline: none;
 }
 
 /* --- typing indicator (§2): "I don't know if the chat is broken" fix ------ */
@@ -1900,4 +1928,135 @@ button:hover {
   line-height: 1;
   cursor: pointer;
   padding: var(--space-2);
+}
+
+/* =============================================================================
+   Round 2 (founder feedback, this morning): real tabs (above), the case
+   header's meta line, a genuinely one-line chat input row, and a mobile
+   pass across the case page + landing page using only the tokens already
+   defined above -- no new colours, no new type scale. */
+
+/* --- case header meta line (item 4) ---------------------------------------
+   Replaces the standalone "Tribunal" tab/section: the tribunal-start
+   timestamp (exact DD/MM/YYYY HH:MM AM/PM format) and, once non-zero, the
+   run-cost figure -- both demoted here rather than dropped. */
+
+.case-meta {
+  margin: 0.15rem 0 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  word-break: break-word;
+}
+
+/* --- one-line chat input row (item 3) --------------------------------------
+   "User answer input text | Send button | Upload button", all in one
+   `<form>`, one flex row. The native file input stays in the DOM (for the
+   browser's own file picker) but is `.visually-hidden` -- its default
+   "Choose file / No file chosen" text is never shown; `#upload-trigger` is
+   the only upload control a resident actually sees. */
+
+.chat-form__send,
+.chat-form__upload {
+  flex: none;
+  white-space: nowrap;
+  min-height: 44px;
+}
+
+.chat-form__upload {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-inline: var(--space-3);
+}
+
+.upload-chip {
+  margin: var(--space-1) 0 0;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  display: inline-block;
+}
+
+.upload-chip--error {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+/* --- case notes card (item 4) -----------------------------------------------
+   The Grounds tab's small "Notes" card: the live-ingest-source line and
+   the tribunal-rerun-ignored notice, relocated from the removed
+   "Tribunal" tab/section. Plain `.event-list li` styling already covers
+   `.case-note` -- no bespoke rule needed beyond a touch of breathing room
+   ahead of the grounds list itself. */
+
+.case-notes {
+  margin-bottom: var(--space-4);
+}
+
+/* --- mobile pass (item 2): 390px / 768px / desktop -------------------------
+   Uses only the existing spacing/type tokens; the case-layout breakpoint
+   above already stacks chat-first (the chat `<aside>` sits before the
+   sections `<div>` in document order, so `display: block` alone puts the
+   interview first on a narrow screen, which is the primary mobile
+   activity per the founder's own framing). This block rounds out the rest:
+   comfortable tap targets, no page-level horizontal scroll, and a bounded
+   (rather than ever-growing) transcript height once the layout is a
+   single column. */
+
+@media (max-width: 860px) {
+  .case-layout__chat .chat-transcript {
+    max-height: 50vh;
+  }
+}
+
+@media (max-width: 480px) {
+  .landing__title {
+    font-size: 2.25rem;
+  }
+
+  .landing__form {
+    flex-direction: column;
+  }
+
+  .landing__form button {
+    width: 100%;
+  }
+
+  .tagline,
+  .case-meta {
+    word-break: break-word;
+  }
+
+  .case-actions__qr {
+    width: 48px;
+    height: 48px;
+  }
+
+  /* Compact the one-liner's two buttons just enough that input + Send +
+     Upload always hold on one line at this width, per the founder's own
+     "the three controls on one flex line that holds at 390px" spec --
+     the text input (flex: 1 1 auto, min-width: 0) absorbs the remaining
+     shrink, never the buttons themselves. */
+  .chat-form__send,
+  .chat-form__upload {
+    padding-inline: var(--space-2);
+    font-size: var(--text-sm);
+  }
+
+  .chat-form__upload-label {
+    display: inline;
+  }
+
+  button,
+  .chip,
+  .tab,
+  .button--secondary,
+  .button--outline,
+  .chat-form input[type="text"],
+  .landing__form input[type="text"],
+  .create-case-form input[type="text"] {
+    min-height: 44px;
+  }
 }
