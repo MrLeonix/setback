@@ -485,9 +485,29 @@ per doctrine.
 ## Cutover
 
 Per the wave's instructions, `setback-console`/`setback-tribunal` in
-`us-central1` are deleted only after a fully green AU pass. See the final
-status line below for whether that gate is met, and the next section for
-the deletion outcome if attempted.
+`us-central1` are deleted only after a fully green AU pass (met, per the
+status line below). Executed and confirmed:
+
+```
+$ gcloud run jobs delete setback-tribunal --region=us-central1 --quiet
+Deleted job [setback-tribunal].
+$ gcloud run services delete setback-console --region=us-central1 --quiet
+Deleted service [setback-console].
+
+$ gcloud run services list --region=us-central1   # -> Listed 0 items.
+$ gcloud run jobs list --region=us-central1        # -> Listed 0 items.
+$ gcloud run services list --region=australia-southeast1
+SERVICE          URL
+setback-console  https://setback-console-956646636969.australia-southeast1.run.app
+$ gcloud run jobs list --region=australia-southeast1
+JOB
+setback-tribunal
+```
+
+`us-central1` is now fully cleared (reversible via `deploy.sh
+SETBACK_REGION=us-central1` if ever needed); `australia-southeast1` is the
+sole live deployment, confirmed healthy immediately after (docket board
+`200`, all cases from this loop still listed).
 
 ## Final verification (verbatim, after every fix above)
 
