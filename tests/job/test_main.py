@@ -128,6 +128,34 @@ def test_default_pipeline_factory_uses_the_durable_gcs_evidence_store() -> None:
     assert isinstance(runner._document_source, GcsEvidenceStore)
 
 
+def test_default_pipeline_factory_wires_a_real_ingest_client_for_live_ingest() -> None:
+    """Wave 9's un-freeze: the real job entrypoint must configure a real,
+    redirect-following `httpx.AsyncClient` as `ingest_client` -- without it,
+    `job.pipeline.RealPipelineRunner` silently stays in frozen-fixture mode
+    for every real deployed run regardless of the case's own typed
+    application number. `follow_redirects=True` is required for
+    `ingest.tracker.EtrackDocumentSource`'s own postback flow when this
+    shared client is injected into it. The `User-Agent` must be the
+    project's neutral identifier, never anything identity-carrying."""
+    import httpx
+
+    from setback.job.main import _default_pipeline_factory
+
+    runner = _default_pipeline_factory()
+
+    assert isinstance(runner._ingest_client, httpx.AsyncClient)
+    assert runner._ingest_client.follow_redirects is True
+    assert runner._ingest_client.headers["user-agent"] == "setback/0.1"
+    # Real-world regression guard: a caller-injected client's own timeout
+    # is what actually governs every ingest request once a client is
+    # passed in (`ingest.onlineda`/`ingest.spatial`'s own `_REQUEST_TIMEOUT`
+    # constants only apply to a client those modules construct themselves)
+    # -- httpx's bare default (5s for every phase) measured too tight for
+    # a real live NSW OnlineDA fetch during this wave's own verification.
+    assert runner._ingest_client.timeout.read == 30.0
+    assert runner._ingest_client.timeout.connect == 10.0
+
+
 # --- main() ----------------------------------------------------------------
 
 

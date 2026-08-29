@@ -160,7 +160,29 @@ def _default_pipeline_factory() -> PipelineRunner:
     Local/dev callers that specifically want the in-process, in-memory store
     (no real GCS) should construct `RealPipelineRunner` directly instead
     (see `console.app`'s `LocalPipelineJobTrigger`, gated behind
-    `SETBACK_LOCAL_TRIBUNAL=1`)."""
+    `SETBACK_LOCAL_TRIBUNAL=1`).
+
+    `ingest_client` (wave 9) is a real `httpx.AsyncClient` -- the one thing
+    that switches `job.pipeline`'s ingest from the frozen PAN-661190 demo
+    fixture to a case's own typed application number, live. Never closed:
+    this factory builds a `PipelineRunner` for exactly one Cloud Run Job
+    execution, which exits the process on completion -- the same lifetime
+    `ModelClient()` below already assumes. `follow_redirects=True` is
+    required for `ingest.tracker.EtrackDocumentSource`'s own search-postback
+    flow (a 302 to the application's detail page) when this shared client is
+    injected into it rather than letting it build its own. `timeout` is set
+    explicitly and generously (30s, 10s to connect) rather than left at
+    httpx's own default (a 5s timeout for every phase): when a caller injects
+    its own client, `ingest.onlineda`/`ingest.spatial`'s own, more generous
+    `_REQUEST_TIMEOUT` constants never apply -- they only govern a client
+    those modules construct *themselves* -- so a bare `httpx.AsyncClient()`
+    here would silently be *stricter* than every other ingest call this
+    codebase makes, timing out for real real-world NSW-API latency observed
+    directly during this wave's live verification (a real, successful fetch
+    of this build's own demo PAN took ~8.5s end-to-end). A neutral
+    `User-Agent` carries no identity, per this project's security rules."""
+    import httpx
+
     from setback.evidence.storage import GcsEvidenceStore
     from setback.job.pipeline import RealPipelineRunner
     from setback.models.client import ModelClient
@@ -169,6 +191,11 @@ def _default_pipeline_factory() -> PipelineRunner:
         document_source=GcsEvidenceStore(),
         polisher=ModelClient(),
         grounding_client=ModelClient(),
+        ingest_client=httpx.AsyncClient(
+            follow_redirects=True,
+            headers={"User-Agent": "setback/0.1"},
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        ),
     )
 
 

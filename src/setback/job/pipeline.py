@@ -7,19 +7,57 @@ package (`ingest`, `evidence`, `court`, `gate`, `dispatch`) exactly as an
 external caller would, never reaching into another package's private
 internals.
 
-**Demo-scope note.** This build ships exactly one demo case (per
-``docs/data-sources.md``): PAN-661190 / DA2026-0359 / Georges River Council
-/ 65A Vista Street, Sans Souci. Rather than hit the live (keyless) NSW
-OnlineDA/spatial APIs on every tribunal run, :func:`_load_frozen_ingest`
-replays the frozen fixtures already checked into ``tests/fixtures/nsw/``
-through a real `httpx.MockTransport` -- driving the exact same
-`ingest.onlineda`/`ingest.spatial` parsing code the test suite validates
-against those fixtures (`client=` is an injectable parameter on every fetch
-function precisely for this), just deterministically and offline instead of
-depending on a live government endpoint's uptime during judging. A future
-wave generalising past the single demo case should swap
-:func:`_load_frozen_ingest` for a live `httpx.AsyncClient` call -- no other
-code in this module would need to change.
+**Un-frozen ingest (wave 9).** A case's own typed `application_number`
+(``resume.case.application_number``) now drives real fetching through the
+existing, proven `ingest.onlineda`/`ingest.spatial` clients:
+:func:`_load_ingest_for_application` fetches the live OnlineDA record for
+that number (scoped to Georges River Council -- the one tracker family
+this build actually speaks, per this wave's explicit scope allowance), then
+resolves that record's *own* address through the live spatial chain. This
+only happens when a real `ingest_client` is configured (`job.main`'s
+production factory now passes one); every existing offline test that
+leaves `ingest_client=None` gets exactly the prior behaviour unchanged
+(see next paragraph). Any live-resolution failure (an unknown PAN, a
+transient NSW API error, a resolvable-but-address-lookup-fails case) is
+caught and reported as a case event, never raised -- the run degrades to
+demo-fixture mode rather than crashing or silently mislabelling a case.
+`RealPipelineRunner._exhibited_tracker_documents` additionally lists and
+downloads a real case's exhibited documents from
+`ingest.tracker.EtrackDocumentSource` once live ingest succeeds, exactly
+the "Same-council/same-tracker-family scope is acceptable" allowance --
+per-document download failures are skipped, never fatal to the run.
+
+**Demo-fixture fallback (unchanged mechanism, now a deliberate degrade
+path rather than the only path).** This build ships one frozen demo case
+(per ``docs/data-sources.md``): PAN-661190 / DA2026-0359 / Georges River
+Council / 65A Vista Street, Sans Souci. :func:`_load_frozen_ingest` replays
+the frozen fixtures already checked into ``tests/fixtures/nsw/`` through a
+real `httpx.MockTransport` -- driving the exact same `ingest.onlineda`/
+`ingest.spatial` parsing code the test suite validates against those
+fixtures (`client=` is an injectable parameter on every fetch function
+precisely for this), just deterministically and offline. Every offline
+test in this module that never sets `ingest_client` gets this path,
+unconditionally, exactly as before this wave. In production, this is now
+also the *documented, event-labelled* fallback when live resolution of a
+typed number fails -- never a silent wrong letterhead: `run` always
+composes the submission from whatever `CaseDossier.da_record` the ingest
+step actually returned, live or fallback, so the letterhead always matches
+what was truly ingested.
+
+**Street View fallback trigger (wave 9).** `_build_dossier` fires
+`evidence.imagery.fetch_street_view_fallback` exactly when three things
+are all true: (a) no uploaded document classified as a resident photo
+(`ProvenanceGrade.RESIDENT_PHOTO`) exists among this case's uploads, (b)
+`self._ingest_client` is configured (offline tests that never set it never
+attempt a live Street View call, matching every other live-only feature in
+this module), and (c) the resolved `da_record.address` is non-empty. A
+`StreetViewUnavailableError` (a real request failure, not "no coverage
+here" -- that is its own, non-exceptional `None` return) degrades to no
+fallback image rather than failing the run. A successful fetch registers a
+grade-B photo document whose title carries the visible attribution string
+verbatim, so `evidence.dossier.build_dossier`'s page-level anchor for it
+also carries that attribution as its `caption` -- the fallback image is
+never anonymous.
 
 **Ground derivation.** A candidate ground's category and claim text are read
 back from the ``ground_category_assigned``/``document_uploaded`` case
@@ -63,26 +101,34 @@ $2 self-abort ceiling is now load-bearing on the full tribunal run,
 reviewers and adjudicator included, not just this module's own direct
 calls.
 
-**Page-level anchor-status propagation (SMOKE.md v5).** A reviewer looking
-at one full-page plan image plausibly cites that whole page rather than a
-specific fine-grained crop `_ground_annotated_evidence` also registered on
-it; `_propagate_page_level_anchor_status` spreads such a page-level
-citation's ground/status down onto every bbox anchor on that same page, so
-the annotated overlay colours them by outcome instead of leaving them
-permanently neutral grey. Three rules, in order, govern exactly how: (a) a
-bbox anchor a reviewer cited *directly* always keeps that citation's own
-ground and status -- never put into contention with, or overridden by, a
-status merely inherited from the page it sits on, however much more severe
-that inherited claim is; (b) page-level inheritance is considered only for
-a bbox anchor with no direct citation of its own; (c) when more than one
-ground's page-level citation competes for the same such anchor, the ground
-whose own `EvidenceSlice` actually included this anchor's document is
-preferred over one that did not, before falling back to severity (refused
-beats flagged beats shipped) as the final tie-break. Before rule (a), a
-SHIPPED ground's own directly-cited bbox anchor could render orange purely
-because an unrelated REFUSED ground's page-level citation of the same page
-was more severe -- exactly backwards from what a resident needs to see.
-See that function's own docstring for the full detail.
+**Page-level anchor-status propagation (SMOKE.md v5, wave 9 root-cause
+fix).** A reviewer looking at one full-page plan image plausibly cites
+that whole page rather than a specific fine-grained crop
+`_ground_annotated_evidence` also registered on it;
+`_propagate_page_level_anchor_status` spreads such a page-level citation's
+ground/status down onto bbox anchors on that same page, so the annotated
+overlay colours them by outcome instead of leaving them permanently
+neutral grey. Three rules, in order, govern exactly how: (a) a bbox anchor
+a reviewer cited *directly* always keeps that citation's own ground and
+status -- never put into contention with, or overridden by, a status
+merely inherited from the page it sits on, however much more severe that
+inherited claim is; (b) page-level inheritance is an all-or-nothing
+per-page fallback for a page with ZERO directly-cited bbox anchors of its
+own, never a per-anchor gap-filler on a page that already has specific
+citations elsewhere -- the wave-9 fix for the live "meaningless mid-house
+boxes" regression, where one ground's page-level citation (e.g. property
+value) was painting unrelated window/door boxes on the same page orange
+even though it never discussed those specific elements; (c) among
+competing page-level-only claims on a page with no direct citations, the
+ground whose own `EvidenceSlice` actually included this anchor's document
+is preferred over one that did not, before falling back to severity
+(refused beats flagged beats shipped) as the final tie-break. Before rule
+(a), a SHIPPED ground's own directly-cited bbox anchor could render orange
+purely because an unrelated REFUSED ground's page-level citation of the
+same page was more severe; before rule (b)'s wave-9 tightening, that same
+page-level citation could paint every OTHER uncited element on the page
+regardless of relevance. See that function's own docstring for the full
+detail.
 """
 
 from __future__ import annotations
@@ -126,6 +172,11 @@ from setback.evidence.dossier import (
     EvidenceAnchor as DossierEvidenceAnchor,
 )
 from setback.evidence.grounding import GroundedBox, ground_elements
+from setback.evidence.imagery import (
+    SecretAccessor,
+    StreetViewUnavailableError,
+    fetch_street_view_fallback,
+)
 from setback.evidence.overlays import AnchoredElement, build_overlay_boxes, render_semantic_overlay
 from setback.gate.relevance import classify_relevance
 from setback.gate.validator import BoundingBox as GateBoundingBox
@@ -136,9 +187,19 @@ from setback.gate.validator import (
     GateStatus,
     validate_ground,
 )
-from setback.ingest.onlineda import DevelopmentApplicationRecord, fetch_development_application
-from setback.ingest.spatial import DcpDocument, PlanningControls, resolve_site
-from setback.ingest.tracker import DocumentSource, ExhibitedDocument
+from setback.ingest.onlineda import (
+    DevelopmentApplicationRecord,
+    OnlineDAError,
+    fetch_development_application,
+)
+from setback.ingest.spatial import DcpDocument, PlanningControls, SpatialApiError, resolve_site
+from setback.ingest.tracker import (
+    DocumentSource,
+    EtrackDocumentSource,
+    EvidenceUploadStore,
+    ExhibitedDocument,
+    TrackerError,
+)
 from setback.models.client import ModelCallError, ModelClient
 from setback.state.breakers import CircuitBreaker
 from setback.state.firestore import (
@@ -170,6 +231,19 @@ _GROUNDING_LABELS: Final[tuple[str, ...]] = (
 )
 
 _ADJUDICATOR_BREAKER_NAME: Final[str] = "adjudicator"
+
+_MAX_TRACKER_DOCUMENTS: Final[int] = 3
+"""Bound on how many of a tracker's listed exhibited documents
+`_exhibited_tracker_documents` downloads per run -- a real council register
+can list many housekeeping/notice PDFs alongside the substantive plans; this
+keeps one tribunal run's live fetch bounded rather than downloading every
+listed file regardless of count."""
+
+_STREET_VIEW_DOCUMENT_ID: Final[str] = "street-view-fallback"
+"""Fixed document id for the Street View fallback photo -- deterministic
+(unlike a resident upload's random id) since at most one is ever registered
+per case, and `evidence.dossier.build_dossier` keys its documents dict by
+this id."""
 
 _OVERLAY_STORAGE_MAX_WIDTH_PX: Final[int] = 1280
 """Firestore caps a single document (a `CaseEvent`'s whole payload map,
@@ -312,6 +386,67 @@ async def _load_frozen_ingest(
     finally:
         if owns_client:
             await http_client.aclose()
+
+
+@dataclass(frozen=True, slots=True)
+class _IngestOutcome:
+    """What :func:`_load_ingest_for_application` resolved, plus whether it
+    had to fall back to the frozen demo fixture and why -- `run` uses
+    `used_demo_fixture`/`demo_fixture_reason` to record an honest
+    `ingest_resolved` case event rather than leaving a resident or judge to
+    guess which mode produced their submission."""
+
+    da_record: DevelopmentApplicationRecord
+    controls: PlanningControls
+    dcp_documents: list[DcpDocument]
+    used_demo_fixture: bool
+    demo_fixture_reason: str | None = None
+
+
+async def _load_ingest_for_application(
+    application_number: str, *, client: httpx.AsyncClient | None
+) -> _IngestOutcome:
+    """Resolve `application_number`'s real ingest data live when `client`
+    is a real (non-`None`) HTTP client, degrading to the frozen PAN-661190
+    demo fixture -- clearly labelled in the returned outcome -- on any
+    resolution failure. `client is None` (every existing offline test's
+    default) is itself treated as "no live capability configured": the
+    demo fixture is returned immediately, with no network attempted at
+    all, exactly matching this module's pre-wave-9 behaviour.
+
+    Only exceptions from `ingest.onlineda`/`ingest.spatial`'s own narrow
+    error hierarchies (`OnlineDAError`, `SpatialApiError`) and raw
+    transport failures (`httpx.HTTPError`) are caught here -- anything else
+    is a genuine bug and should still surface, not be silently swallowed
+    into "demo fixture mode"."""
+    if client is not None:
+        try:
+            da_record = await fetch_development_application(
+                application_number, _DEMO_COUNCIL, client=client
+            )
+            controls, dcp_documents = await resolve_site(da_record.address, client=client)
+            return _IngestOutcome(
+                da_record=da_record,
+                controls=controls,
+                dcp_documents=dcp_documents,
+                used_demo_fixture=False,
+            )
+        except (OnlineDAError, SpatialApiError, httpx.HTTPError) as exc:
+            reason = (
+                f"could not resolve {application_number!r} against {_DEMO_COUNCIL} live "
+                f"({type(exc).__name__}: {exc}); showing the demo fixture case instead"
+            )
+    else:
+        reason = "no live ingest client configured; showing the demo fixture case"
+
+    da_record, controls, dcp_documents = await _load_frozen_ingest()
+    return _IngestOutcome(
+        da_record=da_record,
+        controls=controls,
+        dcp_documents=dcp_documents,
+        used_demo_fixture=True,
+        demo_fixture_reason=reason,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -499,6 +634,16 @@ def _ground_status_for(status: GateStatus) -> GroundStatus:
     return GroundStatus.REFUSED
 
 
+_TERMINAL_GROUND_STATUSES: Final[frozenset[GroundStatus]] = frozenset(
+    {GroundStatus.SUPPORTED, GroundStatus.REFUSED, GroundStatus.FLAGGED}
+)
+"""A ground at any of these statuses has already completed review and can
+never legally transition back to `GroundStatus.UNDER_REVIEW`
+(`state.firestore._ALLOWED_GROUND_TRANSITIONS`) -- `run`'s ground loop
+checks this before attempting that transition, so re-running the pipeline
+against a case with some or all grounds already decided degrades to
+skipping them rather than crashing on `InvalidGroundTransitionError`."""
+
 _STATUS_SEVERITY: Final[Mapping[GateStatus, int]] = {
     GateStatus.SHIPPED: 1,
     GateStatus.FLAGGED: 2,
@@ -604,24 +749,49 @@ def _propagate_page_level_anchor_status(
       unrelated ground also happened to cite the whole page it sits on --
       exactly backwards from what a resident needs to see (a box they
       were shown evidence about keeps that evidence's own verdict).
-    * **(b) page-level inheritance only reaches anchors with no citation
-      of their own.** Once (a) has claimed every directly-cited anchor,
-      inheritance from `page_level_ground_ids` is considered only for the
-      bbox anchors left over -- an anchor that was never cited by anything
-      at all, direct or page-level, stays absent from the result (renders
-      `EVIDENCE_ANCHOR`, per `classify_role`), exactly as before.
-    * **(c) among competing page-level-only claims, prefer the ground
-      whose evidence was actually shown this document.** When more than
-      one ground's page-level citation reaches the same uncited bbox
-      anchor, `_most_severe_page_level_ground` resolves the winner --
-      preferring a ground whose own `EvidenceSlice` actually included this
-      bbox's document over one that did not, before falling back to
-      severity (refused beats flagged beats shipped) as the tie-break.
+    * **(b) page-level inheritance is an all-or-nothing per-page
+      fallback, never a per-anchor gap-filler on a page that already has
+      specific citations elsewhere (wave 9 fix -- "meaningless mid-house
+      boxes").** Inheritance from `page_level_ground_ids` is considered
+      only for a bbox anchor on a page that has ZERO directly-cited bbox
+      anchors of its own (from ANY ground). Before this rule, one
+      ground's page-level citation (e.g. "property value", which never
+      discussed the house's windows or doors) could paint every OTHER
+      uncited bbox anchor on that same page -- window/door boxes with no
+      real relationship to that ground -- purely because nothing else had
+      claimed them yet. Now, the moment a page has even one specific,
+      directly-cited element, every other element on that page is treated
+      as genuinely un-discussed (stays neutral/grey) rather than painted
+      by inference from an unrelated ground's whole-page citation. A page
+      with no direct citations at all still falls back to whichever
+      ground(s) cited it at the page level, exactly as before.
+    * **(c) among competing page-level-only claims (on a page with no
+      direct citations), prefer the ground whose evidence was actually
+      shown this document.** When more than one ground's page-level
+      citation reaches the same anchor, `_most_severe_page_level_ground`
+      resolves the winner -- preferring a ground whose own
+      `EvidenceSlice` actually included this bbox's document over one
+      that did not, before falling back to severity (refused beats
+      flagged beats shipped) as the tie-break.
 
     `anchor_ground` is never mutated; a new mapping is returned with an
     entry for every bbox anchor that ends up with an effective ground
     (direct or inherited) -- a bbox anchor with neither stays absent.
     """
+    # Root-cause fix (wave 9): page-level inheritance must be an all-or-
+    # nothing fallback for a page with NO directly-cited bbox anchors of
+    # its own, never a per-anchor gap-filler on a page that already has
+    # specific citations elsewhere. Before this guard, a single ground's
+    # page-level citation (e.g. "property value") could paint every OTHER
+    # uncited bbox anchor on that page (unrelated windows/doors) orange,
+    # even though that ground never discussed those specific elements --
+    # the exact "meaningless mid-house boxes" regression this fixes.
+    pages_with_direct_citation = {
+        (anchor.source_doc, anchor.page)
+        for anchor in dossier.anchors.values()
+        if anchor.bbox is not None and anchor.anchor_id in anchor_ground
+    }
+
     result = dict(anchor_ground)
     for anchor in dossier.anchors.values():
         if anchor.bbox is None:
@@ -631,6 +801,13 @@ def _propagate_page_level_anchor_status(
             # copy above -- explicit `continue` so a direct citation is
             # never put into contention with (and can never be overridden
             # by) an inherited page-level one, regardless of severity.
+            continue
+        if (anchor.source_doc, anchor.page) in pages_with_direct_citation:
+            # This page already has at least one specific, directly-cited
+            # bbox anchor (possibly from a different ground) -- a
+            # page-level citation from yet another ground is not evidence
+            # that THIS particular uncited element was discussed, so it
+            # stays neutral/grey rather than being painted by inference.
             continue
         page_anchor_id = anchor_id_for(anchor.source_doc, anchor.page, None)
         inherited = page_level_ground_ids.get(page_anchor_id)
@@ -659,13 +836,19 @@ class RealPipelineRunner:
         evidence_model: str | BaseLlm = "gemini-3.5-flash-lite",
         ingest_client: httpx.AsyncClient | None = None,
         document_classifier: DocumentClassifier | None = None,
+        street_view_secret_accessor: SecretAccessor | None = None,
     ) -> None:
         """Args mirror the pipeline's real dependencies; `clause_model`/
         `evidence_model`/`ingest_client`/`grounding_client`/
-        `document_classifier` exist so tests can inject fakes -- production
-        (`job.main`) leaves them at their live defaults.
-        `document_classifier` defaults to the real
-        `setback.clerk.classify_document` (see `_default_document_classifier`)."""
+        `document_classifier`/`street_view_secret_accessor` exist so tests
+        can inject fakes -- production (`job.main`) leaves them at their
+        live defaults. `document_classifier` defaults to the real
+        `setback.clerk.classify_document` (see `_default_document_classifier`).
+        `street_view_secret_accessor` defaults to `None`, which
+        `evidence.imagery.fetch_street_view_fallback` itself resolves to a
+        live Secret Manager read (`default_secret_accessor()`) -- tests
+        inject a fake so the Street View trigger is exercisable with zero
+        live Secret Manager/Maps calls."""
         self._document_source = document_source
         self._polisher = polisher
         self._grounding_client = grounding_client
@@ -673,6 +856,7 @@ class RealPipelineRunner:
         self._evidence_model = evidence_model
         self._ingest_client = ingest_client
         self._document_classifier = document_classifier or _default_document_classifier
+        self._street_view_secret_accessor = street_view_secret_accessor
 
     async def _ground_annotated_evidence(
         self, dossier: CaseDossier
@@ -722,7 +906,7 @@ class RealPipelineRunner:
             document_id=plan_document.document_id, page=page, boxes=tuple(result.boxes)
         )
 
-    def _semantic_overlay_png(
+    def _full_res_semantic_overlay_png(
         self,
         ctx: _GroundedOverlayContext,
         *,
@@ -736,7 +920,13 @@ class RealPipelineRunner:
         exactly the anchor ids `_ground_annotated_evidence` registered on
         the dossier, recomputed here the same deterministic way
         (`anchor_id_for`) rather than looked up, since this method only
-        has `ctx`, not the dossier itself."""
+        has `ctx`, not the dossier itself.
+
+        Returns `render_semantic_overlay`'s own full-resolution PNG bytes,
+        UN-shrunk -- see `_semantic_overlay_png` (which wraps this for the
+        Firestore-safe, embedded-in-the-event copy) and `_store_full_res_
+        overlay` (which persists exactly this method's output for the
+        click-to-open lightbox, LEO-FEEDBACK-UIUX.md §5)."""
         elements = [
             AnchoredElement(
                 anchor_id=anchor_id_for(ctx.document_id, ctx.page.page_number, box.bbox),
@@ -749,7 +939,56 @@ class RealPipelineRunner:
             for box in ctx.boxes
         ]
         overlay_boxes = build_overlay_boxes(elements, ground_status)
-        return _shrink_png_for_storage(render_semantic_overlay(ctx.page, overlay_boxes))
+        return render_semantic_overlay(ctx.page, overlay_boxes)
+
+    def _semantic_overlay_png(
+        self,
+        ctx: _GroundedOverlayContext,
+        *,
+        ground_status: Mapping[str, GateStatus],
+        anchor_ground: Mapping[str, str],
+    ) -> bytes:
+        """The Firestore-safe copy of `_full_res_semantic_overlay_png`'s
+        output, downscaled via `_shrink_png_for_storage` to fit a
+        `CaseEvent`'s ~1 MiB payload limit -- this is the copy embedded
+        directly (base64) in the `annotated_overlay` event, never the
+        click-to-open target (see `_store_full_res_overlay`)."""
+        return _shrink_png_for_storage(
+            self._full_res_semantic_overlay_png(
+                ctx, ground_status=ground_status, anchor_ground=anchor_ground
+            )
+        )
+
+    async def _store_full_res_overlay(
+        self, case_id: str, ctx: _GroundedOverlayContext, full_res_png: bytes
+    ) -> str | None:
+        """Durably write `full_res_png` (the un-shrunk overlay
+        `_full_res_semantic_overlay_png` produced) so `console/app.py` has
+        a real full-resolution image to link the overlay's lightbox to
+        (LEO-FEEDBACK-UIUX.md §5: "overlay image clickable -> full
+        resolution") -- before this fix, only the shrunk copy embedded in
+        the event ever existed anywhere, so "click to open full
+        resolution" only re-displayed that same already-downscaled image
+        bigger.
+
+        Writes via `self._document_source` when it also satisfies
+        `EvidenceUploadStore` (the write side of the same port) --
+        `evidence.storage.GcsEvidenceStore` in production, and the
+        in-memory `UserUploadedDocumentSource` double every offline test
+        already constructs, so this is exercised with zero live network
+        calls in the test suite. Returns the document id the overlay was
+        stored under (for the `annotated_overlay` event's `full_res_
+        document_id` field), or `None` when `document_source` is
+        read-only -- degrades to no click-through rather than failing the
+        run; should not arise in production, where `job.main` always
+        wires a real `GcsEvidenceStore`."""
+        if not isinstance(self._document_source, EvidenceUploadStore):
+            return None
+        document_id = f"overlay-{ctx.document_id}-p{ctx.page.page_number}"
+        await self._document_source.add_evidence_document(
+            case_id, document_id, full_res_png, content_type="image/png"
+        )
+        return document_id
 
     async def _classify_plan_document(self, filename: str, pdf_bytes: bytes) -> Any:
         """Classify an uploaded PDF via `setback.clerk.classify_document`
@@ -767,11 +1006,99 @@ class RealPipelineRunner:
         except Exception:  # noqa: BLE001 -- classification enriches, never blocks the run
             return None
 
-    async def _build_dossier(self, case_id: str, resume: ResumeState) -> CaseDossier:
-        da_record, controls, dcp_documents = await _load_frozen_ingest(client=self._ingest_client)
+    async def _exhibited_tracker_documents(
+        self, da_record: DevelopmentApplicationRecord, *, client: httpx.AsyncClient
+    ) -> list[tuple[str, str, bytes]]:
+        """Best-effort fetch of `da_record`'s real exhibited documents from
+        `ingest.tracker.EtrackDocumentSource` (Georges River Council's
+        tracker -- the one tracker family this build actually speaks, per
+        this wave's scope allowance) -- classified the same way an uploaded
+        PDF is, so a plan sourced from the tracker looks no different on
+        the case page than one a resident uploaded themselves. Only called
+        once live OnlineDA resolution has already succeeded (`run` never
+        reaches here in demo-fixture mode). A listing or per-document
+        download failure is reported to stderr and simply excludes that
+        document -- never fatal to the run, matching `_build_dossier`'s own
+        upload-download degrade-gracefully convention.
+
+        `client` (this module's shared `self._ingest_client`) must follow
+        redirects: `EtrackDocumentSource`'s own search-postback flow relies
+        on it (a 302 to the application's detail page) exactly as its own
+        default, self-constructed client does -- only relevant when a
+        caller (like this one) injects a shared client rather than letting
+        `EtrackDocumentSource` build its own."""
+        source = EtrackDocumentSource(client=client)
+        try:
+            listed = await source.list_documents(da_record.council_application_number)
+        except TrackerError as exc:
+            print(
+                f"eTrack document listing failed for "
+                f"{da_record.council_application_number!r}: {exc}",
+                file=sys.stderr,
+            )
+            return []
+
+        documents: list[tuple[str, str, bytes]] = []
+        for exhibited in listed[:_MAX_TRACKER_DOCUMENTS]:
+            try:
+                content = await source.download_document(exhibited)
+            except TrackerError as exc:
+                print(
+                    f"eTrack document download failed for {exhibited.document_id!r}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            kind = await self._classify_plan_document(exhibited.title, content)
+            title = _plan_document_title(exhibited.title, kind)
+            documents.append((f"etrack-{exhibited.document_id}", title, content))
+        return documents
+
+    async def _street_view_fallback_document(
+        self, address: str
+    ) -> tuple[str, str, bytes, ProvenanceGrade] | None:
+        """Fetch the grade-B Street View fallback for `address`, or `None`
+        if it is unavailable (no coverage, or a request failure -- both
+        degrade the same way here: no fallback image, never a crashed
+        run). See the module docstring's "Street View fallback trigger"
+        section for the exact three-part trigger condition this method's
+        caller (`_build_dossier`) implements."""
+        if self._ingest_client is None:
+            return None
+        try:
+            fallback = await fetch_street_view_fallback(
+                address,
+                client=self._ingest_client,
+                secret_accessor=self._street_view_secret_accessor,
+            )
+        except StreetViewUnavailableError as exc:
+            print(f"Street View fallback unavailable for {address!r}: {exc}", file=sys.stderr)
+            return None
+        if fallback is None:
+            return None
+        title = f"Street View fallback ({fallback.attribution})"
+        return (_STREET_VIEW_DOCUMENT_ID, title, fallback.image_bytes, fallback.provenance_grade)
+
+    async def _build_dossier(
+        self, case_id: str, resume: ResumeState
+    ) -> tuple[CaseDossier, _IngestOutcome]:
+        application_number = (
+            resume.case.application_number if resume.case is not None else _DEMO_PAN
+        )
+        ingest_outcome = await _load_ingest_for_application(
+            application_number, client=self._ingest_client
+        )
+        da_record = ingest_outcome.da_record
+        controls = ingest_outcome.controls
+        dcp_documents = ingest_outcome.dcp_documents
 
         plan_documents: list[tuple[str, str, bytes]] = []
         photo_documents: list[tuple[str, str, bytes, ProvenanceGrade]] = []
+
+        if not ingest_outcome.used_demo_fixture and self._ingest_client is not None:
+            plan_documents.extend(
+                await self._exhibited_tracker_documents(da_record, client=self._ingest_client)
+            )
+
         for upload in _uploaded_documents(resume.events):
             try:
                 content = await self._document_source.download_document(
@@ -808,13 +1135,23 @@ class RealPipelineRunner:
                     (upload.document_id, upload.filename, content, ProvenanceGrade.RESIDENT_PHOTO)
                 )
 
-        return build_dossier(
+        has_resident_photo = any(
+            grade is ProvenanceGrade.RESIDENT_PHOTO
+            for _id, _title, _content, grade in photo_documents
+        )
+        if not has_resident_photo and da_record.address:
+            fallback_document = await self._street_view_fallback_document(da_record.address)
+            if fallback_document is not None:
+                photo_documents.append(fallback_document)
+
+        dossier = build_dossier(
             da_record=da_record,
             controls=controls,
             dcp_documents=dcp_documents,
             plan_documents=plan_documents,
             photo_documents=photo_documents,
         )
+        return dossier, ingest_outcome
 
     async def run(self, case_id: str, resume: ResumeState, store: CaseStore) -> None:
         """Run the full court/gate/dispatch pipeline for `case_id` and
@@ -823,7 +1160,51 @@ class RealPipelineRunner:
         if resume.case is None:
             raise ValueError(f"case {case_id!r} has no resumable state")
 
-        dossier = await self._build_dossier(case_id, resume)
+        # Idempotency guard (SMOKE.md's "Fix 4 -- not fixed" re-press
+        # crash): a case whose tribunal already ran to completion has a
+        # `submission_composed` event on record. Re-running the pipeline
+        # against it would try to transition every already-terminal ground
+        # back to `under_review`, which `state.firestore`'s lifecycle guard
+        # correctly refuses -- `InvalidGroundTransitionError` -- crashing
+        # the whole job execution rather than degrading gracefully. A
+        # resident only ever clicks "Start tribunal" once, but a judge
+        # double-clicking the same button (a case this build must survive)
+        # will hit exactly this path. Made a safe, clearly-labelled no-op
+        # instead: nothing is re-run, nothing is re-composed, and the
+        # existing submission/refusals documents already on the case page
+        # are left exactly as they are.
+        if any(event.event_type == "submission_composed" for event in resume.events):
+            await store.append_event(
+                case_id,
+                f"tribunal-rerun-ignored:{case_id}",
+                "tribunal_rerun_ignored",
+                payload={
+                    "reason": (
+                        "this case's tribunal has already run to completion; "
+                        "starting it again made no changes."
+                    )
+                },
+            )
+            return
+
+        dossier, ingest_outcome = await self._build_dossier(case_id, resume)
+        await store.append_event(
+            case_id,
+            f"ingest-resolved:{case_id}",
+            "ingest_resolved",
+            payload={
+                "application_number": resume.case.application_number,
+                "council": dossier.da_record.council,
+                "council_application_number": dossier.da_record.council_application_number,
+                "address": dossier.da_record.address,
+                "used_demo_fixture": ingest_outcome.used_demo_fixture,
+                **(
+                    {"reason": ingest_outcome.demo_fixture_reason}
+                    if ingest_outcome.demo_fixture_reason is not None
+                    else {}
+                ),
+            },
+        )
         dossier, grounding_ctx = await self._ground_annotated_evidence(dossier)
         # The semantic overlay itself (colour-coded by each anchor's
         # ground's gate outcome) is rendered and emitted below, after the
@@ -854,6 +1235,21 @@ class RealPipelineRunner:
         ground_content: dict[str, GroundContent] = {}
 
         for ground in _candidate_grounds(resume.events, resume.grounds):
+            existing_record = resume.grounds.get(ground.ground_id)
+            if existing_record is not None and existing_record.status in _TERMINAL_GROUND_STATUSES:
+                # Defence in depth alongside the top-level `submission_
+                # composed` guard above: a ground already at a terminal
+                # status (from an earlier, possibly partial run) can never
+                # legally transition back to `under_review` -- skip it
+                # rather than let `store.transition_ground` raise and
+                # crash the whole execution.
+                await store.append_event(
+                    case_id,
+                    f"ground-rerun-skipped:{ground.ground_id}",
+                    "ground_rerun_skipped",
+                    payload={"ground_id": ground.ground_id, "status": existing_record.status.value},
+                )
+                continue
             await store.transition_ground(case_id, ground.ground_id, GroundStatus.UNDER_REVIEW)
             clause_slice, evidence_slice = _court_slices(ground, dossier)
             ground_document_ids[ground.ground_id] = frozenset(
@@ -1007,18 +1403,25 @@ class RealPipelineRunner:
                 ground_status,
                 ground_document_ids=ground_document_ids,
             )
-            overlay_png = self._semantic_overlay_png(
+            full_res_overlay_png = self._full_res_semantic_overlay_png(
                 grounding_ctx, ground_status=ground_status, anchor_ground=effective_anchor_ground
             )
+            overlay_png = _shrink_png_for_storage(full_res_overlay_png)
+            full_res_document_id = await self._store_full_res_overlay(
+                case_id, grounding_ctx, full_res_overlay_png
+            )
+            overlay_payload: dict[str, Any] = {
+                "document_id": grounding_ctx.document_id,
+                "mime_type": "image/png",
+                "image_base64": base64.b64encode(overlay_png).decode("ascii"),
+            }
+            if full_res_document_id is not None:
+                overlay_payload["full_res_document_id"] = full_res_document_id
             await store.append_event(
                 case_id,
                 f"annotated-overlay:{grounding_ctx.document_id}",
                 "annotated_overlay",
-                payload={
-                    "document_id": grounding_ctx.document_id,
-                    "mime_type": "image/png",
-                    "image_base64": base64.b64encode(overlay_png).decode("ascii"),
-                },
+                payload=overlay_payload,
             )
 
         await store.save_breaker(case_id, adjudicator_breaker)

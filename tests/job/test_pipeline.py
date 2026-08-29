@@ -13,7 +13,9 @@ import io
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+import respx
 from PIL import Image
 
 from setback.evidence.dossier import (
@@ -25,14 +27,24 @@ from setback.evidence.dossier import (
     render_pdf_pages,
 )
 from setback.evidence.grounding import GroundedBox
+from setback.evidence.imagery import STREET_VIEW_IMAGE_URL, STREET_VIEW_METADATA_URL
 from setback.evidence.overlays import OVERLAY_COLOR, OverlayRole
 from setback.gate.validator import GateStatus
-from setback.ingest.tracker import ExhibitedDocument, UserUploadedDocumentSource
+from setback.ingest.onlineda import ONLINEDA_URL
+from setback.ingest.spatial import ADDRESS_URL, DCP_URL, LAYERINTERSECT_URL
+from setback.ingest.tracker import (
+    ETRACK_DOWNLOAD_URL,
+    ETRACK_SEARCH_URL,
+    ExhibitedDocument,
+    UserUploadedDocumentSource,
+)
 from setback.job.pipeline import (
+    _STREET_VIEW_DOCUMENT_ID,
     RealPipelineRunner,
     _first_page_text,
     _GroundedOverlayContext,
     _load_frozen_ingest,
+    _load_ingest_for_application,
     _plan_document_title,
     _propagate_page_level_anchor_status,
     _shrink_png_for_storage,
@@ -54,6 +66,93 @@ ELEVATIONS_PDF = FIXTURES / "elevations.pdf"
 SEE_PDF = FIXTURES / "statement-of-environmental-effects.pdf"
 
 _APPLICATION_NUMBER = "PAN-661190"
+
+# --- fixtures for the un-frozen (real-DA) ingest tests ------------------------
+# A synthetic "other" DA, distinct from the frozen PAN-661190 demo case, so a
+# live-resolved test can prove it actually used the typed number's own data
+# rather than silently replaying the frozen fixture.
+
+_OTHER_PAN = "PAN-777001"
+_OTHER_COUNCIL_REF = "DA2026/9911"
+_OTHER_ADDRESS = "12 EXAMPLE STREET KOGARAH 2217"
+
+
+def _fake_street_view_secret_accessor() -> str:
+    return "fake-test-key-not-real"  # noqa: S105 - not a real credential, test-only
+
+
+def _other_onlineda_payload() -> dict[str, object]:
+    return {
+        "TotalCount": 1,
+        "Application": [
+            {
+                "PlanningPortalApplicationNumber": _OTHER_PAN,
+                "CouncilApplicationNumber": _OTHER_COUNCIL_REF,
+                "Council": {"CouncilName": "Georges River Council"},
+                "Location": [{"FullAddress": _OTHER_ADDRESS}],
+                "DevelopmentType": [{"DevelopmentType": "Alterations and additions"}],
+                "ApplicationStatus": "On Exhibition",
+                "AssessmentExhibitionStartDate": "2026-09-01",
+                "AssessmentExhibitionEndDate": "2026-09-15",
+                "CostOfDevelopment": "150000",
+            }
+        ],
+    }
+
+
+def _other_address_payload() -> list[dict[str, object]]:
+    return [{"GURASID": 1, "address": _OTHER_ADDRESS, "propId": 9911001}]
+
+
+def _other_layerintersect_payload() -> list[dict[str, object]]:
+    return [
+        {
+            "layerName": "Land Zoning Map",
+            "results": [
+                {
+                    "Zone": "R2",
+                    "Land Use": "Low Density Residential",
+                    "EPI Name": "Georges River Local Environmental Plan 2021",
+                    "legislationUrl": (
+                        "https://legislation.nsw.gov.au/view/html/inforce/current/epi-2021-0587"
+                    ),
+                }
+            ],
+        }
+    ]
+
+
+def _mock_live_onlineda_and_spatial_for_other_pan() -> None:
+    """Mock the full live OnlineDA + ePlanning spatial chain for `_OTHER_PAN`
+    -- used by every test proving `job.pipeline` genuinely drives real
+    ingest off a case's own typed application number, rather than the
+    frozen demo fixture."""
+    respx.get(ONLINEDA_URL).mock(return_value=httpx.Response(200, json=_other_onlineda_payload()))
+    respx.get(ADDRESS_URL).mock(return_value=httpx.Response(200, json=_other_address_payload()))
+    respx.get(LAYERINTERSECT_URL).mock(
+        return_value=httpx.Response(200, json=_other_layerintersect_payload())
+    )
+    respx.get(DCP_URL).mock(return_value=httpx.Response(200, json=[{"dcpResults": []}]))
+
+
+def _mock_no_street_view_coverage() -> None:
+    """Mock Street View metadata as `ZERO_RESULTS` (real "no coverage here"
+    behaviour, per `evidence.imagery`'s own docstring) -- for every test
+    that configures a real `ingest_client` but isn't itself exercising the
+    Street View trigger, so `_build_dossier`'s always-attempted fallback
+    check degrades to "no fallback image" instead of an unmocked request."""
+    respx.get(STREET_VIEW_METADATA_URL).mock(
+        return_value=httpx.Response(200, json={"status": "ZERO_RESULTS"})
+    )
+
+
+def _mock_etrack_lists_no_documents() -> None:
+    """Mock eTrack's search step to fail (no WebForms fields) -- the
+    simplest way to make `_exhibited_tracker_documents` degrade to an
+    empty list for tests that aren't exercising the tracker fetch itself."""
+    respx.get(ETRACK_SEARCH_URL, params={"ApplicationNumber": _OTHER_COUNCIL_REF}).mock(
+        return_value=httpx.Response(200, text="<html><body>no form here</body></html>")
+    )
 
 
 _FIRESTORE_DOCUMENT_LIMIT_BYTES = 1_048_487
@@ -190,7 +289,7 @@ async def test_build_dossier_uses_the_classified_title_for_the_plan_document() -
     )
     resume = await resume_case(store, case_id)
 
-    dossier = await runner._build_dossier(case_id, resume)  # noqa: SLF001 -- white-box unit test
+    dossier, _ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001 -- white-box unit test
 
     assert dossier.documents["elevations-doc"].title == "Elevations (elevations.pdf)"
 
@@ -268,7 +367,7 @@ async def test_build_dossier_reports_a_download_failure_instead_of_silently_drop
     runner = RealPipelineRunner(document_source=_FailingDocumentSource(), grounding_client=None)  # type: ignore[arg-type]
     resume = await resume_case(store, case_id)
 
-    dossier = await runner._build_dossier(case_id, resume)  # noqa: SLF001 -- white-box unit test
+    dossier, _ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001 -- white-box unit test
 
     assert "doc-1" not in dossier.documents
     err = capsys.readouterr().err
@@ -689,6 +788,82 @@ async def test_run_renders_semantic_overlay_colouring_a_shipped_grounds_anchor_g
     assert image.width <= 1280
 
 
+async def test_run_stores_the_full_resolution_overlay_and_references_it_from_the_event() -> None:
+    """Wave-9 click-to-open fix (LEO-FEEDBACK-UIUX.md §5: "overlay image
+    clickable -> full resolution"): `render_semantic_overlay` already
+    returns full-resolution PNG bytes, but until this fix only the
+    `_shrink_png_for_storage`-downscaled copy was ever persisted anywhere,
+    so a lightbox had nothing full-resolution to open. `run` must now also
+    durably write the pre-shrink bytes via the `EvidenceUploadStore` side
+    of `document_source` (the same port `UserUploadedDocumentSource`/
+    `GcsEvidenceStore` both satisfy) and reference that document id in the
+    `annotated_overlay` event payload, so `console/app.py` has something
+    to link the overlay image to."""
+    from setback.evidence.grounding import ground_elements
+
+    grounding_client = _FakeGroundingClient(box=[400.0, 400.0, 500.0, 500.0])
+    page = render_pdf_pages(ELEVATIONS_PDF.read_bytes())[0]
+    probe = await ground_elements(grounding_client, page, ("window W.1",))
+    grounded_bbox = probe.boxes[0].bbox
+    grounded_anchor_id = anchor_id_for("elevations-doc", 1, grounded_bbox)
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, overshadowing_id, _property_value_id = await _seed_case(
+        store, document_source=document_source
+    )
+
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[
+                review_body(
+                    ground_id=overshadowing_id,
+                    stance="support",
+                    confidence=0.95,
+                    cited_anchor_ids=[grounded_anchor_id],
+                    rationale="clause reviewer supports",
+                )
+            ],
+        ),
+        evidence_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[
+                review_body(
+                    ground_id=overshadowing_id,
+                    stance="support",
+                    confidence=0.9,
+                    cited_anchor_ids=[grounded_anchor_id],
+                    rationale="evidence reviewer supports",
+                )
+            ],
+        ),
+        grounding_client=grounding_client,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    overlay_events = [e for e in events if e.event_type == "annotated_overlay"]
+    assert len(overlay_events) == 1
+    full_res_document_id = overlay_events[0].payload.get("full_res_document_id")
+    assert full_res_document_id, "the event must reference a stored full-resolution document"
+
+    full_res_bytes = await document_source.download_document(
+        ExhibitedDocument(document_id=full_res_document_id, title="x", source="pipeline")
+    )
+    shrunk_bytes = base64.b64decode(overlay_events[0].payload["image_base64"])
+    full_res_image = Image.open(io.BytesIO(full_res_bytes))
+    full_res_image.load()
+    shrunk_image = Image.open(io.BytesIO(shrunk_bytes))
+    shrunk_image.load()
+    assert full_res_image.width > shrunk_image.width, (
+        "the stored full-resolution document must genuinely be higher resolution than "
+        "the shrunk copy embedded directly in the event, not just a second copy of it"
+    )
+
+
 async def test_run_never_recolours_a_directly_cited_shipped_anchor_orange_from_an_unrelated_refused_grounds_page_citation() -> (  # noqa: E501
     None
 ):
@@ -916,7 +1091,7 @@ async def _dossier_with_a_bbox_anchor(bbox: BoundingBox) -> tuple[Any, str]:
     )
     runner = RealPipelineRunner(document_source=document_source, grounding_client=None)
     resume = await resume_case(store, case_id)
-    dossier = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+    dossier, _ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
 
     bbox_anchor_id = anchor_id_for("elevations-doc", 1, bbox)
     dossier = dossier.with_anchor(
@@ -962,7 +1137,7 @@ async def test_propagate_page_level_anchor_status_leaves_other_pages_untouched()
     )
     runner = RealPipelineRunner(document_source=document_source, grounding_client=None)
     resume = await resume_case(store, case_id)
-    dossier = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+    dossier, _ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
     other_page_bbox_anchor_id = anchor_id_for("elevations-doc", 2, bbox)
     dossier = dossier.with_anchor(
         EvidenceAnchor(
@@ -1059,13 +1234,15 @@ async def test_propagate_page_level_anchor_status_a_direct_citation_is_never_ove
 async def test_propagate_page_level_anchor_status_direct_and_inherited_anchors_resolve_independently() -> (  # noqa: E501
     None
 ):
-    """Rules (a) and (b) together, in one call: a bbox anchor directly
-    cited by a shipped ground keeps that status untouched, while a
-    *second*, uncited bbox anchor on the very same page -- cited by nothing
-    of its own -- still inherits the page-level ground's (more severe,
-    refused) status exactly as before. Direct citation is a private
-    exemption for the anchor that has one, not a change to how every other
-    anchor on the page behaves."""
+    """Rules (a) and (b) together, in one call, wave-9 semantics: a bbox
+    anchor directly cited by a shipped ground keeps that status untouched,
+    while a *second*, uncited bbox anchor on the very same page -- cited by
+    nothing of its own -- does NOT inherit the page-level ground's status,
+    because that page already has a direct citation of its own (rule (b)'s
+    all-or-nothing-per-page fallback). This is the exact "meaningless
+    mid-house boxes" regression fix: a page-level citation from a ground
+    unrelated to the second element must not paint it by inference just
+    because it happened to be the only uncited box on the page."""
     cited_bbox = BoundingBox(x0=10, y0=10, x1=50, y1=50)
     uncited_bbox = BoundingBox(x0=60, y0=60, x1=90, y1=90)
     dossier, cited_anchor_id = await _dossier_with_a_bbox_anchor(cited_bbox)
@@ -1096,7 +1273,59 @@ async def test_propagate_page_level_anchor_status_direct_and_inherited_anchors_r
     )
 
     assert result[cited_anchor_id] == "ground-shipped"  # rule (a): untouched
-    assert result[uncited_anchor_id] == "ground-refused"  # rule (b): still inherits
+    assert uncited_anchor_id not in result  # rule (b): no longer inherits (wave 9)
+
+
+async def test_propagate_page_level_anchor_status_does_not_paint_unrelated_elements_on_a_cited_page() -> (  # noqa: E501
+    None
+):
+    """The film-case regression itself, reconstructed: a page has one bbox
+    anchor directly cited by a SHIPPED ground (the "9m height limit datum
+    line"), plus several other bbox anchors on the same page (windows/door)
+    that no ground ever cited directly. A *different*, REFUSED ground's
+    page-level citation of that same page must NOT recolour those unrelated
+    elements -- they must stay absent from the result (renders neutral
+    grey), never repainted orange by a ground that never discussed them."""
+    datum_line_bbox = BoundingBox(x0=10, y0=10, x1=50, y1=50)
+    window_bboxes = [
+        BoundingBox(x0=60, y0=60, x1=90, y1=90),
+        BoundingBox(x0=100, y0=100, x1=130, y1=130),
+        BoundingBox(x0=140, y0=140, x1=170, y1=170),
+    ]
+    door_bbox = BoundingBox(x0=180, y0=180, x1=210, y1=210)
+    dossier, datum_line_anchor_id = await _dossier_with_a_bbox_anchor(datum_line_bbox)
+    unrelated_anchor_ids = []
+    for i, bbox in enumerate([*window_bboxes, door_bbox]):
+        anchor_id = anchor_id_for("elevations-doc", 1, bbox)
+        unrelated_anchor_ids.append(anchor_id)
+        dossier = dossier.with_anchor(
+            EvidenceAnchor(
+                anchor_id=anchor_id,
+                source_doc="elevations-doc",
+                page=1,
+                bbox=bbox,
+                provenance_grade=ProvenanceGrade.DOCUMENTS_ONLY,
+                caption=f"element {i}",
+            )
+        )
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+
+    result = _propagate_page_level_anchor_status(
+        dossier,
+        anchor_ground={
+            page_anchor_id: "ground-property-value",
+            datum_line_anchor_id: "ground-overshadowing",
+        },
+        page_level_ground_ids={page_anchor_id: ["ground-property-value"]},
+        ground_status={
+            "ground-overshadowing": GateStatus.SHIPPED,
+            "ground-property-value": GateStatus.REFUSED_UNSUBSTANTIATED,
+        },
+    )
+
+    assert result[datum_line_anchor_id] == "ground-overshadowing"
+    for anchor_id in unrelated_anchor_ids:
+        assert anchor_id not in result
 
 
 async def test_propagate_page_level_anchor_status_prefers_the_ground_whose_evidence_included_this_document() -> (  # noqa: E501
@@ -1271,3 +1500,505 @@ async def test_run_colours_a_bbox_anchor_shipped_when_only_the_page_level_anchor
         "the grounded bbox must inherit the SHIPPED status from the page-level "
         "citation its reviewers actually made, not stay neutral grey"
     )
+
+
+# --- un-frozen ingest: `_load_ingest_for_application` (wave 9) --------------
+
+
+@respx.mock
+async def test_load_ingest_for_application_uses_live_data_when_a_client_is_configured() -> None:
+    """A typed application number that resolves live must produce the DA
+    record it actually resolves to -- not the frozen PAN-661190 demo case
+    -- proving real ingest is genuinely wired, not just labelled as such."""
+    _mock_live_onlineda_and_spatial_for_other_pan()
+
+    async with httpx.AsyncClient() as client:
+        outcome = await _load_ingest_for_application(_OTHER_PAN, client=client)
+
+    assert outcome.used_demo_fixture is False
+    assert outcome.demo_fixture_reason is None
+    assert outcome.da_record.planning_portal_application_number == _OTHER_PAN
+    assert outcome.da_record.council_application_number == _OTHER_COUNCIL_REF
+    assert outcome.da_record.address == _OTHER_ADDRESS
+    assert outcome.controls.zone_code.value == "R2"
+
+
+async def test_load_ingest_for_application_uses_the_demo_fixture_with_no_client_configured() -> (
+    None
+):
+    """Every existing offline test leaves `ingest_client=None` -- this must
+    keep degrading to the frozen demo fixture exactly as before this wave,
+    with no network attempted at all."""
+    outcome = await _load_ingest_for_application(_OTHER_PAN, client=None)
+
+    assert outcome.used_demo_fixture is True
+    assert outcome.demo_fixture_reason == (
+        "no live ingest client configured; showing the demo fixture case"
+    )
+    assert outcome.da_record.planning_portal_application_number == _APPLICATION_NUMBER
+
+
+@respx.mock
+async def test_load_ingest_for_application_falls_back_on_a_resolution_failure() -> None:
+    """A typed number OnlineDA has never heard of (a real, live possibility
+    -- a mistyped PAN, a DA from a council this build doesn't speak) must
+    fail soft into the labelled demo fixture, never raise and never crash
+    the run."""
+    respx.get(ONLINEDA_URL).mock(
+        return_value=httpx.Response(200, json={"TotalCount": 0, "Application": []})
+    )
+
+    async with httpx.AsyncClient() as client:
+        outcome = await _load_ingest_for_application("PAN-UNKNOWN-999", client=client)
+
+    assert outcome.used_demo_fixture is True
+    assert outcome.demo_fixture_reason is not None
+    assert "PAN-UNKNOWN-999" in outcome.demo_fixture_reason
+    assert "ApplicationNotFoundError" in outcome.demo_fixture_reason
+    assert outcome.da_record.planning_portal_application_number == _APPLICATION_NUMBER
+
+
+# --- un-frozen ingest: exhibited tracker documents (wave 9) -----------------
+
+_OTHER_DETAIL_URL = (
+    "https://etrack.georgesriver.nsw.gov.au/Pages/XC.Track/SearchApplication.aspx"
+    "?id=555001&a=DA2026%2f9911"
+)
+
+_OTHER_SEARCH_FORM_HTML = """
+<html><body><form>
+<input type="hidden" id="__VIEWSTATE" value="vs-token" />
+<input type="hidden" id="__VIEWSTATEGENERATOR" value="vsg-token" />
+<input type="hidden" id="__EVENTVALIDATION" value="ev-token" />
+</form></body></html>
+"""
+
+_OTHER_DOCUMENTS_HTML = (
+    "<html><body><table>"
+    "<tr><td>Site Plan</td><td>"
+    '<a href="../../Common/Integration/FileDownload.ashx?id=90001&amp;ext=PDF'
+    '&amp;filesize=54321">Download</a>'
+    "</td></tr>"
+    "</table></body></html>"
+)
+
+
+def _mock_etrack_lists_one_document() -> None:
+    respx.get(ETRACK_SEARCH_URL, params={"ApplicationNumber": _OTHER_COUNCIL_REF}).mock(
+        return_value=httpx.Response(200, text=_OTHER_SEARCH_FORM_HTML)
+    )
+    respx.post(ETRACK_SEARCH_URL, params={"ApplicationNumber": _OTHER_COUNCIL_REF}).mock(
+        return_value=httpx.Response(302, headers={"Location": _OTHER_DETAIL_URL})
+    )
+    respx.get(url__startswith=_OTHER_DETAIL_URL.split("?")[0]).mock(
+        return_value=httpx.Response(200, text=_OTHER_DOCUMENTS_HTML)
+    )
+    respx.get(ETRACK_DOWNLOAD_URL).mock(
+        return_value=httpx.Response(200, content=ELEVATIONS_PDF.read_bytes())
+    )
+
+
+@respx.mock
+async def test_build_dossier_includes_a_real_exhibited_document_from_the_tracker() -> None:
+    """Once live OnlineDA resolution succeeds, `_build_dossier` must also
+    fetch the case's real exhibited documents from the tracker (the eTrack
+    "same tracker family" scope this wave allows) -- not just documents a
+    resident happened to upload themselves."""
+    _mock_live_onlineda_and_spatial_for_other_pan()
+    _mock_etrack_lists_one_document()
+    _mock_no_street_view_coverage()
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(application_number=_OTHER_PAN, resident_session="resident-1")
+    case_id = case.case_id
+
+    async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+        runner = RealPipelineRunner(
+            document_source=document_source, ingest_client=ingest_client, grounding_client=None
+        )
+        resume = await resume_case(store, case_id)
+        dossier, ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+
+    assert ingest_outcome.used_demo_fixture is False
+    tracker_doc = dossier.documents["etrack-90001"]
+    assert tracker_doc.provenance_grade is ProvenanceGrade.DOCUMENTS_ONLY
+    assert "Site Plan" in tracker_doc.title
+
+
+@respx.mock
+async def test_build_dossier_never_fetches_tracker_documents_in_demo_fixture_mode() -> None:
+    """When live resolution fails and the run degrades to the demo fixture,
+    the tracker must never be hit for this case's (unresolved) exhibited
+    documents -- there is no council reference to look up."""
+    respx.get(ONLINEDA_URL).mock(
+        return_value=httpx.Response(200, json={"TotalCount": 0, "Application": []})
+    )
+    _mock_no_street_view_coverage()
+    # Deliberately no eTrack route mocked -- if `_build_dossier` ever
+    # attempted a tracker fetch anyway, respx's own assertion (every
+    # request must be mocked) would fail this test.
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(
+        application_number="PAN-UNKNOWN-999", resident_session="resident-1"
+    )
+    case_id = case.case_id
+
+    async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+        runner = RealPipelineRunner(
+            document_source=document_source, ingest_client=ingest_client, grounding_client=None
+        )
+        resume = await resume_case(store, case_id)
+        dossier, ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+
+    assert ingest_outcome.used_demo_fixture is True
+    assert dossier.da_record.planning_portal_application_number == _APPLICATION_NUMBER
+
+
+# --- un-frozen ingest: `run` emits an honest `ingest_resolved` event, and --
+# the composed letterhead always matches whatever was actually ingested ----
+
+
+@respx.mock
+async def test_run_emits_ingest_resolved_with_live_data_and_uses_it_for_the_letterhead() -> None:
+    _mock_live_onlineda_and_spatial_for_other_pan()
+    _mock_etrack_lists_no_documents()
+    _mock_no_street_view_coverage()
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(application_number=_OTHER_PAN, resident_session="resident-1")
+    case_id = case.case_id
+
+    plan_document_id = "elevations-doc"
+    document_source.add_document(_OTHER_PAN, plan_document_id, ELEVATIONS_PDF.read_bytes())
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{plan_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": plan_document_id,
+            "filename": "elevations.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 12345,
+        },
+    )
+    ground_id = "ground-overshadowing"
+    await store.propose_ground(case_id, ground_id, claim="Overshadowing concern.")
+    await store.append_event(
+        case_id,
+        f"ground-category:{ground_id}",
+        "ground_category_assigned",
+        payload={
+            "ground_id": ground_id,
+            "category": "environmental_and_social_impacts",
+            "concern_type": "overshadowing",
+            "evidence_document_ids": [plan_document_id],
+        },
+    )
+
+    page_anchor_id = anchor_id_for(plan_document_id, 1, None)
+
+    async def _run_it() -> None:
+        async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+            runner = RealPipelineRunner(
+                document_source=document_source,
+                ingest_client=ingest_client,
+                grounding_client=None,
+                clause_model=FakeLlm(
+                    model="gemini-3.5-flash-lite",
+                    bodies=[
+                        review_body(
+                            ground_id=ground_id,
+                            stance="support",
+                            confidence=0.9,
+                            cited_anchor_ids=[page_anchor_id],
+                        )
+                    ],
+                ),
+                evidence_model=FakeLlm(
+                    model="gemini-3.5-flash-lite",
+                    bodies=[
+                        review_body(
+                            ground_id=ground_id,
+                            stance="support",
+                            confidence=0.9,
+                            cited_anchor_ids=[page_anchor_id],
+                        )
+                    ],
+                ),
+            )
+            resume = await resume_case(store, case_id)
+            await runner.run(case_id, resume, store)
+
+    await _run_it()
+
+    events = await store.list_events(case_id)
+    ingest_events = [e for e in events if e.event_type == "ingest_resolved"]
+    assert len(ingest_events) == 1
+    assert ingest_events[0].payload["used_demo_fixture"] is False
+    assert ingest_events[0].payload["application_number"] == _OTHER_PAN
+    assert ingest_events[0].payload["council_application_number"] == _OTHER_COUNCIL_REF
+    assert ingest_events[0].payload["address"] == _OTHER_ADDRESS
+    assert "reason" not in ingest_events[0].payload
+
+    submission_event = next(e for e in events if e.event_type == "submission_composed")
+    assert _OTHER_COUNCIL_REF in submission_event.payload["submission_markdown"]
+    assert "DA2026/0359" not in submission_event.payload["submission_markdown"]
+
+
+@respx.mock
+async def test_run_falls_back_to_the_demo_fixture_and_labels_it_when_live_resolution_fails() -> (
+    None
+):
+    """The letterhead must never lie: when live resolution fails, both the
+    event and the composed submission must reflect the demo fixture that
+    was *actually* used, not the number the resident typed."""
+    respx.get(ONLINEDA_URL).mock(
+        return_value=httpx.Response(200, json={"TotalCount": 0, "Application": []})
+    )
+    _mock_no_street_view_coverage()
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(
+        application_number="PAN-UNKNOWN-999", resident_session="resident-1"
+    )
+    case_id = case.case_id
+
+    async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+        runner = RealPipelineRunner(
+            document_source=document_source, ingest_client=ingest_client, grounding_client=None
+        )
+        resume = await resume_case(store, case_id)
+        await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    ingest_events = [e for e in events if e.event_type == "ingest_resolved"]
+    assert len(ingest_events) == 1
+    assert ingest_events[0].payload["used_demo_fixture"] is True
+    assert "PAN-UNKNOWN-999" in ingest_events[0].payload["reason"]
+    assert ingest_events[0].payload["council_application_number"] == "DA2026/0359"
+
+    submission_event = next(e for e in events if e.event_type == "submission_composed")
+    assert "DA2026/0359" in submission_event.payload["submission_markdown"]
+
+
+# --- job-side idempotency guard: the "Fix 4 -- not fixed" re-press crash ---
+
+
+async def test_run_is_a_safe_noop_when_the_case_tribunal_already_ran_to_completion() -> None:
+    """Starting the tribunal a second time on a case that already ran to
+    completion must never crash -- a judge will press the button twice."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, overshadowing_id, property_value_id = await _seed_case(
+        store, document_source=document_source
+    )
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+
+    def _fake(ground_id: str) -> FakeLlm:
+        return FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[
+                review_body(
+                    ground_id=ground_id,
+                    stance="support",
+                    confidence=0.9,
+                    cited_anchor_ids=[page_anchor_id],
+                )
+            ],
+        )
+
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=_fake(overshadowing_id),
+        evidence_model=_fake(overshadowing_id),
+        grounding_client=None,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events_after_first_run = await store.list_events(case_id)
+    first_submission_count = sum(
+        1 for e in events_after_first_run if e.event_type == "submission_composed"
+    )
+    assert first_submission_count == 1
+
+    resume_again = await resume_case(store, case_id)
+    await runner.run(case_id, resume_again, store)  # must not raise
+
+    events_after_second_run = await store.list_events(case_id)
+    assert (
+        sum(1 for e in events_after_second_run if e.event_type == "submission_composed")
+        == first_submission_count
+    )
+    rerun_ignored = [e for e in events_after_second_run if e.event_type == "tribunal_rerun_ignored"]
+    assert len(rerun_ignored) == 1
+
+    grounds = {g.ground_id: g for g in await store.list_grounds(case_id)}
+    assert grounds[overshadowing_id].status is GroundStatus.SUPPORTED
+    assert grounds[property_value_id].status is GroundStatus.REFUSED
+
+
+async def test_run_skips_an_already_terminal_ground_instead_of_crashing() -> None:
+    """Defence in depth alongside the top-level guard above: a ground that
+    somehow reached a terminal status without the case's own
+    `submission_composed` event yet existing (e.g. a prior execution
+    crashed mid-loop) must be skipped, not re-transitioned into a
+    `InvalidGroundTransitionError` crash."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, overshadowing_id, property_value_id = await _seed_case(
+        store, document_source=document_source
+    )
+    await store.transition_ground(case_id, overshadowing_id, GroundStatus.UNDER_REVIEW)
+    await store.transition_ground(case_id, overshadowing_id, GroundStatus.SUPPORTED)
+
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=property_value_id, stance="reject", confidence=1.0)],
+        ),
+        evidence_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=property_value_id, stance="reject", confidence=1.0)],
+        ),
+        grounding_client=None,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)  # must not raise
+
+    events = await store.list_events(case_id)
+    skipped = [e for e in events if e.event_type == "ground_rerun_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0].payload["ground_id"] == overshadowing_id
+    assert skipped[0].payload["status"] == "supported"
+
+    grounds = {g.ground_id: g for g in await store.list_grounds(case_id)}
+    assert grounds[overshadowing_id].status is GroundStatus.SUPPORTED  # untouched
+    assert grounds[property_value_id].status is GroundStatus.REFUSED  # processed normally
+
+
+# --- Street View fallback trigger (wave 9) ----------------------------------
+
+
+@respx.mock
+async def test_build_dossier_adds_a_street_view_fallback_when_no_resident_photo_is_uploaded() -> (
+    None
+):
+    """The exact trigger: no resident-photo upload, a resolvable address,
+    and a live ingest client configured -- must add a grade-B fallback
+    photo document whose title (and therefore its anchor's caption) carries
+    the visible attribution."""
+    _mock_live_onlineda_and_spatial_for_other_pan()
+    _mock_etrack_lists_no_documents()
+    respx.get(STREET_VIEW_METADATA_URL).mock(
+        return_value=httpx.Response(200, json={"status": "OK", "pano_id": "p1", "date": "2023-01"})
+    )
+    respx.get(STREET_VIEW_IMAGE_URL).mock(
+        return_value=httpx.Response(200, content=_tiny_white_png(50, 50))
+    )
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(application_number=_OTHER_PAN, resident_session="resident-1")
+    case_id = case.case_id
+    plan_document_id = "elevations-doc"
+    document_source.add_document(_OTHER_PAN, plan_document_id, ELEVATIONS_PDF.read_bytes())
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{plan_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": plan_document_id,
+            "filename": "elevations.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 123,
+        },
+    )
+
+    async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+        runner = RealPipelineRunner(
+            document_source=document_source,
+            ingest_client=ingest_client,
+            grounding_client=None,
+            street_view_secret_accessor=_fake_street_view_secret_accessor,
+        )
+        resume = await resume_case(store, case_id)
+        dossier, ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+
+    assert ingest_outcome.used_demo_fixture is False
+    street_view_doc = dossier.documents[_STREET_VIEW_DOCUMENT_ID]
+    assert street_view_doc.provenance_grade is ProvenanceGrade.STREET_VIEW_SOLAR_FALLBACK
+    assert "(c) Google Street View, 2023-01" in street_view_doc.title
+    anchor = next(a for a in dossier.anchors.values() if a.source_doc == _STREET_VIEW_DOCUMENT_ID)
+    assert "(c) Google Street View, 2023-01" in anchor.caption
+
+
+@respx.mock
+async def test_build_dossier_does_not_fetch_street_view_when_a_resident_photo_exists() -> None:
+    """No Street View route is mocked at all in this test -- if
+    `_build_dossier` ever attempted the call anyway despite a resident
+    photo already existing, respx's own "every request must be mocked"
+    assertion fails this test."""
+    _mock_live_onlineda_and_spatial_for_other_pan()
+    _mock_etrack_lists_no_documents()
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(application_number=_OTHER_PAN, resident_session="resident-1")
+    case_id = case.case_id
+    plan_document_id = "elevations-doc"
+    document_source.add_document(_OTHER_PAN, plan_document_id, ELEVATIONS_PDF.read_bytes())
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{plan_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": plan_document_id,
+            "filename": "elevations.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 123,
+        },
+    )
+    photo_document_id = "resident-photo"
+    document_source.add_document(_OTHER_PAN, photo_document_id, _tiny_white_png(50, 50))
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{photo_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": photo_document_id,
+            "filename": "yard.jpg",
+            "content_type": "image/jpeg",
+            "size_bytes": 10,
+        },
+    )
+
+    async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+        runner = RealPipelineRunner(
+            document_source=document_source,
+            ingest_client=ingest_client,
+            grounding_client=None,
+            street_view_secret_accessor=_fake_street_view_secret_accessor,
+        )
+        resume = await resume_case(store, case_id)
+        dossier, _ingest_outcome = await runner._build_dossier(case_id, resume)  # noqa: SLF001
+
+    assert _STREET_VIEW_DOCUMENT_ID not in dossier.documents
+
+
+async def test_street_view_fallback_document_returns_none_without_an_ingest_client() -> None:
+    """Offline tests that never configure `ingest_client` (the vast
+    majority of this module's tests) must never attempt a live Street View
+    call -- confirmed directly against the method, not just inferred from
+    the absence of a mocked route elsewhere."""
+    runner = RealPipelineRunner(document_source=UserUploadedDocumentSource(), grounding_client=None)
+
+    result = await runner._street_view_fallback_document("65A Vista Street Sans Souci NSW 2219")  # noqa: SLF001
+
+    assert result is None
