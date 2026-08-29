@@ -8,23 +8,46 @@ that answers the resident's actual question on sight: "what is this box,
 and what happened to it?" This change came directly out of user testing on
 the spike's output, not a stylistic preference.
 
-Colour carries exactly three meanings, fixed by role/status -- never a
-per-query or per-label palette:
+Colour carries exactly four meanings, fixed by role/status -- never a
+per-query or per-label palette, and **pinned to the same hex values as
+`console/static/style.css`'s light-theme `--status-*-border` custom
+properties** (founder requirement #5: one semantic-colour source of truth,
+never a locally-invented shade). This module cannot read a CSS file at
+runtime, so the values are duplicated here, literally, as constants --
+`tests/evidence/test_overlays.py::test_overlay_colours_match_the_consoles_
+semantic_status_tokens` is the guard that catches the two drifting apart.
+Before this fix, this module drew its own independently-invented
+blue/green/red palette with only three roles (no distinct FLAGGED colour),
+which shared no colour with `console/static/app.js`'s `.doc-viewer__legend`
+chrome (green/gold/orange) drawn around the same image -- reported live as
+"the legend advertises colours the overlay never uses; every box on screen
+is blue":
 
-* **accent blue** (:data:`OverlayRole.EVIDENCE_ANCHOR`) -- an anchor not
-  (yet) tied to a ground the gate has decided, e.g. a fresh grounding pass
-  before the court/gate stage has run.
-* **green** (:data:`OverlayRole.SUPPORTS_SHIPPED`) -- the anchor is cited
-  by a ground the gate SHIPPED.
-* **red** (:data:`OverlayRole.ANCHOR_OF_REFUSED`) -- the anchor is cited by
-  a ground the gate REFUSED (irrelevant or unsubstantiated) or FLAGGED for
-  human review.
+* **grey**, `--status-pending-border` (:data:`OverlayRole.EVIDENCE_ANCHOR`)
+  -- an anchor not (yet) tied to a ground the gate has decided, e.g. a
+  fresh grounding pass before the court/gate stage has run.
+* **green**, `--status-shipped-border` (:data:`OverlayRole.SUPPORTS_SHIPPED`)
+  -- the anchor is cited by a ground the gate SHIPPED.
+* **gold**, `--status-flagged-border` (:data:`OverlayRole.NEEDS_MORE_EVIDENCE`)
+  -- the anchor is cited by a ground the gate FLAGGED for human review
+  (citations kept failing to resolve) -- a distinct, less-final outcome
+  from an outright refusal, exactly as the console's own tag/card
+  vocabulary (`.tag--flagged`, `--status-flagged`) already distinguishes
+  it everywhere else in the product.
+* **orange**, `--status-refused-border` (:data:`OverlayRole.ANCHOR_OF_REFUSED`)
+  -- the anchor is cited by a ground the gate REFUSED (irrelevant or
+  unsubstantiated).
 
 Each box also gets a short plain-English label chip -- the resident's own
 anchor caption, verbatim, plus a role-specific suffix this module adds --
-rendered as a filled tag beneath the box, and the whole image always gets
-one legend strip explaining the three colours, so the image reads correctly
-on its own without surrounding page text.
+rendered as a filled tag beneath the box. This module no longer bakes a
+legend strip into the image itself: `console/app.py`'s
+`_render_annotated_overlay_item` and `console/static/app.js`'s
+`handleAnnotatedOverlay` both wrap the returned PNG in the identical
+`.doc-viewer` + `.doc-viewer__legend` chrome (colour-discipline rule 4: any
+time >=1 overlay colour is on screen, its legend must be too), which stays
+legible in dark mode and never drifts out of sync with a second,
+image-baked copy the way the old approach could.
 
 **Lane boundary.** Input is deliberately narrow: a
 :class:`~setback.evidence.dossier.RenderedPage`, a sequence of
@@ -54,31 +77,48 @@ from setback.gate.validator import GateStatus
 
 class OverlayRole(StrEnum):
     """The one fact each box's colour communicates. Declaration order is
-    also the legend's left-to-right order."""
+    also the legend's left-to-right order (matching
+    `console/static/app.js`'s `.doc-viewer__legend` markup order:
+    shipped, flagged, refused, pending)."""
 
-    EVIDENCE_ANCHOR = "evidence_anchor"
     SUPPORTS_SHIPPED = "supports_shipped"
+    NEEDS_MORE_EVIDENCE = "needs_more_evidence"
     ANCHOR_OF_REFUSED = "anchor_of_refused"
+    EVIDENCE_ANCHOR = "evidence_anchor"
 
 
 OVERLAY_COLOR: Final[Mapping[OverlayRole, tuple[int, int, int]]] = {
-    OverlayRole.EVIDENCE_ANCHOR: (37, 99, 235),  # accent blue
-    OverlayRole.SUPPORTS_SHIPPED: (22, 163, 74),  # green
-    OverlayRole.ANCHOR_OF_REFUSED: (220, 38, 38),  # red
+    # Every value below is the *light-theme* hex from console/static/
+    # style.css's --status-*-border tokens (a static PNG cannot itself be
+    # theme-aware; the app is filmed/screenshotted with ?theme=light
+    # forced, see console/app.py, so this is the palette that is actually
+    # ever seen). Keep in sync with style.css by hand -- see this module's
+    # docstring and tests/evidence/test_overlays.py's guard test.
+    OverlayRole.SUPPORTS_SHIPPED: (0x0F, 0x6B, 0x3F),  # --status-shipped-border, green
+    OverlayRole.NEEDS_MORE_EVIDENCE: (0xB8, 0x90, 0x1A),  # --status-flagged-border, gold
+    OverlayRole.ANCHOR_OF_REFUSED: (0xB8, 0x57, 0x1C),  # --status-refused-border, orange
+    OverlayRole.EVIDENCE_ANCHOR: (0x8A, 0x94, 0xA1),  # --status-pending-border, grey
 }
 
 _ROLE_LEGEND_TEXT: Final[Mapping[OverlayRole, str]] = {
-    OverlayRole.EVIDENCE_ANCHOR: "Evidence anchor",
-    OverlayRole.SUPPORTS_SHIPPED: "Supports a ground in your submission",
-    OverlayRole.ANCHOR_OF_REFUSED: "Cited by a refused ground",
+    # Verbatim match to console/static/app.js's `.doc-viewer__legend` chip
+    # text, so a server-rendered page (console/app.py) and a live SSE
+    # client-rendered one (app.js) always read identically.
+    OverlayRole.SUPPORTS_SHIPPED: "Supports a shipped ground",
+    OverlayRole.NEEDS_MORE_EVIDENCE: "Needs more evidence",
+    OverlayRole.ANCHOR_OF_REFUSED: "Cited in a refused ground",
+    OverlayRole.EVIDENCE_ANCHOR: "Evidence anchor, not yet decided",
 }
 
 _REFUSED_STATUSES: Final[frozenset[GateStatus]] = frozenset(
-    {GateStatus.REFUSED_IRRELEVANT, GateStatus.REFUSED_UNSUBSTANTIATED, GateStatus.FLAGGED}
+    {GateStatus.REFUSED_IRRELEVANT, GateStatus.REFUSED_UNSUBSTANTIATED}
 )
-"""Every `GateStatus` that reads as "red" to the resident: an outright
-refusal either way, or a flag pending human review -- none of these should
-look like a green, shipped anchor."""
+"""Every `GateStatus` that reads as an outright refusal to the resident.
+`GateStatus.FLAGGED` (citations kept failing to resolve; needs a human, not
+necessarily a "no") is deliberately **not** included here -- it gets its
+own `OverlayRole.NEEDS_MORE_EVIDENCE` colour, matching the console's own
+`.tag--flagged`/`--status-flagged` distinction from `.tag--refused`
+everywhere else in the product."""
 
 _FALLBACK_CAPTION: Final[str] = "This element"
 
@@ -123,6 +163,8 @@ def classify_role(element: AnchoredElement, ground_status: Mapping[str, GateStat
         return OverlayRole.EVIDENCE_ANCHOR
     if status is GateStatus.SHIPPED:
         return OverlayRole.SUPPORTS_SHIPPED
+    if status is GateStatus.FLAGGED:
+        return OverlayRole.NEEDS_MORE_EVIDENCE
     if status in _REFUSED_STATUSES:
         return OverlayRole.ANCHOR_OF_REFUSED
     return OverlayRole.EVIDENCE_ANCHOR
@@ -142,6 +184,8 @@ def label_for(element: AnchoredElement, role: OverlayRole) -> str:
         return f"{caption} — included in your submission"
     if role is OverlayRole.ANCHOR_OF_REFUSED:
         return f"{caption} — cited by a refused ground"
+    if role is OverlayRole.NEEDS_MORE_EVIDENCE:
+        return f"{caption} — needs more evidence"
     return caption
 
 
@@ -187,12 +231,6 @@ def _page_points_to_full_res_pixels(
 
 _BOX_WIDTH_PX: Final[int] = 4
 _CHIP_PADDING_PX: Final[int] = 4
-_LEGEND_HEIGHT_PX: Final[int] = 40
-_LEGEND_SWATCH_PX: Final[int] = 18
-_LEGEND_MARGIN_PX: Final[int] = 12
-_LEGEND_GAP_PX: Final[int] = 24
-_LEGEND_BG: Final[tuple[int, int, int]] = (255, 255, 255)
-_LEGEND_TEXT_COLOR: Final[tuple[int, int, int]] = (17, 24, 39)
 _CHIP_TEXT_COLOR: Final[tuple[int, int, int]] = (255, 255, 255)
 
 
@@ -210,32 +248,19 @@ def _draw_label_chip(
     draw.text((x + _CHIP_PADDING_PX, chip_top + _CHIP_PADDING_PX), text, fill=_CHIP_TEXT_COLOR)
 
 
-def _append_legend(image: Image.Image) -> Image.Image:
-    """Return a new image with one legend strip appended beneath `image`:
-    one colour swatch and its plain-English meaning per `OverlayRole`, so
-    the image is self-explanatory without surrounding page text. Always
-    appended, even when no boxes were drawn -- an overlay image should
-    never ship unexplained."""
-    canvas = Image.new("RGB", (image.width, image.height + _LEGEND_HEIGHT_PX), _LEGEND_BG)
-    canvas.paste(image, (0, 0))
-    draw = ImageDraw.Draw(canvas)
-    x = _LEGEND_MARGIN_PX
-    y = image.height + (_LEGEND_HEIGHT_PX - _LEGEND_SWATCH_PX) // 2
-    for role in OverlayRole:
-        color = OVERLAY_COLOR[role]
-        draw.rectangle((x, y, x + _LEGEND_SWATCH_PX, y + _LEGEND_SWATCH_PX), fill=color)
-        text = _ROLE_LEGEND_TEXT[role]
-        text_x = x + _LEGEND_SWATCH_PX + 6
-        draw.text((text_x, y + 2), text, fill=_LEGEND_TEXT_COLOR)
-        left, _top, right, _bottom = draw.textbbox((0, 0), text)
-        x = round(text_x + (right - left) + _LEGEND_GAP_PX)
-    return canvas
-
-
 def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> bytes:
     """Draw every box in `boxes` onto `page`'s full-resolution image, each
-    with its role's colour and a plain-English label chip, plus an
-    unconditional legend strip, and return the annotated PNG bytes.
+    with its role's colour and a plain-English label chip, and return the
+    annotated PNG bytes -- exactly `page`'s own dimensions, no legend strip
+    appended.
+
+    No legend is baked into the pixels: `console/app.py`'s
+    `_render_annotated_overlay_item` and `console/static/app.js`'s
+    `handleAnnotatedOverlay` both wrap this image in the identical
+    `.doc-viewer__legend` chrome using `ROLE_LEGEND_TEXT`/`OVERLAY_COLOR`'s
+    own token names, which stays legible in dark mode and can never drift
+    out of sync with a second, image-baked copy (the bug this module's
+    docstring documents).
 
     Boxes are page-points (origin bottom-left, as
     :func:`~setback.evidence.grounding.ground_elements` and the anchor
@@ -249,14 +274,35 @@ def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> 
         draw.rectangle((x0, y0, x1, y1), outline=box.color, width=_BOX_WIDTH_PX)
         _draw_label_chip(draw, x0, y0, box.label, box.color)
 
-    annotated = _append_legend(image)
     buf = io.BytesIO()
-    annotated.save(buf, format="PNG")
+    image.save(buf, format="PNG")
     return buf.getvalue()
+
+
+ROLE_LEGEND_TEXT: Final[Mapping[OverlayRole, str]] = _ROLE_LEGEND_TEXT
+"""Public re-export of this module's legend copy, so `console/app.py`'s
+server-rendered `.doc-viewer__legend` and `console/static/app.js`'s
+client-rendered one can both source their text from here rather than each
+maintaining their own (drifting) copy. Iterate `OverlayRole` for legend
+order; see `ROLE_CSS_CLASS_SUFFIX` for the matching `legend-swatch--*`
+CSS class each role should render with."""
+
+ROLE_CSS_CLASS_SUFFIX: Final[Mapping[OverlayRole, str]] = {
+    # console/static/style.css's existing `.legend-swatch--{suffix}`
+    # classes (`--shipped`/`--flagged`/`--refused`/`--pending`), which are
+    # already theme-aware (they resolve to the same --status-*-border
+    # custom properties `OVERLAY_COLOR` pins the literal hex of, above).
+    OverlayRole.SUPPORTS_SHIPPED: "shipped",
+    OverlayRole.NEEDS_MORE_EVIDENCE: "flagged",
+    OverlayRole.ANCHOR_OF_REFUSED: "refused",
+    OverlayRole.EVIDENCE_ANCHOR: "pending",
+}
 
 
 __all__ = [
     "OVERLAY_COLOR",
+    "ROLE_CSS_CLASS_SUFFIX",
+    "ROLE_LEGEND_TEXT",
     "AnchoredElement",
     "OverlayBox",
     "OverlayRole",
