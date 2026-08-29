@@ -846,3 +846,184 @@ SHIPPED with citations, property-value REFUSED with correct, now-current
 s4.15 wording) in one unbroken live run. Full suite green, lint/format/
 type-check clean, gallery replaced with 8 real shots. Pushed to `main`
 after this file and STATUS.md were updated.
+
+---
+
+# SMOKE.md v4 — wave-6 fix-plan verification on the deployed console
+
+## Redeploy
+
+Redeployed via `./deploy.sh` (the sanctioned path; a standalone
+`gcloud run deploy` for the console alone was refused by this session's own
+auto-mode classifier) — twice, since the first pass surfaced the finding
+below and the second pass carried its fix. Final: `setback-console`
+revision `setback-console-00010-92j`, 100% traffic,
+`run.googleapis.com/sessionAffinity=true` confirmed on the revision's own
+annotations (not just requested by the flag). `setback-tribunal` job
+redeployed alongside it as an unavoidable side effect of using the one
+script that does both — idempotent, no case data touched, no live run
+triggered.
+
+## Finding, fixed live: the docket passphrase gate was never actually
+## armed in production
+
+`GET /` on the deployed console returned **`200` with no `?key` at all**
+before this round — `SETBACK_DOCKET_KEY` (the wave-6 code fix's own gate,
+`console/app.py::_docket_key_accepted`) was never set as an env var on the
+live service, and `deploy.sh` never set it either (confirmed on the prior
+revision, `setback-console-00008-5f8`, before this round touched anything).
+The code fix was real and tested; production simply never turned it on —
+STATUS.md's wave-6 claim that the docket is "now gated" was true of the
+code, not yet of the deployment. Fixed this round: `deploy.sh` now sets
+`SETBACK_DOCKET_KEY` from the operator's own shell environment (never
+hardcoded, never committed — see the diff), and a fresh passphrase was
+generated and set on the live service. Verified after redeploy:
+
+```
+GET /                          -> 401 (no key)
+GET /?key=<wrong>              -> 401
+GET /?key=<correct>            -> 200
+GET /cases/<any-id>             -> 200, no key required (unaffected, by design)
+```
+
+The passphrase itself is not written anywhere in this repo (git history
+included) — it was reported to the founder directly, out of band, per this
+project's secret-handling rule. **Needs Leo**: store it somewhere durable;
+today it exists only in this Cloud Run revision's env vars.
+
+## Browser verification (deployed URL, all per this round's checklist)
+
+- `?theme=light` / `?theme=dark` both force `<html data-theme="...">`
+  correctly on both the docket board and a case page; no `?theme` leaves
+  it unset (system preference).
+- A photo evidence doc-card now serves a real `image/jpeg` (800x600,
+  13,989 bytes) at `/api/cases/{id}/documents/{doc_id}` — confirmed a real
+  thumbnail, not the old grey placeholder icon.
+- No `#N {}`-shaped raw-JSON fragment found anywhere across the docket
+  board or any of the 5 listed case pages (grepped the rendered HTML).
+- `make -n deploy` (dry run, nothing executed): prints `./deploy.sh` —
+  confirms the Makefile target is wired, matching README.
+- `bash -n deploy.sh`: syntax OK, both before and after this round's edit.
+
+## Finding, not fixed (outside this round's lane/budget): the docket board is gated but not fully clean
+
+The structural UUID filter (`_looks_like_a_resident_session`) does its one
+job — every `SMOKE-RATE-LIMIT-TEST-*` / manually-POSTed row is gone — but
+it filters by *session-id shape*, not by content, so it does not catch:
+
+- **Duplicate app-number labels**: `PAN-661190` appears twice (distinct
+  case ids) and `DA2026/0359` appears three times (`-DEMO`, `-PROOF`, and
+  bare), all five still shown as "Ready to submit" — the exact "duplicate
+  case labels" junk-drawer complaint, just no longer joined by the
+  smoke-test rows.
+- **One listed case is a synthetic smoke artifact**: case
+  `fd183a3e29a7c600fa45e40927534d7b` (labelled `DA2026/0359`) was created
+  through a real browser-shaped session (so it passes the UUID filter) but
+  its "photo" evidence is a placeholder image whose own pixels read
+  `SMOKE TEST PHOTO` / `synthetic - no real data`, filed under the
+  filename "Test photo" — precisely the artifact P0 item 6 meant to purge,
+  just structurally invisible to a filter that only checks session-id
+  shape.
+
+**Needs Leo, before filming**: pick one real case for the docket board
+(recommend `0000f6d1a323b002db9be2c6a07db8cf` / `DA2026/0359-PROOF` — the
+only one with a real annotated-overlay event) and delete the other four
+Firestore case documents, or re-run the interview flow fresh through the
+real browser UI for exactly one clean case. Deleting live case data is a
+destructive action outside this verification pass's remit, so it was
+reported, not done.
+
+## Gallery shot 07 — regenerated from stored data, 0 live model calls, partially achieved
+
+Investigated whether any of the 5 live docket cases has a durable,
+structured evidence-anchor record (bbox + role, independent of the final
+baked PNG) that the fixed `evidence.overlays.render_semantic_overlay`
+could be re-run against. **None does**: every ground on every case has an
+empty `anchors` tuple in Firestore (`GroundEvidenceAnchor` is only
+persisted when a reviewer's verdict actually cites a grounded box —
+`job/pipeline.py` line ~716 — and that has never happened in any of these
+five runs). The "colour tells the resident what happened to this evidence"
+feature the wave-6 fix wired up has therefore never fired for real
+anywhere in the live docket; the sole existing `annotated_overlay` event
+(case `0000f6d1...`, `DA2026/0359-PROOF`) is the *old*, pre-fix renderer's
+output — flat, wrong-colour (`#3d74ed`, matching no legend token) boxes,
+no label chips, predating both wave-6 fixes.
+
+Regenerated anyway, honestly, from what stored data does exist and zero
+model calls: pulled the case's real uploaded PDF fresh from GCS, rendered
+it locally via the same `evidence.dossier.render_pdf_pages` (300 DPI) the
+pipeline itself uses, recovered the four real box positions by locating
+the old image's own (uniquely-coloured) rectangle outlines pixel-for-pixel
+and mapping them back through the real page-point<->pixel geometry, then
+ran them through the actual current `build_overlay_boxes` /
+`render_semantic_overlay` unmodified (role: `EVIDENCE_ANCHOR`, since that
+is what the real — empty — anchor-to-ground data says is true for every
+box here). Result, saved over `07-overlay-viewer-with-legend.png`:
+
+- **Fixed and now demonstrably real**: boxes render in the correct
+  `--status-pending-border` grey (not the old arbitrary blue), each with a
+  label chip, wrapped in the real, current 4-item `.doc-viewer__legend`
+  chrome (all four colours shown, sourced from `evidence.overlays`'s own
+  constants — this part of the wave-6 fix is genuinely live).
+- **Not achieved, and not achievable from stored data**: "boxes ON the
+  drawing." Two of the four recovered box positions land in the blank
+  gap between the page's two elevation drawings, not on any drawn
+  element — this is the original grounding pass's own coordinate
+  accuracy for this run, a pre-existing, separate defect the wave-6
+  colour/legend fix never touched and that only a fresh live grounding
+  call (a model call, out of this round's 0-call budget) could improve.
+  Reported per this round's instruction rather than spending the call.
+
+**New finding, verified independently of the above**: the overlay's label
+chip renders with no visible word-spacing — PIL's implicit default font
+(`evidence/overlays.py::_draw_label_chip` calls `ImageDraw.text` with no
+`font=`) collapses `"This element"` to `"Thiselement"` on screen
+(`textbbox` reports the space is ~2px wide, but it disappears entirely
+once anti-aliased/resized). Reproduced independently in a 3-line PIL
+script, unrelated to this round's reconstruction pipeline — this will
+affect every real, multi-word evidence caption in production, not just
+the fallback text used here. Not fixed (outside this verification lane —
+belongs to whoever owns `evidence/overlays.py`).
+
+## Finding, not fixed: the refusals-explainer ground-id leak is fixed in code, stale on every existing case page
+
+Commit `8e6d54b` (`fix(dispatch): show a human-readable heading on
+refused/flagged grounds`) is real, tested, and correct — but a case's
+refusals-explainer document is composed once, at tribunal-run time, and
+stored as static text/HTML; redeploying the console does not
+retroactively recompose it. Case `c3cc67dd7b96ce206b054fb5b428a8db`'s live,
+downloadable refusals document still reads `<h3>ground-b72d23845dda7b8e</h3>`
+verbatim — the exact string VERDICT quoted as the internal-state-leak
+example — because that document predates the fix and no case has been
+re-run since. **Needs Leo**: whichever case is used on film day should be
+produced by a fresh tribunal run (post-fix) if this document is shown
+on camera; the four other pre-existing cases will still show the raw
+hash if opened.
+
+## Gallery shot 01 — regenerated
+
+Re-shot the docket board (light theme forced, correct passphrase) after
+the fix above. Clean of `SMOKE-RATE-LIMIT-TEST-*` rows and raw JSON; still
+shows the duplicate-label issue documented above (not this round's fix to
+make).
+
+## Verification
+
+```
+$ uv run pytest -q
+503 passed, 202 warnings in 20.08s
+```
+
+`bash -n deploy.sh` clean. No secret read, printed, or committed —
+`git diff -- deploy.sh` contains no literal passphrase, only an
+environment-variable reference. No personal identifier introduced into
+any file this round touched.
+
+## Status
+
+**DEPLOYED, session-affinity confirmed, docket gate now actually live.**
+Two real findings escalated as needs-Leo items (duplicate/smoke-artifact
+docket cases; the label-chip font/spacing bug); one pre-existing
+grounding-accuracy limitation named rather than spent a model call on. 0
+live model calls this round. Pushed to `main` after this file was
+updated.

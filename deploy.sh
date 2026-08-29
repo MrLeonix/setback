@@ -48,6 +48,18 @@ TRIBUNAL_SA="sa-orchestrator@${PROJECT_ID}.iam.gserviceaccount.com"
 MAPS_SECRET="maps-api-key"
 FIRESTORE_DB="${SETBACK_FIRESTORE_DB:-setback-au}"
 GCS_UPLOADS_BUCKET="${SETBACK_GCS_UPLOADS_BUCKET:-vexcourt-agent-setback-au}"
+# `SETBACK_DOCKET_KEY`: the public docket **list** route's passphrase gate
+# (console/app.py::_docket_key_accepted). Read from the operator's own shell
+# environment only -- never hardcoded here, never committed. If unset, the
+# app's own documented fallback applies and the gate is disabled entirely
+# (fine for local dev; NOT fine for a public deploy, since that's the exact
+# PII-exposure gap this variable exists to close). This script warns, but
+# does not fail, when it's unset, since a first-time/local deploy should
+# still succeed.
+DOCKET_KEY="${SETBACK_DOCKET_KEY:-}"
+if [[ -z "${DOCKET_KEY}" ]]; then
+  log "WARNING: SETBACK_DOCKET_KEY is not set in this shell -- the public docket board's case list will be reachable with NO passphrase on this deploy. Export SETBACK_DOCKET_KEY before running this script for any public-facing deploy."
+fi
 
 TAG="$(date -u +%Y%m%dt%H%M%Sz)"
 AR_HOST="${REGION}-docker.pkg.dev"
@@ -131,7 +143,7 @@ gcloud run deploy "${CONSOLE_SERVICE}" \
   --session-affinity \
   --cpu-throttling \
   --port=8080 \
-  --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID},SETBACK_FIRESTORE_DB=${FIRESTORE_DB},SETBACK_GCS_UPLOADS_BUCKET=${GCS_UPLOADS_BUCKET}" \
+  --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID},SETBACK_FIRESTORE_DB=${FIRESTORE_DB},SETBACK_GCS_UPLOADS_BUCKET=${GCS_UPLOADS_BUCKET},SETBACK_DOCKET_KEY=${DOCKET_KEY}" \
   --clear-secrets \
   --allow-unauthenticated \
   --quiet
