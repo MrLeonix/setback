@@ -320,7 +320,14 @@ input:focus-visible,
   margin-right: 0.4rem;
 }
 
-.ground-list li {
+/* Direct children only (`>`) -- deliberately scoped so this pre-accordion
+   rule never reaches a nested `<li>` several levels inside a ground card's
+   own `<details>` body (e.g. `.ground-card__opinions`'s reviewer-verdict
+   list). A bare `.ground-list li` descendant selector matched those too,
+   flexing each reviewer opinion's own text into unreadable, squeezed
+   `justify-content: space-between` columns -- found live on the deployed
+   console, wave-9 QA smoke loop. */
+.ground-list > li {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -329,7 +336,7 @@ input:focus-visible,
   border-bottom: 1px dashed var(--border);
 }
 
-.ground-list li:last-child {
+.ground-list > li:last-child {
   border-bottom: none;
 }
 
