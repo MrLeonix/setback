@@ -19,8 +19,7 @@ run-local:
 	uv run uvicorn setback.console.app:app --reload --port 8000
 
 deploy:
-	@echo "Not yet implemented: gcloud run deploy setback-console / setback-job (see README, Cloud spin-up)"
-	@exit 1
+	./deploy.sh
 
 demo-reset:
 	@echo "Not yet implemented: reset Firestore demo-case documents once state/firestore.py lands"

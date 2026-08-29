@@ -145,6 +145,26 @@ gcloud secrets add-iam-policy-binding "${MAPS_SECRET}" \
   --member="serviceAccount:${TRIBUNAL_SA}" \
   --role="roles/secretmanager.secretAccessor"
 
+# --- 5b. Project-level IAM both service accounts need to run at all -----------
+# ARCHITECTURE.md §5 documents both SAs as holding `roles/datastore.user` and
+# `roles/aiplatform.user` -- until now those two roles existed only from
+# manual, undocumented `gcloud` commands run once against the live project
+# (the gap STATUS.md's wave-3 section caught live as a 403 and closed by
+# hand, never by this script). A fresh deploy of this project by anyone
+# else starts with neither role granted and 403s on the first Firestore
+# read or Vertex AI call. `add-iam-policy-binding` is idempotent -- granting
+# a role a principal already holds is a no-op, safe to re-run every deploy.
+log "Granting datastore.user + aiplatform.user to both service accounts (idempotent)"
+for SA in "${CONSOLE_SA}" "${TRIBUNAL_SA}"; do
+  for ROLE in roles/datastore.user roles/aiplatform.user; do
+    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+      --member="serviceAccount:${SA}" \
+      --role="${ROLE}" \
+      --condition=None \
+      --quiet >/dev/null
+  done
+done
+
 # --- 6. Deploy setback-tribunal (Cloud Run Job) ---
 # Only the tribunal job reads the Maps secret (evidence/imagery.py's Street
 # View fallback runs inside the tribunal pipeline, never in the console) --
