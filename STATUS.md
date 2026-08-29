@@ -1,3 +1,180 @@
+# STATUS — wave 9 landed: founder feedback round (2026-08-29)
+
+Integration pass reconciling four fixer lanes' work (already applied to the working
+tree when this pass started) against `LEO-FEEDBACK-UIUX.md` (Leo's binding wave-9
+spec, driving the deployed app live), plus this pass's own cross-lane fixes and full
+quality-gate/security verification. **This pass did not redeploy** — `deploy.sh`
+against the live `setback-console`/`setback-tribunal` (`australia-southeast1`) is the
+next, separate step; git only, per this wave's brief.
+
+## Shipped (LEO-FEEDBACK-UIUX.md item by item)
+
+- **§1 Landing page**: public `/`, minimal (Setback + caption + one DA-number input),
+  never 401s; docket board moved to `/docket` (same `?key=` gate). localStorage
+  "previous cases" affordance. Copy link + a server-generated QR code (`segno`, new
+  dependency) on every case page for account-free re-access. Email sending stays
+  explicitly deferred (no GCP-native SES), per the spec's own "explicitly deferred"
+  list.
+- **§2 Case page**: fixed left chat pane / scrolling right pane, stacking on narrow
+  screens. The cold-start no-resume bug is fixed (`InterviewFlow.resume`, wired from
+  the case's persisted transcript) — greets only when the transcript is empty, no
+  more duplicate opening line on a fresh Cloud Run instance. Typing indicator +
+  disabled input while a reply is pending. Standalone "Interview transcript" section
+  removed. "Export transcript" downloads plain text.
+- **§3 Grounds**: one-line accordion (clamped claim + status pill) expanding to full
+  detail; reviewer opinions and the gate decision merged into the expansion; refusal
+  copy names the ground by its own one-liner.
+- **§4 Evidence**: document cards clickable (real thumbnail for a photo, served via
+  the existing document route); Street View fallback trigger condition widened to
+  accept a free-text address (the pipeline never had lat/lng, only a resolved
+  address string) and verified.
+- **§5 Annotated overlay (flagship, was regressed)** — root-caused and fixed, not
+  patched around:
+  - Overlay box count capped at 8 (`DEFAULT_MAX_OVERLAY_BOXES`), preferring decided
+    boxes over neutral evidence anchors when trimming.
+  - Label-chip collisions now stack instead of overwriting into an illegible
+    run-on string.
+  - **Root cause of "meaningless mid-house boxes"** fixed in
+    `_propagate_page_level_anchor_status`: page-level citation inheritance is now an
+    all-or-nothing fallback for a page with zero direct citations of its own, never a
+    per-anchor gap-filler on a page that already has specific citations elsewhere —
+    verified against the film case's own real stored anchor/ground facts, and pinned
+    by a new regression test reconstructing that exact case (one directly-cited
+    datum-line box stays green; four unrelated window/door boxes on the same page,
+    cited by an unrelated refused ground's page-level citation, correctly stay
+    neutral instead of turning orange).
+  - **Full-resolution click-to-open, closed end-to-end**: `render_semantic_overlay`'s
+    pre-shrink PNG is now durably stored (via the document source's
+    `EvidenceUploadStore` side — `GcsEvidenceStore` in production) and referenced
+    from the `annotated_overlay` event; the lightbox opens that real full-resolution
+    image instead of re-displaying the shrunk, embedded copy bigger. Verified live in
+    a real browser against an offline, fakes-only smoke server (zero live model/GCP
+    calls): clicking the overlay opened a genuinely higher-resolution image served
+    from the new document route.
+  - Grounding-tier default kept at `INTERVIEW`, not switched to `BENCH` — a live
+    2-call comparison against the real film-case fixture showed `BENCH` placing all
+    four window/door boxes on the *wrong* elevation drawing, a regression. Documented
+    in `grounding.py`'s docstring for re-evaluation against a future, richer fixture.
+- **§6 Submission documents**: Copy text + Email this (mailto) as primary actions,
+  HTML download kept secondary, Markdown download removed from the UI.
+- **§7 Tribunal**: timestamps render in Australia/Sydney with the date (stored UTC).
+  "Start tribunal" is now un-crashable on both sides: UI disables/hides it in
+  terminal states, and `job/pipeline.py` gained the job-side idempotency guard
+  (SMOKE.md's "Fix 4 — not fixed") — a judge double-pressing the button against an
+  already-decided case is now a safe, event-logged no-op instead of a crash. The
+  three new event types this produces (`ingest_resolved`, `tribunal_rerun_ignored`,
+  `ground_rerun_skipped`) were flagged by one fixer's handoff note as an
+  unregistered-renderer gap (would have fallen through to the raw-JSON dump, or
+  simply never rendered) — closed at this integration pass: the first two render in
+  plain English in a merged, chronological "Tribunal" card; the third stays out of
+  the resident-facing UI by design (an internal resume-safety signal only), per that
+  same note's own recommendation.
+- **§8 Theme**: header light/dark toggle, persisted in localStorage, overriding
+  system preference; `?theme=light` still works for filming.
+- **§9 Right-pane structure**: sticky in-page nav across the merged section set
+  (Grounds, Evidence, Overlay, Documents, Tribunal).
+
+## Partially shipped
+
+- **§10 Real-case validation**: the *mechanism* is shipped and tested — a typed DA
+  number now drives real OnlineDA/spatial/tracker fetching when a live ingest client
+  is configured, degrading honestly (a labelled `ingest_resolved` event, never a
+  silent wrong letterhead) to the frozen demo fixture on any resolution failure.
+  **Not done by this pass**: actually populating the docket with 4–6 real DAs
+  currently on exhibition, running real tribunals against them, recording per-case
+  cost, and picking the new film case — this requires live runs against real
+  government endpoints and is deploy-time/founder work, out of this git-only
+  integration pass's scope and budget.
+
+## Cut
+
+- **§11 Veo simulation**: not attempted this wave — zero trace of it anywhere in the
+  tree. Consistent with the spec's own instruction ("time-boxed bonus... if not
+  demo-ready in time, CUT it — no half-shipped feature"), but flagged explicitly
+  since no lane's notes confirmed this was a deliberate per-lane decision rather than
+  simply unstarted.
+
+## Note: one lane's report was not found
+
+The wave-9 brief describes four fixer lanes (A/B/C/D), but only three lanes' patch
+notes were present in this integration pass's brief (covering `evidence/{overlays,
+grounding}.py`; `console/**` + `interview/flow.py` + `dispatch/composer.py`;
+`job/{pipeline,main}.py` + `evidence/imagery.py`). No lane-D patch notes were found,
+and no trace of lane-D-shaped changes (a config change, a docket-card wiring change,
+or anything matching "lane D's config + console card wiring") appears anywhere in
+the working tree diff this pass reconciled. Per the orchestrator's own fallback
+instruction ("if D said CUT, wire nothing and say so"), **nothing was wired for a
+lane D this pass could not identify** — flagging this explicitly rather than
+guessing at what lane D covered or silently proceeding as if it had shipped.
+
+## Cross-lane patch notes applied at this integration pass
+
+- The propagation-bug root-cause fix (§5 above) — reported by one fixer as a patch
+  note for `job/pipeline.py`, outside that fixer's own lane (`evidence/overlays.py`),
+  verified visually offline against the film case's real facts. Applied here with a
+  new regression test reconstructing the exact reported scenario.
+- The full-resolution click-to-open wiring (§5 above) — reported by the same fixer
+  as needing both `job/pipeline.py` and `console/app.py`, requiring a GCS-wiring and
+  event-payload-shape decision neither individual lane could make alone. Implemented
+  here (pipeline write + event field + console route content-type fallback + lightbox
+  JS preference), TDD throughout, and verified live in a real browser.
+- The three unregistered event-renderer gap (§7 above) — reported by the `job/
+  pipeline.py` fixer as a handoff note for whoever owns `console/app.py`. Closed here.
+
+## Verification (verbatim, this integration pass)
+
+```
+$ uv run pytest -q
+590 passed, 256 warnings in ~45-55s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+81 files already formatted
+
+$ uv run mypy
+Success: no issues found in 38 source files
+```
+
+Up from wave 8's 532 (581 after the four lanes' own work, 590 after this pass's own
+TDD additions: the propagation-bug regression test, the three event-renderer tests,
+and the three full-resolution click-through tests).
+
+## Security diff check (this pass, full wave-9 diff)
+
+Grepped the full staged diff for credential patterns (`AIza...`, `ghp_...`,
+`AKIA...`, `sk-...`, JWTs, `BEGIN ... PRIVATE KEY`, literal `docket-key`/`api_key`/
+`password` assignments), the user's email, and internal hostnames/home-directory
+paths (`kratos`, `mimir`, `.local`, `/Users/leo`, `/home/leo`, `@gmail.com`). Zero
+live hits — the only `.local`-shaped matches were `window.localStorage` calls (new
+localStorage-driven UI state, §1/§8 above), not a hostname. No secret value, personal
+identifier, or hostname appears anywhere in this wave's diff.
+
+## Live model calls this pass
+
+Zero. This was a pure code-integration pass (propagation-bug fix, event-renderer
+wiring, full-resolution overlay wiring) verified entirely by the offline test suite
+plus one offline, fakes-only browser smoke test (`create_app(...)` with an in-memory
+store/document-source/composer — never `_build_production_app`, never a real
+`ModelClient`) — no live Vertex AI, Secret Manager, or GCP call of any kind was made.
+
+## What remains (film-day / next-pass work, unchanged in spirit from prior waves)
+
+- **Redeploy**: this pass's changes are pushed to `origin/main` but not yet deployed
+  — `./deploy.sh` against `australia-southeast1` is the next step, followed by a live
+  smoke pass against the deployed console (docket gate, case creation, a real
+  interview turn, a real tribunal run) before the film-day freeze.
+- **§10's live half** (populate the docket with 4–6 real DAs, run real tribunals,
+  record cost, pick the new film case) — founder/deploy-time work, not attempted
+  here.
+- **§11 Veo** — cut, as above; would need a fresh scoping pass if resurrected.
+- **Lane D** — its scope was never identified by this pass (see the note above); if
+  it was meant to cover something real, it needs to be re-briefed and re-run, not
+  assumed lost.
+
+---
+
 # STATUS — wave 8 landed: build phase closed (2026-08-29)
 
 Final build wave. Closed the three visual defects SMOKE.md v5 flagged as gating the
