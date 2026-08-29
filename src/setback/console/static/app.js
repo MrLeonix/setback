@@ -197,7 +197,41 @@
     startTribunalBtn.addEventListener("click", async () => {
       startTribunalBtn.disabled = true;
       startTribunalBtn.textContent = "Tribunal running...";
-      await fetch(`/api/cases/${caseId}/tribunal`, { method: "POST" });
+      const existingError = document.getElementById("start-tribunal-error");
+      if (existingError) existingError.remove();
+      try {
+        const response = await fetch(`/api/cases/${caseId}/tribunal`, { method: "POST" });
+        if (!response.ok) {
+          // A 429 (rate/concurrency/spend guard) or 5xx (e.g. the job
+          // trigger itself failing) both leave the resident staring at a
+          // button stuck on "Tribunal running..." with no way to tell
+          // whether it is actually safe to retry -- surface the server's
+          // own detail message and re-enable the button so they can.
+          let detail = `Could not start the tribunal (status ${response.status}). Please try again shortly.`;
+          try {
+            const errorBody = await response.json();
+            if (errorBody && errorBody.detail) detail = errorBody.detail;
+          } catch (err) {
+            // Non-JSON error body: keep the generic message above.
+          }
+          const errorEl = document.createElement("p");
+          errorEl.id = "start-tribunal-error";
+          errorEl.className = "create-case-error";
+          errorEl.textContent = detail;
+          startTribunalBtn.insertAdjacentElement("afterend", errorEl);
+          startTribunalBtn.disabled = false;
+          startTribunalBtn.textContent = "Start tribunal";
+        }
+      } catch (err) {
+        // Network failure: same recovery as an HTTP error above.
+        const errorEl = document.createElement("p");
+        errorEl.id = "start-tribunal-error";
+        errorEl.className = "create-case-error";
+        errorEl.textContent = "Could not reach the server. Please check your connection and try again.";
+        startTribunalBtn.insertAdjacentElement("afterend", errorEl);
+        startTribunalBtn.disabled = false;
+        startTribunalBtn.textContent = "Start tribunal";
+      }
     });
   }
 

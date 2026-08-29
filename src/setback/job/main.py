@@ -147,21 +147,26 @@ def _default_store_factory() -> CaseStore:
 def _default_pipeline_factory() -> PipelineRunner:
     """Build the production `PipelineRunner`.
 
-    A fresh `UserUploadedDocumentSource` here will not find any documents a
-    resident uploaded to a separate `setback-console` process (see
-    `job.pipeline`'s module docstring's "known gaps" note) -- a real Cloud
-    Run Job execution therefore degrades to citation-only grounds rather
-    than crashing. Local/dev callers that want uploaded documents visible
-    to the job should instead construct `RealPipelineRunner` directly with
-    the same `UserUploadedDocumentSource` instance the console app is using
-    (see `console.app`'s in-process trigger).
-    """
-    from setback.ingest.tracker import UserUploadedDocumentSource
+    Uses `evidence.storage.GcsEvidenceStore`, exactly like `console.app`'s
+    own `_build_production_app` -- the durable, GCS-backed store a resident's
+    upload actually lands in, shared between the console process and this
+    entirely separate Cloud Run Job container. A fresh, per-execution
+    `ingest.tracker.UserUploadedDocumentSource` (this factory's default
+    before this fix) is process-local, in-memory, and always empty in a
+    real job execution, silently degrading every uploaded-evidence-dependent
+    ground to "no evidence provided" regardless of what the resident
+    actually uploaded -- caught live in smoke loop #2 (an Evidence Reviewer
+    verdict citing missing photos/plans for a case that had both uploaded).
+    Local/dev callers that specifically want the in-process, in-memory store
+    (no real GCS) should construct `RealPipelineRunner` directly instead
+    (see `console.app`'s `LocalPipelineJobTrigger`, gated behind
+    `SETBACK_LOCAL_TRIBUNAL=1`)."""
+    from setback.evidence.storage import GcsEvidenceStore
     from setback.job.pipeline import RealPipelineRunner
     from setback.models.client import ModelClient
 
     return RealPipelineRunner(
-        document_source=UserUploadedDocumentSource(),
+        document_source=GcsEvidenceStore(),
         polisher=ModelClient(),
         grounding_client=ModelClient(),
     )

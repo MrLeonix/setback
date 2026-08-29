@@ -306,6 +306,74 @@ def test_trigger_tribunal_records_event_and_calls_job_trigger(
     assert job_trigger.triggered_case_ids == [case_id]
 
 
+def test_trigger_tribunal_records_job_failed_when_the_trigger_itself_raises(
+    store: InMemoryCaseStore, composer: _FakeComposer
+) -> None:
+    """A `JobTrigger.trigger` failure (e.g. the deployed console's real
+    `RealJobTrigger` hitting a `PermissionDenied` from Cloud Run, caught
+    live in smoke loop #2) must not silently leave the case stuck
+    "running" forever against `enforce_concurrent_tribunal_cap` -- that
+    permanently burns one of only `DEFAULT_MAX_CONCURRENT_TRIBUNALS` (2)
+    slots for a run that never actually started. The route must record a
+    terminal `job_failed` event and surface a clean error status, not an
+    unhandled 500."""
+
+    class _RaisingJobTrigger:
+        async def trigger(self, case_id: str) -> None:
+            raise RuntimeError("simulated: PermissionDenied from Cloud Run")
+
+    app = create_app(
+        store,
+        composer=composer,
+        document_source=UserUploadedDocumentSource(),
+        job_trigger=_RaisingJobTrigger(),
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+    case_id = _create_case(client)
+
+    response = client.post(f"/api/cases/{case_id}/tribunal")
+    assert response.status_code == 502, response.text
+
+    events = asyncio.run(store.list_events(case_id))
+    event_types = [e.event_type for e in events]
+    assert "tribunal_requested" in event_types
+    assert "job_failed" in event_types
+
+    # The stuck-forever regression this guards against: with a terminal
+    # event now recorded, this case must no longer count as "running" --
+    # a fresh tribunal request for a *different* case must not be refused
+    # by the concurrency cap because of this one's leftover state.
+    from setback.console.guards import count_running_tribunals
+
+    assert asyncio.run(count_running_tribunals(store)) == 0
+
+
+def test_a_second_tribunal_start_on_the_same_case_records_its_own_event(
+    client: TestClient, job_trigger: _RecordingJobTrigger, store: InMemoryCaseStore
+) -> None:
+    """`tribunal_requested`'s event id must be unique per *attempt*, not
+    just per case -- a fixed `f"tribunal-requested:{case_id}"` id caused
+    `CaseStore.append_event`'s idempotency-by-id dedup to silently swallow
+    every request after the first (the event, and its sequence number,
+    just never advanced), which is exactly what smoke loop #2 found live:
+    a second, later `POST /tribunal` on an already-completed case still
+    triggered a *real* second Cloud Run Job execution (`trigger.trigger`
+    is unconditional) while leaving no trace of that second attempt in the
+    case's own audit log at all."""
+    case_id = _create_case(client)
+
+    first = client.post(f"/api/cases/{case_id}/tribunal")
+    assert first.status_code == 202, first.text
+    second = client.post(f"/api/cases/{case_id}/tribunal")
+    assert second.status_code == 202, second.text
+
+    assert job_trigger.triggered_case_ids == [case_id, case_id]
+    events = asyncio.run(store.list_events(case_id))
+    tribunal_requested_events = [e for e in events if e.event_type == "tribunal_requested"]
+    assert len(tribunal_requested_events) == 2
+    assert tribunal_requested_events[0].sequence != tribunal_requested_events[1].sequence
+
+
 def test_trigger_tribunal_unknown_case_is_404(client: TestClient) -> None:
     response = client.post("/api/cases/does-not-exist/tribunal")
     assert response.status_code == 404
@@ -436,6 +504,20 @@ def test_docket_board_lists_created_cases(client: TestClient) -> None:
     assert "text/html" in response.headers["content-type"]
     assert case_id in response.text
     assert "PAN-2" in response.text
+
+
+def test_docket_board_loads_the_client_script_so_the_create_case_form_renders(
+    client: TestClient,
+) -> None:
+    """`app.js` builds the docket board's only case-creation UI at runtime
+    (`initCreateCaseForm`, per its own module docstring -- the
+    server-rendered board has no case-creation markup of its own). Without
+    a `<script src="/static/app.js">` tag on this page, a resident has no
+    way to start a case through the UI at all -- caught live against the
+    deployed console (smoke loop #2)."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert '<script src="/static/app.js"></script>' in response.text
 
 
 def test_docket_board_survives_a_fresh_app_instance_over_the_same_store(

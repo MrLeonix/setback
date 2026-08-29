@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import base64
 import io
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -614,7 +615,22 @@ class RealPipelineRunner:
                         case_id=case_id,
                     )
                 )
-            except Exception:  # noqa: BLE001 -- see module docstring's known-gap note
+            except Exception as exc:  # noqa: BLE001 -- degrade the dossier, never crash the run
+                # Excluding the document (rather than failing the whole
+                # run) is the intended degrade-gracefully behaviour the
+                # module docstring's "Durable uploads" note describes --
+                # but a *silent* skip here is exactly what let a whole
+                # wave's worth of tribunal runs quietly lose every
+                # resident-uploaded document to an unrelated wiring bug
+                # with nothing in any log to point at why (smoke loop #2).
+                # stderr, not an event: this is an operability signal for
+                # whoever reads the job's Cloud Run logs, not case-facing
+                # state a resident's page should render.
+                print(
+                    f"evidence download failed for document {upload.document_id!r} "
+                    f"({upload.filename!r}); excluding it from the dossier: {exc}",
+                    file=sys.stderr,
+                )
                 continue
             if upload.is_pdf:
                 kind = await self._classify_plan_document(upload.filename, content)

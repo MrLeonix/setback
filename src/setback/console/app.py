@@ -36,6 +36,7 @@ import hashlib
 import html
 import json
 import os
+import secrets
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -502,10 +503,42 @@ def create_app(
         await _require_case(case_id)
         await enforce_concurrent_tribunal_cap(store)
         await enforce_daily_spend_budget(store)
+        # A per-attempt nonce, not just `case_id`, keyed into the event id:
+        # `CaseStore.append_event` dedups by exact event id (its
+        # idempotency mechanism for retried writes), so a fixed
+        # `f"tribunal-requested:{case_id}"` id meant every attempt after
+        # the very first silently collapsed into the same Firestore
+        # document -- no new event, no sequence advance, no audit trail --
+        # while `trigger.trigger` below still fired a real second Cloud Run
+        # Job execution regardless. Caught live in smoke loop #2.
         await store.append_event(
-            case_id, f"tribunal-requested:{case_id}", "tribunal_requested", payload={}
+            case_id,
+            f"tribunal-requested:{case_id}:{secrets.token_hex(4)}",
+            "tribunal_requested",
+            payload={},
         )
-        await trigger.trigger(case_id)
+        try:
+            await trigger.trigger(case_id)
+        except Exception as exc:  # noqa: BLE001 -- must record + report, never crash uncaught
+            # A `tribunal_requested` event with no later terminal event
+            # counts as "still running" forever against
+            # `guards.enforce_concurrent_tribunal_cap` (smoke loop #2 found
+            # this live: a `RealJobTrigger` permission error left a case
+            # permanently burning one of only 2 concurrent-run slots). Book
+            # a `job_failed` terminal event -- the same event type/payload
+            # shape `job.main`'s own pipeline-failure handler already uses
+            # -- before reporting the error, so the guard sees this run as
+            # over rather than still in flight.
+            await store.append_event(
+                case_id,
+                f"job-failed:{case_id}:{type(exc).__name__}:{secrets.token_hex(4)}",
+                "job_failed",
+                payload={"error": str(exc)},
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="could not start the tribunal job; please try again shortly",
+            ) from exc
         return {"case_id": case_id, "status": "tribunal_requested"}
 
     @app.get("/api/cases/{case_id}/events")
@@ -639,6 +672,7 @@ def render_docket_board(cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ..
       {rows}
     </div>
   </main>
+  <script src="/static/app.js"></script>
 </body>
 </html>
 """

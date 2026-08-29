@@ -156,13 +156,26 @@ gcloud run jobs deploy "${TRIBUNAL_JOB}" \
   --set-secrets="MAPS_API_KEY=${MAPS_SECRET}:latest" \
   --quiet
 
-# --- 7. Least-privilege IAM: sa-console may invoke exactly this job, nothing broader ---
-log "Granting sa-console run.invoker on ${TRIBUNAL_JOB} only (resource-scoped)"
+# --- 7. Least-privilege IAM: sa-console may execute exactly this job, nothing broader ---
+# `roles/run.invoker` alone is NOT enough: `console/app.py::RealJobTrigger`
+# calls `JobsClient.run_job` with a per-execution `overrides.container_overrides`
+# (to pass CASE_ID) -- the Cloud Run Admin API requires the distinct
+# `run.jobs.runWithOverrides` permission for a request that sets `overrides`,
+# which `run.invoker` does not include (only `run.jobs.run`, `run.instances.invoke`,
+# `run.routes.invoke`). `roles/run.jobsExecutorWithOverrides` is a superset
+# (`run.jobs.run` + `run.jobs.runWithOverrides` + `run.executions.cancel`) --
+# granted here scoped to this one job resource, not project-wide (smoke loop
+# #2 found a live 403 `PermissionDenied: run.jobs.runWithOverrides` from
+# exactly this gap, introduced when an earlier checkpoint removed sa-console's
+# broader *project-level* binding of the same role as "redundant" against
+# `run.invoker` -- it was not redundant, since `run.invoker` never carried
+# the overrides permission in the first place).
+log "Granting sa-console run.jobsExecutorWithOverrides on ${TRIBUNAL_JOB} only (resource-scoped)"
 gcloud run jobs add-iam-policy-binding "${TRIBUNAL_JOB}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
   --member="serviceAccount:${CONSOLE_SA}" \
-  --role="roles/run.invoker"
+  --role="roles/run.jobsExecutorWithOverrides"
 
 # --- 8. Report ---
 SERVICE_URL="$(gcloud run services describe "${CONSOLE_SERVICE}" \

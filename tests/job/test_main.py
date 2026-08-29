@@ -100,6 +100,34 @@ async def test_run_job_custom_heartbeat_stage() -> None:
     assert "tribunal" not in heartbeats
 
 
+# --- _default_pipeline_factory (production wiring) --------------------------
+
+
+def test_default_pipeline_factory_uses_the_durable_gcs_evidence_store() -> None:
+    """The real Cloud Run Job entrypoint (`python -m setback.job.main`,
+    exactly what `deploy.sh` runs) must read a resident's uploaded evidence
+    from the same durable store the console wrote it to
+    (`evidence.storage.GcsEvidenceStore`) -- not a fresh, per-execution,
+    always-empty `ingest.tracker.UserUploadedDocumentSource`.
+
+    Caught live in smoke loop #2: a real deployed tribunal run's Evidence
+    Reviewer rejected a ground citing "neither photos nor plans were
+    actually provided", for a case that genuinely had both files uploaded
+    and visible on its console case page -- because `job.main`'s pipeline
+    factory (unlike `console.app`'s `_build_production_app`, already fixed
+    this wave) was never updated off its pre-`GcsEvidenceStore` default.
+    Every real deployed job execution has been silently losing all
+    resident-uploaded evidence since wave 4 introduced `GcsEvidenceStore`."""
+    from setback.evidence.storage import GcsEvidenceStore
+    from setback.job.main import _default_pipeline_factory
+    from setback.job.pipeline import RealPipelineRunner
+
+    runner = _default_pipeline_factory()
+
+    assert isinstance(runner, RealPipelineRunner)
+    assert isinstance(runner._document_source, GcsEvidenceStore)
+
+
 # --- main() ----------------------------------------------------------------
 
 

@@ -13,6 +13,7 @@ import io
 from pathlib import Path
 from typing import Any
 
+import pytest
 from PIL import Image
 
 from setback.evidence.dossier import BoundingBox, RenderedPage, anchor_id_for, render_pdf_pages
@@ -222,9 +223,49 @@ async def test_build_dossier_threads_case_id_into_downloaded_documents() -> None
 
     await runner._build_dossier(case_id, resume)  # noqa: SLF001 -- white-box unit test
 
-    assert len(document_source.requested) == 1
-    assert document_source.requested[0].case_id == case_id
-    assert document_source.requested[0].document_id == "doc-1"
+
+async def test_build_dossier_reports_a_download_failure_instead_of_silently_dropping_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed `document_source.download_document` call degrades the
+    dossier gracefully (the document is simply excluded, exactly as
+    before) but must no longer vanish without a trace -- smoke loop #2
+    found `job.main`'s pipeline factory silently handing the job an
+    always-empty document source for an entire wave with nothing in any
+    log to point at why every evidence-dependent ground kept failing
+    review. A bare `except: continue` here would hide the *next* such
+    wiring regression exactly the same way."""
+
+    class _FailingDocumentSource:
+        async def list_documents(self, da_number: str) -> list[ExhibitedDocument]:
+            return []
+
+        async def download_document(self, document: ExhibitedDocument) -> bytes:
+            raise RuntimeError("simulated: object not found in bucket")
+
+    store = InMemoryCaseStore()
+    case = await store.create_case(application_number=_APPLICATION_NUMBER, resident_session="r-1")
+    case_id = case.case_id
+    await store.append_event(
+        case_id,
+        "document-uploaded:doc-1",
+        "document_uploaded",
+        payload={
+            "document_id": "doc-1",
+            "filename": "elevations.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 1,
+        },
+    )
+    runner = RealPipelineRunner(document_source=_FailingDocumentSource(), grounding_client=None)  # type: ignore[arg-type]
+    resume = await resume_case(store, case_id)
+
+    dossier = await runner._build_dossier(case_id, resume)  # noqa: SLF001 -- white-box unit test
+
+    assert "doc-1" not in dossier.documents
+    err = capsys.readouterr().err
+    assert "doc-1" in err
+    assert "elevations.pdf" in err
 
 
 async def test_load_frozen_ingest_matches_the_checked_in_demo_fixtures() -> None:
