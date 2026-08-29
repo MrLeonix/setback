@@ -94,6 +94,32 @@
     });
   })();
 
+  // ===========================================================================
+  // Wave 12 founder feedback: "the chat keeps expanding vertically as I
+  // send new messages -- it should have a fixed auto height with the
+  // screen". `style.css` bounds `.case-layout__chat` to `calc(100dvh -
+  // var(--header-height) - var(--space-5) * 2)` -- `--header-height` has
+  // to be measured here rather than guessed as a CSS constant because the
+  // header's real rendered height varies (the case-meta line, the QR
+  // code, wrapping at narrow widths): a guess that's too short clips the
+  // pane's own input row/buttons below the fold on first load, and one
+  // that's too tall just leaves visible dead space. Runs unconditionally,
+  // like `initThemeToggle` above -- a harmless no-op on any page (landing,
+  // docket) that has no `.topbar`.
+  // ===========================================================================
+  (function initChatPaneHeight() {
+    const header = document.querySelector(".topbar");
+    if (!header) return;
+    function updateHeaderHeight() {
+      document.documentElement.style.setProperty(
+        "--header-height",
+        `${header.getBoundingClientRect().height}px`
+      );
+    }
+    updateHeaderHeight();
+    window.addEventListener("resize", updateHeaderHeight);
+  })();
+
   const RESIDENT_SESSION_KEY = "setback:resident-session";
 
   // A stable per-browser identifier so revisiting the same DA number from

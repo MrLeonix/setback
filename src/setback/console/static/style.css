@@ -75,6 +75,15 @@
   --space-6: 2rem;
   --space-8: 3rem;
 
+  /* Real `.topbar` height, measured and kept live by app.js's
+     `initChatPaneHeight` (the case-meta line/QR code/wrapping at narrow
+     widths all change it) -- `.case-layout__chat` below subtracts this,
+     not a fixed guess, to size itself to exactly what's left of the
+     viewport under the header. This fallback only matters for the brief
+     window before that JS runs (or with JS disabled), sized to the
+     one-line-header case. */
+  --header-height: 88px;
+
   --radius-sm:   6px;
   --radius:      10px;
   --radius-lg:   16px;   /* wide disruption cards (split/refusal) */
@@ -1645,19 +1654,49 @@ button:hover {
 .case-layout__chat {
   position: sticky;
   top: var(--space-5);
-  max-height: calc(100vh - var(--space-8));
+  /* `height` (not just `max-height`) is load-bearing here: a percentage
+     height on `.chat-card` below only resolves against a *definite*
+     ancestor height, and a flex child's `flex-grow` only fills a
+     *bounded* container -- with `max-height` alone (wave-11) this box's
+     own height stayed auto/content-driven, so an ever-growing transcript
+     just kept pushing this box (and the whole page) taller instead of
+     scrolling internally.
+
+     The subtraction is `var(--header-height)` (app.js-measured real
+     `.topbar` height) plus two `--space-5` gaps -- one above the pane
+     (this `top`), one below it -- NOT the old wave-11 `--space-8` guess:
+     this pane sits in normal document flow *below* the header, not at
+     the viewport top, until the page is scrolled far enough for `top:
+     var(--space-5)` to engage `position: sticky`. Sizing against a
+     constant that ignores the header's real height left the pane taller
+     than the space actually available on first load, pushing its own
+     input row and buttons below the fold (caught live, wave-12 browser
+     QA). `100dvh` (with a `100vh` fallback for browsers that don't parse
+     the `dvh` unit) is the "based on the screen" the founder asked for --
+     it tracks the real visible viewport, mobile browser chrome included. */
+  height: calc(100vh - var(--header-height) - var(--space-5) * 2);
+  height: calc(100dvh - var(--header-height) - var(--space-5) * 2);
+  max-height: calc(100vh - var(--header-height) - var(--space-5) * 2);
+  max-height: calc(100dvh - var(--header-height) - var(--space-5) * 2);
   display: flex;
+  min-height: 0;
 }
 
 .case-layout__chat .chat-card {
   width: 100%;
-  max-height: 100%;
+  height: 100%;
+  min-height: 0;
 }
 
 .case-layout__chat .chat-transcript {
-  flex: 1;
+  flex: 1 1 auto;
   max-height: none;
-  min-height: 220px;
+  /* Flex items default to `min-height: auto`, which resolves to the
+     content's intrinsic height and silently defeats `overflow-y: auto`
+     (the item just grows to fit every message instead of scrolling) --
+     `min-height: 0` is what actually lets this pane's fixed height above
+     cap the transcript and hand the overflow to its own scrollbar. */
+  min-height: 0;
 }
 
 .case-layout__sections {
@@ -1683,6 +1722,11 @@ button:hover {
 
   .case-layout__chat {
     position: static;
+    /* Undoes the desktop `height`/`max-height` pairing above -- single-
+       column mobile has no sticky pane to bound, so the chat card is
+       free to size to its own content again; `.chat-transcript` gets its
+       own bounded `max-height: 50vh` + scroll further down instead. */
+    height: auto;
     max-height: none;
     margin-bottom: var(--space-5);
   }
@@ -2008,6 +2052,7 @@ button:hover {
 @media (max-width: 860px) {
   .case-layout__chat .chat-transcript {
     max-height: 50vh;
+    max-height: 50dvh;
   }
 }
 

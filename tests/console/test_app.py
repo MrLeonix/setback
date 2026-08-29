@@ -1409,6 +1409,111 @@ def test_static_assets_are_served(client: TestClient) -> None:
     assert css.status_code == 200
 
 
+def _css_rule(css_text: str, selector: str, start: int = 0) -> str:
+    """The `{...}` declaration block for `selector`'s first occurrence at
+    or after `start` -- every rule these tests inspect is flat (no
+    nesting), so the first `}` after the opening brace always closes it."""
+    open_brace = css_text.index("{", css_text.index(selector, start))
+    close_brace = css_text.index("}", open_brace)
+    return css_text[open_brace + 1 : close_brace]
+
+
+def test_chat_pane_has_a_real_viewport_bound_height(client: TestClient) -> None:
+    """Wave-12 founder feedback: "the chat keeps expanding vertically as I
+    send new messages -- it should have a fixed auto height with the
+    screen". `max-height` alone (wave-11) never gave this sticky pane a
+    *definite* height, so the percentage/flex sizing below it resolved to
+    nothing and an ever-growing transcript just kept pushing the whole
+    page taller instead of scrolling internally. A real `height` (not
+    just `max-height`), pinned to `dvh` so real (not just large) viewport
+    chrome is accounted for, is what fixes that."""
+    css = client.get("/static/style.css").text
+    rule = _css_rule(css, ".case-layout__chat {")
+    assert "display: flex" in rule
+    assert "height: calc(100dvh" in rule
+    assert "max-height: calc(100dvh" in rule
+    # Not a hardcoded space token: the pane sits below the header in
+    # normal flow (not at the viewport top) until scrolled far enough for
+    # `position: sticky` to engage, so its height must subtract the
+    # header's *real* rendered height (app.js-measured, see below) rather
+    # than a fixed guess -- a fixed guess left the pane taller than the
+    # space actually available and clipped its own input row below the
+    # fold on first load (caught live, wave-12 browser QA).
+    assert "var(--header-height)" in rule
+
+
+def test_header_height_custom_property_has_a_root_fallback(client: TestClient) -> None:
+    """`--header-height` is set live by app.js, but the CSS still needs a
+    sane fallback for the instant before that script runs."""
+    css = client.get("/static/style.css").text
+    root_rule = _css_rule(css, ":root {")
+    assert "--header-height:" in root_rule
+
+
+def test_app_js_measures_the_real_header_height_for_the_chat_pane(client: TestClient) -> None:
+    """The `--header-height` CSS custom property `.case-layout__chat`
+    relies on (test above) has to come from somewhere real: this pins
+    that app.js actually measures `.topbar` and republishes it, on load
+    and on resize (the case-meta line/QR code/wrapping all change the
+    header's height at different viewport widths)."""
+    js = client.get("/static/app.js").text
+    assert '.topbar' in js
+    assert "--header-height" in js
+    assert "addEventListener(\"resize\"" in js
+
+
+def test_chat_card_fills_the_pane_height_for_its_transcript_to_flex_against(
+    client: TestClient,
+) -> None:
+    css = client.get("/static/style.css").text
+    rule = _css_rule(css, ".case-layout__chat .chat-card {")
+    assert "height: 100%" in rule
+    assert "min-height: 0" in rule
+
+
+def test_chat_transcript_min_height_is_zero_so_it_can_actually_shrink_to_scroll(
+    client: TestClient,
+) -> None:
+    """A flex item's default `min-height: auto` resolves to its content's
+    intrinsic height, which silently defeats `overflow-y: auto` -- the
+    transcript would just keep growing to fit every message rather than
+    scrolling inside the fixed-height pane above it. `min-height: 0`
+    overrides that default and is what actually makes the transcript (not
+    the page) the thing that scrolls."""
+    css = client.get("/static/style.css").text
+    rule = _css_rule(css, ".case-layout__chat .chat-transcript {")
+    assert "flex: 1" in rule
+    assert "min-height: 0" in rule
+
+
+def test_mobile_chat_pane_resets_the_desktop_fixed_height(client: TestClient) -> None:
+    """Below the 860px breakpoint the layout stacks to a single column and
+    the chat pane is no longer sticky -- the desktop `height`/
+    `max-height` pairing above must reset to `auto`/`none` there, or a
+    short mobile viewport would clip the (now static-positioned) card
+    instead of letting it size to its own content, per wave-11's existing
+    single-column behaviour."""
+    css = client.get("/static/style.css").text
+    media_start = css.index("@media (max-width: 860px)")
+    rule = _css_rule(css, ".case-layout__chat {", start=media_start)
+    assert "position: static" in rule
+    assert "height: auto" in rule
+    assert "max-height: none" in rule
+
+
+def test_mobile_chat_transcript_stays_bounded_and_scrollable(client: TestClient) -> None:
+    """Wave-11 already bounded the mobile transcript to `50vh` with
+    `overflow-y: auto` inherited from the base `.chat-transcript` rule --
+    this wave adds a `dvh` fallback (same reasoning as the desktop pane)
+    and this test pins that it keeps behaving the same way (internal
+    scroll, pinned input) rather than regressing alongside the desktop
+    fix above."""
+    css = client.get("/static/style.css").text
+    first = css.index(".case-layout__chat .chat-transcript {")
+    rule = _css_rule(css, ".case-layout__chat .chat-transcript {", start=first + 1)
+    assert "50dvh" in rule
+
+
 # --- RealJobTrigger ----------------------------------------------------------
 
 
