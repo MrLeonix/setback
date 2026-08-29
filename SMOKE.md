@@ -1345,3 +1345,92 @@ overlay shot now shows the fix working on the film case's own real stored
 data. Gallery (8 shots) and paste-pack (5 canonical files) are both
 final. Remaining work from here is film-day/founder-only (per STATUS.md's
 wave-6/7 checklists) — no further build-wave agent pass is expected.
+
+---
+
+# SMOKE.md v7 — wave-9 redeploy + live smoke (2026-08-29)
+
+Redeployed `origin/main` at `f1e39ad` (wave-9 founder-feedback round) to
+`australia-southeast1` via `./deploy.sh`. Image
+`...setback:20260829t122149z`; console revision
+**`setback-console-00014-dvx`** (up from `-00013-smf`); tribunal job
+generation **13**. `--session-affinity` confirmed still set
+(`run.googleapis.com/sessionAffinity: "true"` on the deployed service
+annotation, read back via `gcloud run services describe`).
+
+## Live verification (HTTP status codes only, no secret values printed)
+
+| Check | Result |
+|---|---|
+| `GET /` | `200` — public landing, no key required |
+| `GET /docket` (no key) | `401` |
+| `GET /docket?key=<fetched into shell var from Secret Manager `docket-key`, used, unset>` | `200` |
+| `GET /cases/f3f8c3475e2646537212677fbf7c8075` (film case) | `200` |
+| Theme toggle asset | present — `data-theme`/`theme-toggle`/`ThemeToggle` all found in the served markup and `app.js` |
+
+## Browser pass (`chrome-devtools` MCP; one pre-existing tab from an
+earlier session was closed before this pass started, per standing
+security instruction)
+
+- **Landing (`/`)**: matches §1 of `LEO-FEEDBACK-UIUX.md` exactly —
+  centered "Setback" + caption, one highlighted DA-number input, footer
+  copy intact, theme toggle top-right. "YOUR PREVIOUS CASES" localStorage
+  affordance confirmed rendering a link back to a case created earlier in
+  this browser.
+- **Case page, film case (`f3f8c3475e2646537212677fbf7c8075`)**: two-pane
+  layout confirmed (fixed left chat, scrolling right sections with sticky
+  nav — Grounds/Evidence/Overlay/Documents/Tribunal); copy-link + QR code
+  both present in the header.
+- **Duplicate-greeting check — investigated a false alarm, then confirmed
+  the real fix is good**: the film case's own persisted transcript
+  contains **two** greeting-shaped messages ("Welcome! ..." near the top
+  of the transcript and "Hello there! ..." near the bottom, after a
+  closing "Thank you so much..." message). This looked exactly like the
+  regressed bug at first glance, so it was chased down rather than waved
+  through. Root-caused by testing against a **brand-new** case instead:
+  created `DA2026/DEPLOY-QA` (case `17c8dfd977ed5fdcc71fea8fa16393d1`),
+  confirmed exactly one greeting rendered, answered one turn, reloaded
+  the page twice — each reload rendered the full persisted transcript
+  (greeting + resident turn + AI follow-up) with **no duplication and no
+  re-greet**. Conclusion: the fix (`InterviewFlow.resume`, greet only
+  when the stored transcript is empty) is working correctly on this
+  deploy; the film case's own two-greeting transcript is old, baked-in
+  history from a pre-fix wave (that case has been reused across waves
+  3–9 for demo/gallery purposes) and is not evidence of a live
+  regression. Flagged here rather than silently reused for filming: if
+  the film case is kept as the demo case, its transcript still visibly
+  shows this old artifact on the case page and should be either replaced
+  with a fresh case or have the resident-facing transcript view start
+  from the last greeting — a founder/film-day call, not a code defect.
+- **Typing indicator + disabled input**: confirmed live on the new case —
+  sending a turn showed an animated three-dot indicator and the answer
+  input while a reply was pending; the reply arrived, transcript updated,
+  input re-enabled.
+- **Chat bubble asymmetry**: resident turns render as filled, right-
+  aligned blue bubbles; AI turns render as plain left-aligned text —
+  confirmed in both the film case and the new case.
+- **Export transcript** link present and pointed at the correct
+  `/api/cases/{id}/transcript.txt` route.
+
+No browser tooling issue this round (no stale-tab exposure) — the one
+pre-existing tab was closed at the very start, before navigating anywhere
+new.
+
+## Security
+
+No secret value was read, printed, or transmitted — `docket-key`'s value
+was fetched into a shell variable, used once inside a `curl --data-urlencode`
+argument, and `unset` immediately after; only the resulting HTTP status
+code (`200`) was recorded anywhere. No personal identifier or internal
+hostname appears in this file, any command run, or any file touched this
+round. Zero live model calls beyond what the QA browser pass itself
+triggered organically (one real interview turn against the new case,
+which is expected, ordinary product usage of the deployed app, not a
+scripted live-model check).
+
+## Status
+
+Redeploy + live smoke for wave 9 is **green**. `STATUS.md`'s outstanding
+"what remains" items (§10's live docket-repopulation half, §11 Veo, lane D)
+are unchanged by this pass — this pass covered redeploy + verification
+only, per its own scope.
