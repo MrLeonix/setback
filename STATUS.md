@@ -1,3 +1,117 @@
+# STATUS — wave 4 deploy checkpoint: australia-southeast1 (2026-08-29)
+
+Deploy agent's pass over the integration checkpoint below: ran `deploy.sh` against
+`australia-southeast1` (Sydney), verified the new region end-to-end against the named
+`setback-au` Firestore database, executed WP-E's IAM-narrowing commands, and re-verified the
+console-to-job trigger path afterwards. **Does not touch the `us-central1` service/job** —
+per this wave's brief, that stays as-is until a future cutover.
+
+## AU deploy — URLs and revisions (verbatim)
+
+- Image: `australia-southeast1-docker.pkg.dev/vexcourt-agent/setback/setback:20260829t022659z`
+- Console URL: `https://setback-console-v2kz7phkba-ts.a.run.app` (HTTPS, serves the docket
+  board, `200`) — console revision `setback-console-00002-vlk`
+- Tribunal job: `setback-tribunal` (generation 2), region `australia-southeast1`
+- Firestore database: named `setback-au` (already existed in `australia-southeast1`,
+  `FIRESTORE_NATIVE`, created ahead of this pass — not created by this checkpoint)
+- GCS uploads bucket: `vexcourt-agent-setback-au` (`australia-southeast1`, already existed —
+  not created by this checkpoint)
+- Artifact Registry repo `setback` (`australia-southeast1-docker.pkg.dev`) — created by this
+  pass's first `deploy.sh` run, keep-last-3 cleanup policy applied
+
+## Bug found and fixed during verification: frozen-fixture path breaks under a non-editable install
+
+**Symptom**: the first wiring-proof job execution (`setback-tribunal-bd2l6`) failed —
+`[Errno 2] No such file or directory: '/app/.venv/lib/python3.12/tests/fixtures/nsw/
+onlineda_pan-661190.json'`.
+
+**Root cause**: `job/pipeline.py`'s `_FIXTURES_DIR = Path(__file__).resolve().parents[3] /
+"tests" / "fixtures" / "nsw"` (see that module — WP-B's lane, unmodified here) assumes an
+editable/source-tree checkout (`src/setback/job/pipeline.py` → repo root, 3 parents up). The
+Docker image installs the package **non-editable** into the venv (`uv sync --no-editable`
+per the Dockerfile's existing design), so at runtime `__file__` resolves inside
+`/app/.venv/lib/python3.12/site-packages/setback/job/pipeline.py` and `parents[3]` lands on
+`/app/.venv/lib/python3.12` instead of `/app` — and `tests/` was never copied into the image
+at all regardless. This bug predates this wave's region move; it was never caught before
+because no prior deploy checkpoint actually executed the job end-to-end against a built
+image (the wave-3 `SMOKE.md` deployed-environment run was blocked earlier, at the IAM layer,
+before ever reaching this code path).
+
+**Fix applied (Dockerfile only — no source lane's file touched)**: added one `COPY
+tests/fixtures/nsw /app/.venv/lib/python3.12/tests/fixtures/nsw` line, mirroring the frozen
+demo-case fixtures at the exact path the existing (unmodified) `_FIXTURES_DIR` resolution
+already computes for this image's layout. `Dockerfile` has no assigned wave lane (not listed
+under A/B/C/D/E in this wave's brief), so this is the minimal, lane-respecting fix available
+at deploy time; `job/pipeline.py` itself was not touched.
+
+**Follow-up recommended for a future wave (not this checkpoint's lane to make)**: this fix is
+fragile — it hardcodes the venv's internal `lib/python3.12/site-packages` depth, which breaks
+again on any Python version bump or packaging-layout change. `job/pipeline.py`'s
+`_FIXTURES_DIR` should be resolved via a packaged resource (e.g. `importlib.resources`
+against a fixtures package, or an env-var-overridable path) instead of a `parents[N]` climb
+from `__file__`, which is inherently install-mode-dependent. Exact patch owed to WP-B's lane
+(`job/pipeline.py`), not applied here.
+
+## Verification performed
+
+1. **Docket board over HTTPS**: `GET /` on the AU console URL → `200`, correct
+   server-rendered HTML (confirmed via `curl`, neutral `User-Agent: setback/deploy-verify`).
+2. **Seeded case in `setback-au` (not `(default)`)**: `POST /api/cases` against the AU
+   console (which reads `SETBACK_FIRESTORE_DB=setback-au` from its own deploy env) created
+   case `74e4f6b25ef99f386a443090aca1fa46` (`PAN-661190`, a synthetic `resident_session`, no
+   real personal data); confirmed present via the docket board listing. A stray diagnostic
+   `gcloud firestore export` used once to sanity-check the database (before the docket-board
+   listing check above made it redundant) wrote a small temp export into
+   `gs://vexcourt-agent-setback-au/tmp-export-check/` and was deleted immediately after —
+   bucket confirmed empty afterwards.
+3. **Wiring-proof job execution against that case, in `setback-au`**: first attempt failed on
+   the fixture-path bug above; after the Dockerfile fix and a second `deploy.sh` run,
+   `gcloud run jobs execute setback-tribunal --update-env-vars=CASE_ID=...` completed
+   successfully (`setback-tribunal-62kxx`) — real Firestore reads/writes against `setback-au`,
+   real frozen-fixture ingest (Georges River Council / DA2026/0359 / 65A Vista Street parsed
+   correctly), real dispatch/compose output (submission + refusals documents rendered on the
+   case page, empty grounds since this seed case ran no interview — expected, this is a
+   wiring proof, not a full demo run).
+4. **IAM narrowing (WP-E's exact commands, STATUS.md's prior checkpoint)**: confirmed
+   `sa-console` already held the resource-scoped `roles/run.invoker` on `setback-tribunal`
+   (from this wave's `deploy.sh`), then removed the now-redundant project-level
+   `roles/run.jobsExecutorWithOverrides` binding on `sa-console`; confirmed via
+   `gcloud projects get-iam-policy --filter` that `sa-console` now carries only
+   `aiplatform.user`, `cloudtasks.enqueuer`, `cloudtrace.agent`, `datastore.user`,
+   `logging.logWriter` at the project level (no `run.*` override left).
+5. **Job still triggers from the console after IAM narrowing**: `POST
+   /api/cases/{id}/tribunal` against the AU console (`202`) launched a new job execution
+   (`setback-tribunal-fr8lz`) via the console's own `RealJobTrigger`/`sa-console` identity,
+   which completed successfully — confirms the narrower IAM alone is sufficient for the real
+   trigger path, not just a manual `gcloud run jobs execute`.
+
+**Live model calls made by this checkpoint**: 4 — two Cloud Run Job executions
+(`setback-tribunal-62kxx`, `-fr8lz`) each made 2 real `gemini-3.5-flash-lite` (`INTERVIEW`
+tier) calls polishing the submission/refusals document prose (`dispatch/composer.py`'s
+optional polish step, unconditional on ground count); the seed case had zero grounds
+(no interview run), so no reviewer/adjudicator calls fired. Short prompts against short
+template text; cost not separately itemized here but of the same small
+per-call order as WP-E's prior three-call, $0.002378 total live check this wave — well
+inside the $62 ceiling. The first (failed) execution made 0 live calls (it errored during
+ingest, before reaching the polish step).
+
+**Security**: no secret read/printed/transmitted; ADC handled all `gcloud` auth; every
+outbound HTTP call from this checkpoint used a neutral `User-Agent: setback/deploy-verify`;
+the one `resident_session` value used for the seed case (`deploy-verify-au-001`) is a
+synthetic label, not any real identifier; no personal identifier appears in this file, the
+Dockerfile diff, or any command run. `us-central1` was read-only touched (listed, never
+modified) to confirm it was left alone.
+
+**Deviation from the "git for deploy.sh/STATUS.md only" instruction, flagged explicitly**:
+this checkpoint also modified and will commit `Dockerfile` (the fixture-path fix above) —
+`deploy.sh` itself needed no changes (its `australia-southeast1`/`setback-au` defaults were
+already correct, from an earlier work package). `Dockerfile` carries no wave-lane owner, and
+the AU deploy's job-execution requirement was not achievable without this fix, so it is
+included here as the minimal necessary exception rather than left broken or silently
+worked around.
+
+---
+
 # STATUS — wave 4 integration checkpoint (2026-08-29, final for this build wave)
 
 All five wave-4 work packages (A: Firestore `list_cases` + region defaults + config; B: GCS

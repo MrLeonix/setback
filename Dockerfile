@@ -44,6 +44,21 @@ RUN uv sync --frozen --no-dev --no-install-project --no-editable
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 
+# `job/pipeline.py`'s frozen-demo-fixture loader (the one shipped demo
+# case, PAN-661190 -- see that module's docstring) resolves its fixtures
+# directory via `Path(__file__).resolve().parents[3]`, which is correct
+# for an editable/source-tree checkout (`src/setback/job/pipeline.py` ->
+# repo root) but NOT for this image: `uv sync --no-editable` installs the
+# package into the venv's site-packages, so at runtime `__file__` is
+# `/app/.venv/lib/python3.12/site-packages/setback/job/pipeline.py` and
+# `parents[3]` lands on `/app/.venv/lib/python3.12` rather than `/app`.
+# Mirroring the fixtures at that exact resolved path is the minimal
+# deploy-side fix that needs no change to `job/pipeline.py` (out of this
+# change's lane) -- flagged in STATUS.md as a follow-up: `_FIXTURES_DIR`
+# should be resolved via a packaged resource, not a `parents[N]` climb,
+# since the latter is inherently broken under any non-editable install.
+COPY tests/fixtures/nsw /app/.venv/lib/python3.12/tests/fixtures/nsw
+
 # Non-root runtime user. Fixed uid/gid so Cloud Run's filesystem
 # permissions are predictable across rebuilds.
 RUN groupadd --gid 10001 setback \
