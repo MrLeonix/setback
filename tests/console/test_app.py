@@ -521,6 +521,20 @@ def test_docket_board_loads_the_client_script_so_the_create_case_form_renders(
     assert '<script src="/static/app.js"></script>' in response.text
 
 
+def test_docket_board_does_not_hardcode_a_light_theme(client: TestClient) -> None:
+    """`style.css` implements the artifact-style theme contract: an unset
+    `data-theme` on `<html>` follows the system's `prefers-color-scheme`
+    (`:root:not([data-theme="light"])` for the dark override), and an
+    explicit `data-theme="dark"`/`"light"` overrides it either way -- but
+    this app has no theme toggle (confirmed: `app.js` has zero `theme`/
+    `dark` references), so hardcoding `data-theme="light"` on every page
+    permanently defeats system dark mode for every viewer. Confirmed live
+    on the deployed console with `prefers-color-scheme: dark` emulated:
+    the page stayed light (`background-color: rgb(247, 245, 242)`)."""
+    response = client.get("/")
+    assert 'data-theme="light"' not in response.text
+
+
 def test_docket_board_survives_a_fresh_app_instance_over_the_same_store(
     store: InMemoryCaseStore, composer: _FakeComposer
 ) -> None:
@@ -544,6 +558,14 @@ def test_case_page_renders_known_sections(client: TestClient) -> None:
     body_lower = response.text.lower()
     for section in ("interview", "evidence", "reviewer", "adjudication", "gate", "submission"):
         assert section in body_lower
+
+
+def test_case_page_does_not_hardcode_a_light_theme(client: TestClient) -> None:
+    """Same live-confirmed dark-mode bug as `test_docket_board_does_not_
+    hardcode_a_light_theme` above, on the case page's own template."""
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert 'data-theme="light"' not in response.text
 
 
 def test_case_page_unknown_case_is_404(client: TestClient) -> None:
@@ -1077,3 +1099,91 @@ def test_case_page_exposes_zero_run_cost_with_no_ledger(client: TestClient) -> N
     case_id = _create_case(client)
     response = client.get(f"/cases/{case_id}")
     assert 'data-run-cost-usd="0.000000"' in response.text
+
+
+# --- ship-phase smoke fix: three event types were missing from
+# `_EVENT_ITEM_RENDERERS`, falling through `_render_events_section`'s
+# fallback branch and rendering literal `json.dumps(...)` text -- found
+# live on the deployed console (a `tribunal_requested` event rendered as
+# a bare " {}" in the "Tribunal" section), violating founder requirement
+# #3 (zero raw JSON anywhere user-facing). -----------------------------
+
+
+def test_tribunal_requested_event_renders_with_no_raw_json(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(case_id, "tribunal-requested:x", "tribunal_requested", payload={})
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert "{}" not in response.text
+    assert (
+        "{"
+        not in response.text.split('<section class="card"><h3>Tribunal</h3>')[1].split(
+            "</section>"
+        )[0]
+    )
+    assert "Tribunal run started" in response.text
+
+
+def test_adjudication_decision_event_renders_with_no_raw_json(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "adjudication:ground-1",
+            "adjudication_decision",
+            payload={
+                "ground_id": "ground-1",
+                "outcome": "resolved",
+                "stance": "supports",
+                "confidence": 0.82,
+                "cited_anchor_ids": ["anchor-1"],
+                "rationale": "Both reviewers agreed the shadow diagram supports the claim.",
+                "source": "adjudicated",
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    # Bare field-name substrings, so this catches the leak whether or not
+    # `_esc`'s `html.escape` has turned the surrounding quotes into
+    # `&quot;` -- a browser renders escaped JSON as readable JSON text just
+    # the same, which is exactly what founder requirement #3 forbids.
+    assert "cited_anchor_ids" not in response.text
+    section = response.text.split('<section class="card"><h3>Adjudication</h3>')[1].split(
+        "</section>"
+    )[0]
+    assert "{" not in section
+    assert "Both reviewers agreed the shadow diagram supports the claim." in response.text
+
+
+def test_resident_refusal_feedback_event_renders_with_no_raw_json(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "refusal-feedback:ground-1:x",
+            "resident_refusal_feedback",
+            payload={
+                "ground_id": "ground-1",
+                "pushback": "I still think this should count.",
+                "original_explanation": "Property value is not a s4.15(1) matter.",
+                "re_rendered_explanation": "I hear you -- but property value still isn't "
+                "a matter s4.15(1) lets us weigh, so it can't be included. Your "
+                "disagreement is on record.",
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert "re_rendered_explanation" not in response.text
+    assert "original_explanation" not in response.text
+    assert "I still think this should count." in response.text
+    assert "Your disagreement is on record." in response.text

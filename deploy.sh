@@ -113,6 +113,14 @@ gcloud builds submit \
 # can never silently inherit a stale secret reference from the prior
 # revision's template.
 log "Deploying Cloud Run service ${CONSOLE_SERVICE}"
+# `--session-affinity`: best-effort cookie-based routing that prefers sending
+# a given browser session's requests back to the same instance, mitigating
+# (NOT eliminating) the console's in-process `interview_flows` state hazard
+# under `--max-instances=3` (see STATUS.md's "Multi-instance state hazard"
+# note). It is not a substitute for durable, persisted interview state: it
+# gives no guarantee on cold start, instance scale-down/eviction, or a
+# revision rollout, so `GET /interview` can still, rarely, hit a fresh
+# instance with no in-memory `InterviewFlow` for an existing case.
 gcloud run deploy "${CONSOLE_SERVICE}" \
   --project="${PROJECT_ID}" \
   --region="${REGION}" \
@@ -120,6 +128,7 @@ gcloud run deploy "${CONSOLE_SERVICE}" \
   --service-account="${CONSOLE_SA}" \
   --min-instances=0 \
   --max-instances=3 \
+  --session-affinity \
   --cpu-throttling \
   --port=8080 \
   --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID},SETBACK_FIRESTORE_DB=${FIRESTORE_DB},SETBACK_GCS_UPLOADS_BUCKET=${GCS_UPLOADS_BUCKET}" \

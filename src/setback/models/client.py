@@ -96,6 +96,20 @@ class ModelResult[T]:
     model: str
 
 
+_MAAS_PUBLISHER = "google"
+"""Vertex's OpenAI-compatible endpoint requires a publisher-qualified model
+id (``<publisher>/<model>``) -- a bare id like ``gemma-4-26b-a4b-it-maas``
+400s with "Malformed publisher model ... expected '<publisher>/<model>'".
+`config.CLERK.model` and `ModelResult.model` deliberately stay unqualified
+(the ledger's pricing table keys on the bare id); only the outgoing
+payload needs the ``google/`` prefix."""
+
+
+def _maas_publisher_model(model: str) -> str:
+    """The publisher-qualified model id Vertex's MaaS endpoint requires."""
+    return f"{_MAAS_PUBLISHER}/{model}"
+
+
 def _maas_base_url(project: str, location: str) -> str:
     """The Vertex OpenAI-compatible endpoint base URL for `project`/`location`."""
     if location == "global":
@@ -274,7 +288,7 @@ class ModelClient:
         messages.append({"role": "user", "content": f"{prompt}\n\n{schema_hint}"})
 
         payload: dict[str, object] = {
-            "model": tier.model,
+            "model": _maas_publisher_model(tier.model),
             "messages": messages,
             "response_format": {"type": "json_object"},
         }

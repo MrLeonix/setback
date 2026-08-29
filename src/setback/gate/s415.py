@@ -15,30 +15,33 @@ Sourcing
 --------
 The primary source, https://legislation.nsw.gov.au/view/html/inforce/current/act-1979-203,
 returned ``HTTP 403 Forbidden`` (Cloudflare bot-protection challenge) on every
-attempt on 2026-08-29, including via a headless-render proxy, both for the
-Angular single-page HTML view and the PDF endpoint. AustLII
+curl/httpx attempt on 2026-08-29, including via a headless-render proxy, both
+for the Angular single-page HTML view and the PDF endpoint. AustLII
 (austlii.edu.au / classic.austlii.edu.au) was likewise 403-blocked with a bot
-challenge on the same date.
+challenge on the same date. The wording below was originally sourced instead
+from a Georges River-adjacent council's own business paper (Bathurst Regional
+Council, Ordinary Council Meeting business paper, 17 April 2024, item
+"9.2.1 Section 4.15 of the Environmental Planning and Assessment Act 1979").
 
-The verbatim wording below was instead sourced from a Georges River-adjacent
-council's own business paper, which quotes s4.15(1) directly from the
-in-force Act for its councillors:
+**Resolved 2026-08-29 (wave-5 ship phase)**: loading the primary source
+through a real, non-headless browser session (which the Cloudflare challenge
+does not block) succeeded where curl/httpx did not. The in-force text of
+s4.15(1)(b), read directly from
+https://legislation.nsw.gov.au/view/html/inforce/current/act-1979-203#sec.4.15
+on that date, is:
 
-    Bathurst Regional Council, Ordinary Council Meeting business paper,
-    17 April 2024, item "9.2.1 Section 4.15 of the Environmental Planning
-    and Assessment Act 1979" — accessed 2026-08-29.
-    https://www.bathurst.nsw.gov.au/files/content/public/v/1/minutes-and-agendas/17-april-2024/17-april-2024/reports/9.2.1-section-4.15-of-the-environmental-planning-and-assessment-act-1979/9-2-1-section-4-15-of-the-environmental-planning-and-ass.pdf
+    (b)  the significant likely impacts of that development, including
+    environmental impacts on both the natural and built environments, and
+    social and economic impacts in the locality,
 
-**Pending amendment (not encoded here)**: per HWL Ebsworth, "Major reforms
-confirmed for the NSW planning system" (14 November 2025), a Bill passed the
-NSW Parliament on 11 November 2025 that would insert "significant" before
-"likely impacts" in s4.15(1)(b) (a "proportionate and risk-based" narrowing).
-As at the date this module was written the Bill was reported as awaiting
-assent with no commencement date confirmed by any source this module's
-author could reach. The wording below is the current, unamended text.
-**If that amendment has since commenced, `ENVIRONMENTAL_AND_SOCIAL_IMPACTS`
-below is stale and should be updated** — this is a known gap for the
-integrator, not an oversight.
+This confirms the amendment flagged as "pending" in the previous revision of
+this module's docstring — inserting "significant" before "likely impacts",
+per HWL Ebsworth's 14 November 2025 report of the Bill that passed NSW
+Parliament on 11 November 2025 — **has now commenced**. `PLANNING_HEADS[
+"environmental_and_social_impacts"]` below has been updated to the current,
+amended wording accordingly; the rest of s4.15(1) (paragraphs (a), (c), (d),
+(e)) is unaffected by this amendment and unchanged from the previously
+sourced text.
 """
 
 from __future__ import annotations
@@ -94,13 +97,13 @@ PLANNING_HEADS: dict[str, RelevanceRuling] = {
         category="environmental_and_social_impacts",
         relevant=True,
         explanation=(
-            "This ground describes a likely impact of the proposed development itself — on "
-            "the natural environment (e.g. trees, drainage, habitat), the built environment "
-            "(e.g. overshadowing, privacy, streetscape), or the social or economic character "
-            "of the locality. Section 4.15(1)(b) requires the consent authority to consider "
-            "exactly this: 'the likely impacts of that development, including environmental "
-            "impacts on both the natural and built environments, and social and economic "
-            "impacts in the locality'."
+            "This ground describes a significant likely impact of the proposed development "
+            "itself — on the natural environment (e.g. trees, drainage, habitat), the built "
+            "environment (e.g. overshadowing, privacy, streetscape), or the social or "
+            "economic character of the locality. Section 4.15(1)(b) requires the consent "
+            "authority to consider exactly this: 'the significant likely impacts of that "
+            "development, including environmental impacts on both the natural and built "
+            "environments, and social and economic impacts in the locality'."
         ),
         statutory_basis=f"{ACT_CITATION} s4.15(1)(b)",
     ),

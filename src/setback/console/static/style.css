@@ -1302,8 +1302,18 @@ button:hover {
 }
 
 .summary-list {
+  /* Two columns (key, value) -- `_render_check_answers_section` (app.py)
+     emits exactly one global "Change something" link *after* the `<dl>`,
+     never a per-row action cell, so a third `max-content` column here was
+     a mismatch with the real DOM: `.summary-list__row { display: contents }`
+     flattens each row's two children (`dt`, `dd`) straight into the grid,
+     and against a 3-column template that desyncs every row after the
+     first -- confirmed live on the deployed check-answers screen ("Ground
+     2"'s label landing in row 1's third column, its answer text forced
+     into a narrow max-content column of its own on row 2, wildly
+     overflowing the card). Fixed to match the actual 2-cells-per-row DOM. */
   display: grid;
-  grid-template-columns: max-content 1fr max-content;
+  grid-template-columns: max-content 1fr;
   gap: var(--space-2) var(--space-4);
   margin: 0 0 var(--space-4);
 }

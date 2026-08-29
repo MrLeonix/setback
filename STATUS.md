@@ -1,3 +1,45 @@
+# STATUS — wave 5 ship-phase checkpoint: redeploy + UI smoke + proof run (2026-08-29)
+
+Ship-phase pass following the wave-5 UI-revamp integration checkpoint below: redeployed
+the console twice (Gemma/session-affinity fixes, then three UI bugs this smoke loop
+found), ran a full UI smoke against the deployed `australia-southeast1` console with a
+real browser, resolved the outstanding s4.15(1)(b) legislative-wording question, captured
+THE PROOF RUN (one unbroken live tribunal run: overshadowing SHIPPED with citations,
+property-value REFUSED with the correct statutory wording), and replaced the gallery with
+8 real screenshots. Full detail — every finding, every fix, every test, the live-budget
+accounting, and the gallery-shot honesty notes — is in `SMOKE.md`'s "SMOKE.md v3" section;
+this entry is a pointer plus the headline items.
+
+## Closed this checkpoint (see SMOKE.md v3 for full detail)
+
+- **Gemma publisher-qualified model id** (`models/client.py`) — the wave-4 P0 carry-
+  forward that survived wave 5's UI lanes untouched (`STATUS.md`'s wave-5 section flagged
+  it as unclaimed). Fixed with a `google/`-prefixed payload model id; verified with
+  exactly one live Gemma call (`SUCCESS answer='ok' ...`).
+- **`--session-affinity`** added to `deploy.sh`'s console deploy, with the tradeoff
+  documented inline (mitigates steady-state routing only, not cross-redeploy instance
+  loss — reconfirmed live, see SMOKE.md v3's "multi-instance hazard" section).
+- **s4.15(1)(b) "significant likely impacts" amendment confirmed commenced** — read live
+  via a real (non-headless) browser session against `legislation.nsw.gov.au`, which
+  defeats the Cloudflare block that stopped every prior curl/httpx attempt. `gate/s415.py`
+  updated to the current wording.
+- **Three raw-JSON leaks found live** (`tribunal_requested`, `adjudication_decision`,
+  `resident_refusal_feedback` — missing from `console/app.py`'s `_EVENT_ITEM_RENDERERS`,
+  falling through to a literal `json.dumps` dump) — fixed with three new plain-English
+  renderers, closing founder requirement #3 completely (wave 5's own checkpoint below had
+  only closed two of five such gaps).
+- **Check-answers summary-list grid bug** (`style.css`) — a 3-column grid template against
+  a 2-cells-per-row DOM scrambled every row after the first; fixed to a 2-column template.
+- **Dark mode was unconditionally disabled** — both page templates hardcoded
+  `data-theme="light"` on `<html>`, defeating `style.css`'s otherwise-correct
+  `prefers-color-scheme` support with no compensating theme-toggle feature anywhere in
+  `app.js`. Fixed by leaving `<html>` bare.
+
+Test count: **480 passed** (up from 474 at the wave-5 integration checkpoint), ruff
+check/format clean, mypy clean. Deployed, smoked, gallery replaced, pushed.
+
+---
+
 # STATUS — wave 5 integration checkpoint: UI revamp (2026-08-29)
 
 Integrator's reconciliation pass over wave 5 (UI revamp, per `UI-SPEC.md`), which ran as

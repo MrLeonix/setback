@@ -276,6 +276,39 @@ async def test_generate_routes_clerk_tier_through_maas_openai_endpoint() -> None
 
 
 @respx.mock
+async def test_generate_sends_publisher_qualified_model_id_to_maas_payload() -> None:
+    """Vertex's OpenAI-compatible endpoint 400s on a bare model id
+    ("Malformed publisher model (`model`: gemma-4-26b-a4b-it-maas) ...
+    expected '<publisher>/<model>'") -- the payload must carry the
+    publisher-qualified form, even though `config.CLERK.model` and
+    `ModelResult.model` (used for ledger cost lookup) stay unqualified."""
+    url = _maas_base_url("test-project", "global") + "/chat/completions"
+    route = respx.post(url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"answer": "ok"}'}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+    )
+    client = ModelClient(
+        project="test-project",
+        location="global",
+        token_provider=lambda: "fake-token",
+    )
+
+    result = await client.generate(CLERK, "hello", SampleOutput)
+
+    import json as _json
+
+    body = _json.loads(route.calls.last.request.content.decode())
+    assert body["model"] == "google/gemma-4-26b-a4b-it-maas"
+    # The unqualified id is still what ledger.cost_for's pricing table keys on.
+    assert result.model == "gemma-4-26b-a4b-it-maas"
+
+
+@respx.mock
 async def test_generate_passes_explicit_temperature_to_maas_payload() -> None:
     url = _maas_base_url("test-project", "global") + "/chat/completions"
     route = respx.post(url).mock(

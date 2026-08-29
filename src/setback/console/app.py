@@ -743,7 +743,7 @@ def render_docket_board(cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ..
         rows = '<p class="empty">No cases yet -- create one to get started.</p>'
     return f"""
 <!doctype html>
-<html data-theme="light">
+<html>
 <head>
   <meta charset="utf-8">
   <title>Setback -- Docket Board</title>
@@ -972,12 +972,68 @@ def _render_interview_turn_item(_case_id: str, event: CaseEvent) -> str:
     return f"<li>{bubble}</li>"
 
 
+def _render_tribunal_requested_item(event: CaseEvent) -> str:
+    """A `tribunal_requested` marker event carries an empty payload (`{}`)
+    by design (`start_tribunal` in this module) -- it exists only to mark
+    a run's start time for the concurrency guard, so there is no field to
+    show beyond that. Found live on the deployed console rendering as a
+    bare `{}` before this fix (fallthrough to the raw-JSON branch below),
+    violating founder requirement #3."""
+    started_at = _format_clock_time(event.recorded_at)
+    return f'<li class="tribunal-event">Tribunal run started at {_esc(started_at)}.</li>'
+
+
+_ADJUDICATION_STANCE_LABELS: Mapping[str, str] = {
+    "support": "supports this ground",
+    "reject": "does not support this ground",
+}
+"""`ReviewStance` value -> plain-English verdict phrase, mirroring
+`_DOCUMENT_KIND_LABELS`' rule that a raw enum value is never shown."""
+
+
+def _render_adjudication_decision_item(event: CaseEvent) -> str:
+    """The adjudicator's final call on a contested ground -- reached the
+    raw-JSON fallback branch before this fix, the same live bug class as
+    `tribunal_requested` above."""
+    payload = event.payload
+    stance = str(payload.get("stance", ""))
+    stance_label = _ADJUDICATION_STANCE_LABELS.get(stance, stance)
+    confidence = payload.get("confidence")
+    confidence_pct = f"{float(confidence) * 100:.0f}%" if confidence is not None else "unknown"
+    rationale = str(payload.get("rationale", ""))
+    return (
+        '<li class="adjudication-decision">'
+        f"<strong>Adjudicator</strong> {_esc(stance_label)} "
+        f"(confidence {_esc(confidence_pct)})"
+        f"<br><em>{_esc(rationale)}</em></li>"
+    )
+
+
+def _render_resident_refusal_feedback_item(event: CaseEvent) -> str:
+    """The resident's recorded pushback on a refusal, and Setback's
+    acknowledging restatement (`interview.flow.capture_refusal_feedback`)
+    -- reached the raw-JSON fallback branch before this fix, the same live
+    bug class as `tribunal_requested`/`adjudication_decision` above."""
+    payload = event.payload
+    pushback = str(payload.get("pushback", ""))
+    re_rendered = str(payload.get("re_rendered_explanation", ""))
+    return (
+        '<li class="refusal-feedback">'
+        f'<p class="refusal-feedback__pushback">&ldquo;{_esc(pushback)}&rdquo;</p>'
+        f'<p class="refusal-feedback__response">{_esc(re_rendered)}</p>'
+        "</li>"
+    )
+
+
 _EVENT_ITEM_RENDERERS: Mapping[str, Callable[[str, CaseEvent], str]] = {
     "review_verdict": lambda _case_id, e: _render_review_verdict_item(e),
     "annotated_overlay": lambda _case_id, e: _render_annotated_overlay_item(e),
     "submission_composed": _render_submission_composed_item,
     "document_uploaded": _render_document_uploaded_item,
     "interview_turn": _render_interview_turn_item,
+    "tribunal_requested": lambda _case_id, e: _render_tribunal_requested_item(e),
+    "adjudication_decision": lambda _case_id, e: _render_adjudication_decision_item(e),
+    "resident_refusal_feedback": lambda _case_id, e: _render_resident_refusal_feedback_item(e),
 }
 """Event types rendered via the `(case_id, event) -> html` shape. `gate_
 decision` is deliberately absent -- it needs the case's full grounds list
@@ -1154,7 +1210,7 @@ def render_case_page(
 
     return f"""
 <!doctype html>
-<html data-theme="light">
+<html>
 <head>
   <meta charset="utf-8">
   <title>Setback -- {_esc(case.application_number)}</title>
