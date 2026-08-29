@@ -202,6 +202,61 @@ def test_build_overlay_boxes_on_empty_input_returns_empty_list() -> None:
     assert build_overlay_boxes([], {}) == []
 
 
+# --- build_overlay_boxes: box cap (founder requirement #2, wave 9) ----------
+#
+# Live-reported ("meaningless mid-house boxes"): nothing capped how many
+# boxes a page could carry. A real page grounds a handful of elements today,
+# but nothing stopped a future page (a richer fixture, a more generous
+# labels list) from drawing dozens of boxes at once -- illegible regardless
+# of colour/label correctness. `max_boxes` is a hard ceiling; when trimming
+# is needed, a *decided* box (the resident's actual answer: shipped/
+# flagged/refused) is always kept over a neutral, not-yet-decided
+# `EVIDENCE_ANCHOR` -- a box with a real outcome to report is more relevant
+# to a resident than one still waiting on a verdict.
+
+
+def test_build_overlay_boxes_caps_the_total_at_max_boxes() -> None:
+    elements = [_element(f"a{i}", ground_id=None) for i in range(12)]
+    boxes = build_overlay_boxes(elements, {}, max_boxes=8)
+    assert len(boxes) == 8
+
+
+def test_build_overlay_boxes_default_cap_is_generous_enough_for_a_real_page() -> None:
+    """The production fixture (5 grounded elements) must never be trimmed by
+    the *default* cap -- this pins the default high enough that today's
+    real pages are unaffected, only a genuine overload is."""
+    elements = [_element(f"a{i}", ground_id=None) for i in range(5)]
+    assert len(build_overlay_boxes(elements, {})) == 5
+
+
+def test_build_overlay_boxes_cap_keeps_decided_boxes_over_neutral_ones() -> None:
+    elements = [
+        _element("neutral-1", ground_id=None),
+        _element("neutral-2", ground_id=None),
+        _element("neutral-3", ground_id=None),
+        _element("shipped", ground_id="g-shipped"),
+        _element("refused", ground_id="g-refused"),
+    ]
+    status = {"g-shipped": GateStatus.SHIPPED, "g-refused": GateStatus.REFUSED_IRRELEVANT}
+    boxes = build_overlay_boxes(elements, status, max_boxes=2)
+    kept_ids = {b.anchor_id for b in boxes}
+    assert kept_ids == {"shipped", "refused"}
+
+
+def test_build_overlay_boxes_cap_preserves_relative_order_within_each_group() -> None:
+    elements = [
+        _element("shipped-1", ground_id="g-shipped-1"),
+        _element("neutral-1", ground_id=None),
+        _element("shipped-2", ground_id="g-shipped-2"),
+        _element("neutral-2", ground_id=None),
+    ]
+    status = {"g-shipped-1": GateStatus.SHIPPED, "g-shipped-2": GateStatus.SHIPPED}
+    boxes = build_overlay_boxes(elements, status, max_boxes=3)
+    # Both decided boxes are kept (in their original relative order), then
+    # the cap's one remaining slot goes to the first neutral box in order.
+    assert [b.anchor_id for b in boxes] == ["shipped-1", "shipped-2", "neutral-1"]
+
+
 # --- colour discipline: the overlay's own palette must equal the app's ----------
 
 
@@ -329,6 +384,81 @@ def test_render_semantic_overlay_at_a_real_pdf_pages_dpi_draws_inside_the_image_
     # box's colour -- guards against a degenerate transform that paints the
     # whole canvas or clamps every box to one corner.
     assert image.getpixel((5, 5)) != OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED]
+
+
+# --- render_semantic_overlay: never draw a page-spanning box (founder ------
+# requirement #1, wave 9) ----------------------------------------------------
+#
+# Live-reported: "one huge page-wide box" on the film case's overlay -- the
+# founder's own diagnosis was a page/document-level anchor being drawn as a
+# box, which `AnchoredElement.bbox` (a required, non-optional `BoundingBox`)
+# already makes impossible to construct in the first place -- there is no
+# code path that can build an `AnchoredElement` *for* a page-level anchor
+# (`bbox=None` in the dossier's own anchor manifest) at all. This is
+# defense-in-depth for the same product requirement at the geometry layer:
+# even a *legitimately grounded* box should never be allowed to swallow
+# almost the entire page (a plausible mis-grounding outcome this module has
+# no control over, e.g. a model returning `[0, 0, 1000, 1000]`) -- such a
+# box is drawn nowhere near as useful as it is misleading, and must never
+# render, regardless of why it happened to have that shape.
+
+
+def test_render_semantic_overlay_never_draws_a_box_spanning_almost_the_whole_page() -> None:
+    page = _page((400, 300))
+    # A box covering >90% of both the page's width and height -- exactly
+    # the shape a mis-grounded "whole document" box would take.
+    huge_box = OverlayBox(
+        anchor_id="huge",
+        bbox=BoundingBox(x0=5, y0=5, x1=395, y1=295),
+        role=OverlayRole.SUPPORTS_SHIPPED,
+        color=OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED],
+        label="a mis-grounded whole-page box",
+    )
+    blank_bytes = render_semantic_overlay(page, [])
+    huge_bytes = render_semantic_overlay(page, [huge_box])
+    # Nothing was drawn: the huge box's own presence must not change a
+    # single pixel relative to drawing no boxes at all.
+    blank = Image.open(io.BytesIO(blank_bytes)).convert("RGB")
+    result = Image.open(io.BytesIO(huge_bytes)).convert("RGB")
+    assert ImageChops.difference(blank, result).getbbox() is None
+
+
+def test_render_semantic_overlay_still_draws_a_legitimately_large_but_thin_box() -> None:
+    """A real annotation can legitimately span almost the full *width* of a
+    page while staying visually thin (e.g. a height-limit datum line, or
+    the quality-bar reference's own wide labelled lines) -- the guard must
+    key on covering the page's *area*, not merely one dimension, so this
+    real, useful pattern is never suppressed alongside the degenerate case
+    above."""
+    page = _page((400, 300))
+    wide_thin_box = OverlayBox(
+        anchor_id="datum-line",
+        bbox=BoundingBox(x0=5, y0=145, x1=395, y1=155),  # spans ~98% width, ~3% height
+        role=OverlayRole.SUPPORTS_SHIPPED,
+        color=OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED],
+        label="9m height limit datum line",
+    )
+    png_bytes = render_semantic_overlay(page, [wide_thin_box])
+    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    # The box's own outline colour must appear somewhere on the drawn page.
+    assert OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED] in image.getdata()
+
+
+def test_render_semantic_overlay_draws_a_box_covering_most_of_one_axis_but_not_the_other() -> None:
+    """A box big along one axis and small along the other (a tall, narrow
+    corner-window box, say) must still render -- the guard is on *area*
+    coverage, not "is this box unusually large on some axis"."""
+    page = _page((400, 300))
+    tall_box = OverlayBox(
+        anchor_id="tall",
+        bbox=BoundingBox(x0=180, y0=5, x1=220, y1=295),  # ~10% width, ~97% height
+        role=OverlayRole.SUPPORTS_SHIPPED,
+        color=OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED],
+        label="a tall corner window",
+    )
+    png_bytes = render_semantic_overlay(page, [tall_box])
+    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    assert OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED] in image.getdata()
 
 
 # --- label chip word spacing (SMOKE.md wave-6 live finding) -----------------
@@ -466,3 +596,86 @@ def test_render_semantic_overlay_draws_a_measurably_taller_chip_on_a_wider_page(
     wide_page_chip_height = _chip_height_px(1600)
     assert wide_page_chip_height > small_page_chip_height
     assert wide_page_chip_height >= 18
+
+
+# --- adjacent chips must not overlap into unreadable run-on text (wave 9, --
+# founder live finding) -------------------------------------------------------
+#
+# Reproduced live re-rendering the film case's own real anchors at
+# production's stored width: three window boxes sitting side by side on the
+# same elevation drew three status-suffixed chips ("window W.1 -- cited by
+# a refused ground", etc.) that overlapped into a single illegible run
+# ("window W.1 -- ciwindow W.2 -- citwindow W.3 -- cited by a refused
+# ground") -- exactly the founder's "unreadable labels" report, and
+# independent of *which* ground/status produced the caption text. Each
+# chip must never overlap a chip already drawn for an earlier box.
+
+
+def test_draw_label_chip_avoiding_a_previous_chip_does_not_overlap_it() -> None:
+    image = Image.new("RGB", (500, 200), color=(255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    first_rect = _draw_label_chip(
+        draw, 10.0, 120.0, "window W.1 -- cited by a refused ground", (0, 0, 0)
+    )
+    second_rect = _draw_label_chip(
+        draw, 60.0, 120.0, "window W.2 -- cited by a refused ground", (0, 0, 0), avoid=[first_rect]
+    )
+
+    def _overlaps(
+        a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+    ) -> bool:
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        return not (ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0)
+
+    assert not _overlaps(first_rect, second_rect)
+
+
+def test_render_semantic_overlay_staggers_overlapping_chips_instead_of_merging_them() -> None:
+    """End-to-end: three boxes close enough together, with long enough
+    captions, that every pair's natural chip width collides -- exactly the
+    live film-case reproduction above -- `render_semantic_overlay` itself
+    (not just the lower-level helper) must stack them at different heights
+    rather than paint one chip's rectangle over another's, which is what
+    produced the live "window W.1 -- ciwindow W.2 -- cit..." run-on.
+
+    Asserted by the pixel-observable consequence of stacking: three
+    genuinely stacked chips occupy noticeably more total vertical extent
+    above the boxes than a single chip's own height -- a same-row merge (the
+    bug) stays confined to one chip-height band regardless of how many
+    labels were drawn into it.
+    """
+    page = _page((900, 300))
+    boxes = [
+        OverlayBox(
+            anchor_id=f"a{i}",
+            bbox=BoundingBox(x0=x0, y0=50, x1=x0 + 60, y1=110),
+            role=OverlayRole.ANCHOR_OF_REFUSED,
+            color=OVERLAY_COLOR[OverlayRole.ANCHOR_OF_REFUSED],
+            label=f"window W.{i} — cited by a refused ground",
+        )
+        for i, x0 in enumerate((10, 90, 170), start=1)
+    ]
+    png_bytes = render_semantic_overlay(page, boxes)
+    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    chip_color = OVERLAY_COLOR[OverlayRole.ANCHOR_OF_REFUSED]
+
+    # The boxes themselves sit in the bottom half of the page (page-points
+    # y in [50, 110] on a 300pt-tall, 72-dpi page -> top-down pixel rows
+    # [190, 250]); restrict the scan to strictly above that band so only
+    # chip pixels (never a box's own 4px outline) are counted.
+    box_top_px = 190
+    single_chip_height = (
+        _label_font_size_for_width(image.width) + 2 * 4
+    )  # font size + padding, rough floor
+    chip_rows = {
+        y
+        for y in range(0, box_top_px)
+        if any(image.getpixel((x, y)) == chip_color for x in range(image.width))
+    }
+    assert chip_rows, "no chip pixels drawn at all"
+    extent = max(chip_rows) - min(chip_rows)
+    assert extent > single_chip_height * 1.5, (
+        "chips stayed within one chip-height band -- they were merged/overwritten "
+        "in place rather than stacked at distinct heights"
+    )

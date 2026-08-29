@@ -62,6 +62,21 @@ size_for_width` sizes the chip font as a ratio of whatever image
 therefore the readable size) survives any later *uniform* resize a caller
 applies, without this module needing to know that resize ever happens.
 
+**Full-resolution output, by contract (wave 9 requirement: a click-to-open
+high-res variant).** `render_semantic_overlay` always returns a PNG at
+exactly its input `page`'s own full-resolution dimensions (pinned by
+`test_render_semantic_overlay_returns_a_png_matching_the_source_dimensions`)
+-- it never shrinks its own output. `job/pipeline.py::_shrink_png_for_storage`
+downscaling that same return value for Firestore's document-size limit is
+a separate, caller-applied step over an *already-full-resolution* image,
+not something this module does or needs to know about. In other words:
+the full-res bytes this module guarantees already exist at every call
+site, in full, before any shrink -- a lightbox/click-to-open feature needs
+a place to *persist and serve* that pre-shrink return value (this module
+has no storage or routing of its own, out of its lane), not a new render
+path here. See `notesForOrchestrator` for the exact one-line integration
+point this implies in `job/pipeline.py`.
+
 **Lane boundary.** Input is deliberately narrow: a
 :class:`~setback.evidence.dossier.RenderedPage`, a sequence of
 :class:`AnchoredElement` (this module's own minimal join of an anchor's
@@ -203,10 +218,36 @@ def label_for(element: AnchoredElement, role: OverlayRole) -> str:
     return caption
 
 
+DEFAULT_MAX_OVERLAY_BOXES: Final[int] = 8
+"""Hard ceiling on how many boxes one overlay ever draws (founder
+requirement #2, wave 9: "cap the box count -- pick a sensible N, e.g. 6-8,
+keep most-relevant"). Chosen at the top of that range: generous enough that
+today's real fixture (5 grounded elements) is never trimmed (see
+`test_build_overlay_boxes_default_cap_is_generous_enough_for_a_real_page`),
+while still bounding a future page that grounds far more elements than a
+resident could usefully read at once."""
+
+
 def build_overlay_boxes(
-    elements: Sequence[AnchoredElement], ground_status: Mapping[str, GateStatus]
+    elements: Sequence[AnchoredElement],
+    ground_status: Mapping[str, GateStatus],
+    *,
+    max_boxes: int = DEFAULT_MAX_OVERLAY_BOXES,
 ) -> list[OverlayBox]:
-    """Classify and label every element in `elements`, in order."""
+    """Classify and label every element in `elements`, then cap the result
+    at `max_boxes`.
+
+    "Most-relevant" (the cap's own tie-break rule) means: a box with a real,
+    decided outcome to report -- shipped, flagged, or cited by a refused
+    ground -- is always kept ahead of a neutral `EVIDENCE_ANCHOR` (grounded,
+    but not yet tied to any decided ground) once the ceiling is reached. A
+    resident gains far more from seeing what happened to five decided
+    elements than from six one of which is still an undecided grey box.
+    Every decided box sorts ahead of every neutral one in the returned
+    list once trimming happens; within each of those two groups, original
+    input order is preserved -- the cap trims from the *back* of each
+    group, it never otherwise reorders what survives.
+    """
     boxes: list[OverlayBox] = []
     for element in elements:
         role = classify_role(element, ground_status)
@@ -219,7 +260,15 @@ def build_overlay_boxes(
                 label=label_for(element, role),
             )
         )
-    return boxes
+    if len(boxes) <= max_boxes:
+        return boxes
+
+    decided = [b for b in boxes if b.role is not OverlayRole.EVIDENCE_ANCHOR]
+    neutral = [b for b in boxes if b.role is OverlayRole.EVIDENCE_ANCHOR]
+    kept_decided = decided[:max_boxes]
+    remaining_slots = max_boxes - len(kept_decided)
+    kept_neutral = neutral[:remaining_slots] if remaining_slots > 0 else []
+    return [*kept_decided, *kept_neutral]
 
 
 # --- geometry (page points, origin bottom-left -> full-res top-down pixels) ---
@@ -330,6 +379,21 @@ def _label_font_size_for_width(width_px: int) -> int:
     return max(_LABEL_FONT_MIN_SIZE_PX, round(width_px * _LABEL_FONT_WIDTH_RATIO))
 
 
+_ChipRect = tuple[float, float, float, float]
+
+
+def _rects_overlap(a: _ChipRect, b: _ChipRect) -> bool:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return not (ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0)
+
+
+_CHIP_STACK_GAP_PX: Final[int] = 3
+"""Extra vertical gap `_draw_label_chip` opens between two chips it stacks
+to avoid a collision -- purely cosmetic breathing room so two stacked
+chips read as visibly separate labels rather than merely touching edges."""
+
+
 def _draw_label_chip(
     draw: ImageDraw.ImageDraw,
     x: float,
@@ -338,10 +402,12 @@ def _draw_label_chip(
     color: tuple[int, int, int],
     *,
     font: ImageFont.ImageFont | ImageFont.FreeTypeFont | None = None,
-) -> None:
+    avoid: Sequence[_ChipRect] | None = None,
+) -> _ChipRect:
     """Draw a filled, coloured tag with white text, anchored just above
     `(x, y)` (a box's top-left corner) -- clamped so it never draws above
-    the image's top edge.
+    the image's top edge. Returns the drawn chip's own rectangle
+    `(left, top, right, bottom)`.
 
     Uses a real TTF (`font`, or `_label_font()`'s default if omitted --
     never PIL's implicit bitmap default) so a multi-word caption's spaces
@@ -349,16 +415,73 @@ def _draw_label_chip(
     `render_semantic_overlay` always passes an explicit, width-scaled
     `font` (`_label_font_size_for_width`); the default here exists so this
     function's own direct callers/tests can draw a chip without picking a
-    size themselves."""
+    size themselves.
+
+    `avoid`, if given, is every chip rectangle already drawn earlier in
+    this render. When two boxes sit close together, their captions'
+    natural chip width can collide -- live-reported (wave 9) as several
+    boxes' labels overwriting each other into one illegible run-on string
+    ("window W.1 -- ciwindow W.2 -- cit..."), since each chip is an opaque
+    filled rectangle drawn on top of whatever was there before. Rather than
+    let a later chip silently paint over an earlier one, this chip is
+    pushed straight up (stacked, one chip-height plus `_CHIP_STACK_GAP_PX`
+    at a time) until it no longer overlaps anything in `avoid`, or until it
+    would be pushed off the top of the image entirely (`chip_top` already
+    at `0.0`), at which point the last, closest-fitting position is
+    accepted rather than looping forever -- a still-cramped chip beats one
+    silently dropped or an infinite loop.
+    """
     font = font or _label_font()
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
     width = (right - left) + 2 * _CHIP_PADDING_PX
     height = (bottom - top) + 2 * _CHIP_PADDING_PX
     chip_top = max(0.0, y - height)
-    draw.rectangle((x, chip_top, x + width, chip_top + height), fill=color)
+    rect: _ChipRect = (x, chip_top, x + width, chip_top + height)
+
+    if avoid:
+        while any(_rects_overlap(rect, placed) for placed in avoid):
+            new_top = rect[1] - height - _CHIP_STACK_GAP_PX
+            if new_top < 0.0:
+                if rect[1] <= 0.0:
+                    break  # already pinned to the top edge; accept the overlap
+                new_top = 0.0
+            rect = (x, new_top, x + width, new_top + height)
+
+    draw.rectangle(rect, fill=color)
     draw.text(
-        (x + _CHIP_PADDING_PX, chip_top + _CHIP_PADDING_PX), text, fill=_CHIP_TEXT_COLOR, font=font
+        (rect[0] + _CHIP_PADDING_PX, rect[1] + _CHIP_PADDING_PX),
+        text,
+        fill=_CHIP_TEXT_COLOR,
+        font=font,
     )
+    return rect
+
+
+_MAX_BOX_PAGE_AREA_FRACTION: Final[float] = 0.9
+"""A box covering >= this fraction of the page's own area is never drawn --
+defense-in-depth for founder requirement #1 ("NEVER draw page-level/
+whole-document anchors as boxes"). `AnchoredElement.bbox` is already a
+required, non-optional `BoundingBox`, so a *page-level* anchor (which the
+dossier's own anchor manifest always stores with `bbox=None`) is already
+structurally impossible to turn into a drawable box -- this guard instead
+catches the geometrically equivalent case this module's own contract
+cannot rule out by typing alone: a legitimately-constructed but
+badly-mis-grounded box that happens to cover almost the entire page (e.g.
+a model returning `[0, 0, 1000, 1000]`), which would read exactly like the
+founder's live "one huge page-wide box" report regardless of which anchor
+produced it. Keyed on *area*, not either dimension alone, so a real,
+useful annotation that is legitimately wide-but-thin (a height-limit datum
+line spanning most of the page's width) or tall-but-narrow is never
+suppressed by this guard -- see the two "still draws" regression tests
+beside this constant's own guard test."""
+
+
+def _covers_almost_the_whole_page(bbox: BoundingBox, page: RenderedPage) -> bool:
+    page_area = page.width_pts * page.height_pts
+    if page_area <= 0:
+        return False
+    box_area = max(0.0, bbox.x1 - bbox.x0) * max(0.0, bbox.y1 - bbox.y0)
+    return (box_area / page_area) >= _MAX_BOX_PAGE_AREA_FRACTION
 
 
 def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> bytes:
@@ -378,7 +501,13 @@ def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> 
     Boxes are page-points (origin bottom-left, as
     :func:`~setback.evidence.grounding.ground_elements` and the anchor
     manifest store them) and are mapped back to the full-resolution image's
-    top-down pixel space before drawing.
+    top-down pixel space before drawing. A box covering almost the whole
+    page (see `_covers_almost_the_whole_page`) is silently skipped rather
+    than drawn -- founder requirement #1's geometric backstop. Every
+    surviving box's label chip is drawn clear of every chip already placed
+    for an earlier box in `boxes` (see `_draw_label_chip`'s `avoid`
+    parameter) so adjacent boxes' captions stack rather than overwrite one
+    another into an illegible run-on string.
     """
     image = Image.open(io.BytesIO(page.png_bytes)).convert("RGB")
     draw = ImageDraw.Draw(image)
@@ -386,10 +515,16 @@ def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> 
     # `_label_font_size_for_width`'s docstring) and reused for every box on
     # the page -- not recomputed per box, since it depends only on `image`.
     font = _label_font(_label_font_size_for_width(image.width))
+    placed_chip_rects: list[_ChipRect] = []
     for box in boxes:
+        if _covers_almost_the_whole_page(box.bbox, page):
+            continue
         x0, y0, x1, y1 = _page_points_to_full_res_pixels(box.bbox, page)
         draw.rectangle((x0, y0, x1, y1), outline=box.color, width=_BOX_WIDTH_PX)
-        _draw_label_chip(draw, x0, y0, box.label, box.color, font=font)
+        chip_rect = _draw_label_chip(
+            draw, x0, y0, box.label, box.color, font=font, avoid=placed_chip_rects
+        )
+        placed_chip_rects.append(chip_rect)
 
     buf = io.BytesIO()
     image.save(buf, format="PNG")
@@ -417,6 +552,7 @@ ROLE_CSS_CLASS_SUFFIX: Final[Mapping[OverlayRole, str]] = {
 
 
 __all__ = [
+    "DEFAULT_MAX_OVERLAY_BOXES",
     "OVERLAY_COLOR",
     "ROLE_CSS_CLASS_SUFFIX",
     "ROLE_LEGEND_TEXT",

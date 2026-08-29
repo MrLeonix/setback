@@ -29,6 +29,26 @@ parseable-but-malformed model reply.
 Every call pins `temperature=0.0` (`ModelClient.generate`'s optional
 `temperature` parameter, wave 4), matching the spike's own low-variance
 setup exactly rather than relying on `ThinkingLevel.MINIMAL`/`LOW` alone.
+
+**Default tier re-evaluated, kept as `INTERVIEW` (wave 9).** The founder
+asked that switching the default grounding call to the more capable
+`BENCH` tier (`gemini-3.7-flash`, `ThinkingLevel.LOW`) be evaluated, cost
+being irrelevant at these sizes, and adopted if it measurably improved box
+placement. Tested live against the committed film-case fixture
+(`tests/fixtures/nsw/docs/elevations.pdf` page 1, the same five production
+labels): both tiers located all five elements, but `BENCH` placed all four
+of the window/door boxes on the *wrong* elevation entirely (the South
+elevation drawing, y in [319, 363]pt) while `INTERVIEW` placed the same
+four correctly on the North elevation (y in [408, 477]pt) -- the elevation
+that actually carries the architect's own "W.1"/"W.2"/"D.1" callouts in
+this fixture. `BENCH` is measurably *worse* here, not better, so the
+default stays `INTERVIEW`; `ground_contested_elements`'s existing
+second-opinion escalation to `BENCH` for adjudicator-contested citations
+is untouched by this finding (a genuinely contested citation is a
+different situation from a first-pass default). Re-run this comparison
+(the exact two calls, no more) if a future, larger real-DA fixture makes
+the picture different -- this conclusion is fixture-specific evidence, not
+a permanent verdict on either model.
 """
 
 from __future__ import annotations
