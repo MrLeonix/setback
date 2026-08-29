@@ -1,3 +1,42 @@
+# STATUS — wave 11 SMOKE close-out: full QA loop green, build RE-FROZEN for filming (2026-08-30)
+
+Full QA→find→fix→QA smoke pass against the deployed `setback-console`
+(`australia-southeast1`, revision `setback-console-00018-z2s`, tribunal
+generation 17 — the wave-11 redeploy already recorded below) at 390px,
+768px, and desktop, both themes, per the founder's film-day brief. Full
+detail in `SMOKE.md`'s "SMOKE.md v10" section; headline here.
+
+**Result: zero defects found.** Every item passed on the first live check —
+the ARIA tablist (selection state, only-active-content, full keyboard
+support), mobile layout (no horizontal scroll, chat-first, 44px tap
+targets, desktop two-pane at 1440px), the one-line chat input with a custom
+Upload button (confirmed zero native "Choose file"/"No file chosen" text
+anywhere), the header timestamp (`DD/MM/YYYY HH:MM AM/PM`, Sydney) with
+run-cost and live-ingest-source both visible, and every wave-9 checklist
+item (docket gate, accordion legibility, evidence doc-card clicks, overlay
+lightbox open/close, Copy text + Email this with zero Markdown links, theme
+toggle + persistence + warm-brown refusal semantics in dark mode, and the
+safe idempotent tribunal re-press). The wave-11 grounding fix (site-plan
+vocabulary overlay labels, zero window/door labels) was independently
+reconfirmed live on the actual redeployed revision, not just carried
+forward from the PROVE pass's pre-redeploy check.
+
+No source file was touched this pass (nothing to fix); no redeploy was
+needed. Full offline suite re-confirmed green immediately before the
+browser work: `648 passed`, ruff check/format clean, mypy clean (38 source
+files); tree was clean and up to date with `origin/main` throughout. Zero
+live model calls this pass (drove only already-completed cases; the one
+idempotent tribunal re-press short-circuits before any model call). No
+secret value, personal identifier, or hostname was read, printed, or
+transmitted — full detail and the exact commands run are in `SMOKE.md` v10.
+
+**Build is RE-FROZEN for filming as of this pass.** Nothing further is
+expected from a build/QA agent before the founder's early-afternoon shoot
+today; the wave-11 integration entry immediately below (grounding fix +
+round-2 UI feedback) is what this smoke pass verified.
+
+---
+
 # STATUS — wave 11 landed: grounding root-cause fix + round-2 UI feedback (2026-08-30)
 
 Founder-directed round, filmed early afternoon the same day it landed — the brief

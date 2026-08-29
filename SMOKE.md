@@ -1783,3 +1783,192 @@ No personal identifier appeared in any command, file, or screenshot this
 pass.
 
 **Status: deploy verified green, ready for filming.**
+
+---
+
+# SMOKE.md v10 — full QA→find→fix→QA loop, wave 11 close-out (2026-08-30)
+
+Full driving pass against the deployed `setback-console` (`australia-southeast1`,
+revision `setback-console-00018-z2s`, tribunal generation 17 — the same
+redeploy the wave-11 redeploy note above verified endpoint-level) with a real
+Chrome browser (`chrome-devtools` MCP) at **390px, 768px, and 1440px desktop,
+both themes**, per this round's brief: tabs, mobile layout, chat input +
+Upload button, header timestamp format, run-cost/live-ingest visibility, and
+every wave-9 checklist item still green. Tree confirmed clean at
+`821eb0f` (up to date with `origin/main`) before this pass started; full
+offline suite re-run first: **648 passed**, `ruff check`/`ruff format --check`
+clean, `mypy` clean (38 source files) — no source drift since wave 11's own
+integration pass. **Zero defects found this round** — every item below is a
+first-pass live PASS; no fix-and-re-smoke cycle was needed. Reported here in
+full rather than abbreviated, per the standing QA→find→fix→QA doctrine (the
+loop still runs even when it terminates after one green pass).
+
+One pre-existing browser tab (`Setback -- PAN-661190`, a leftover case page
+from an earlier session) was found open at the very start and closed
+immediately, per the standing security instruction, before navigating
+anywhere new.
+
+## Tabs (WAI-ARIA tablist, from wave 11's own fix)
+
+- **Selection state**: `aria-selected="true"` on exactly one of
+  Grounds/Evidence/Overlay/Documents at all times; clicking any tab moves
+  `aria-selected` correctly and the visual pill highlight follows it, both
+  themes, all three viewports.
+- **Only-active-content**: confirmed at the DOM level, not just visually —
+  the three non-selected `[role="tabpanel"]` elements are `hidden` (`display:
+  none`) while the selected one is `display: block`; only one tabpanel's
+  content is ever in the accessibility tree's active subtree at a time.
+- **Keyboard**: focused the active tab, then `ArrowRight` → moves focus and
+  activates the next tab (Evidence → Overlay), `End` → jumps straight to
+  Documents (last tab), `Home` → jumps straight back to Grounds (first tab).
+  All four confirmed via `aria-selected` read back after each key, not just
+  visually.
+
+## Mobile layout (390px, 768px)
+
+- **No horizontal page scroll** at either width: `document.documentElement.
+  scrollWidth === clientWidth` confirmed via script at 390px (both the
+  landing page and a case page) and 768px.
+- **Chat-first / stacked layout**: at both 390px and 768px, `main`'s computed
+  `display` is `block` (not `grid`) — the two-pane layout only activates at
+  desktop widths; confirmed by reading the computed style, not inferred from
+  a screenshot. The chat pane renders full-width, tabs and their panel below
+  it, matching "chat-first" on narrow screens.
+- **Tap targets**: all four tab elements measured `44px` tall via
+  `getBoundingClientRect()` at both 390px and 768px — meets the 44px minimum
+  named in this round's brief.
+- **Desktop two-pane**: at 1440px, `main`'s computed `display` is `grid`
+  (`grid-template-columns: minmax(320px, 38%) 1fr`) — fixed left chat pane,
+  scrolling right pane, confirmed both by computed style and screenshot.
+
+## Chat input + Upload button
+
+- Confirmed one flex row at 390px: `Type your answer...` textbox, `Send`,
+  `Upload` — not wrapped, not stacked, on the narrowest viewport tested.
+- **No native "choose file" text anywhere**: scripted a full-page text
+  search for `Choose file` / `No file chosen` (the native unstyled
+  `<input type="file">` strings) — zero matches on the case page. The upload
+  affordance is a real styled button (`button "Upload a photo or document"`
+  in the accessibility tree), not the browser's own file-input chrome.
+
+## Header timestamp + run-cost + live-ingest visibility
+
+- **Format**: `Tribunal started 29/08/2026 11:23 PM · Run cost: $0.0028`
+  (FILM2 case) and `Tribunal started 30/08/2026 07:19 AM · Run cost: $0.0031`
+  (the wave-11 real-DA case, `aeff0460...`) — both exactly
+  `DD/MM/YYYY HH:MM AM/PM`, Sydney-local, confirmed present in the page
+  header on every viewport (it never disappears at narrow widths — Sydney
+  format and run-cost both remain in the single header text node that wraps
+  naturally rather than being hidden by a breakpoint).
+- **Live-ingest notice**: the real-DA case's Grounds tab "Notes" card reads
+  "Fetched live council data for PAN-661190." (a real, honest ingest-source
+  line); the FILM2 fixture case's own Notes card correctly reads "Could not
+  fetch DA2026/0412-FILM2 live; showing the demo case (DA2026/0359) instead."
+  — both cases show their own true provenance, never silently blank.
+
+## Wave-11 grounding fix — reconfirmed live on the redeployed revision
+
+Re-opened the wave-11 flagship real-DA case
+(`aeff0460678e76feceb7a5a7af934d31`) fresh on `setback-console-00018-z2s`
+(the redeploy this pass is verifying, not the pre-redeploy state PROVE
+checked): Overlay tab renders `site boundary for 65A Vista St`, `proposed
+building footprint — cited by a refused ground`, `existing pool`,
+`easement`, `north arrow — included` — **zero window/door labels**, legend
+colours correct (orange footprint = cited by the refused ground, green north
+arrow = supports the shipped ground, grey anchors = undecided). Evidence tab
+shows the real "Archival Street View" grade-B doc-card, clickable. Confirms
+the fix survived the redeploy end-to-end in a real browser, not just via the
+PROVE pass's direct API/image reads.
+
+## Everything from the wave-9 checklist, re-verified still green
+
+- **Landing (`/`)**: public, no key, centered Setback + caption + one DA
+  input + footer, both themes, both mobile and desktop. "Your previous
+  cases" localStorage affordance renders correctly; confirmed it also
+  degrades correctly with localStorage cleared (no stale-case block, no
+  error) — system-preference dark mode alone (no explicit override) also
+  confirmed live in this state.
+- **Docket gate**: `GET /docket` no key → `401`; wrong key → `401`; correct
+  key (fetched into a shell variable from Secret Manager, used once in a
+  `curl -G --data-urlencode`, unset immediately, HTTP code only ever
+  recorded) → `200`. Never navigated a browser tab to a key-bearing URL, per
+  the standing lesson from the SMOKE v3/v5 key-exposure incidents.
+- **Accordion**: ground cards expand/collapse on click; "What the reviewers
+  said" renders as normal prose in both themes, both cases checked (no
+  recurrence of the wave-8 letter-squeeze CSS bug).
+- **Evidence clicks**: both the Elevations PDF and the resident's photo
+  doc-card on the FILM2 case resolve `200` at their real document routes
+  (`application/pdf`, `image/jpeg` respectively) — confirmed via direct
+  request, not just present as a link.
+- **Overlay lightbox**: clicking the overlay image opens a full-viewport
+  lightbox with a close (`×`) button; `Escape` closes it cleanly, returning
+  to the normal tab view — confirmed at 390px.
+- **Copy/Email**: Documents tab exposes `Copy text` + `Email this` (a real
+  `mailto:` link with the full letter body URL-encoded) as the primary
+  actions on both the submission and the refusals documents, `Download HTML`
+  secondary — **zero `.md`/Markdown link anywhere** on the page, confirmed by
+  enumerating every `<a>`/`<button>` whose text matches
+  copy/email/download/`.md`. Refusals heading reads "Property value" (human
+  text), not a raw `ground-...` hash.
+- **Theme toggle**: light→dark→light confirmed on a case page at both mobile
+  and desktop width; `data-theme` persists across a full page reload
+  (localStorage-backed); refused-ground styling stays warm-brown/orange
+  (`rgb(232, 153, 107)`) in dark mode, never red — read via computed style,
+  not just eyeballed.
+- **Safe re-press**: `POST .../tribunal` against the already-completed
+  wave-11 case → `202`, no crash; the case page immediately after reads "...
+  already run — nothing further happened." with zero raw JSON (`grep -c "{"`
+  on the fetched HTML → `0`) — confirmed live, not just carried forward from
+  a prior wave's report.
+
+## Verification (verbatim, before this pass's browser work)
+
+```
+$ uv run pytest -q
+648 passed, 256 warnings in 64.16s
+
+$ git status
+On branch main
+Your branch is up to date with 'origin/main'.
+nothing to commit, working tree clean
+```
+
+No source file was touched this pass (a pure QA/verification loop that
+found nothing to fix); no re-deploy was needed or performed.
+
+## Live budget / calls this pass
+
+Zero live model calls. This pass drove already-completed cases (FILM2,
+the wave-11 real-DA case) and read already-persisted state — no new
+interview turn, no new tribunal run. One idempotent `POST .../tribunal`
+re-press against an already-terminal case, which short-circuits before any
+model call per the wave-8 idempotency guard (confirmed: the response
+returned in under a second, consistent with no live call being made).
+
+## Security
+
+No secret value was read, printed, or transmitted. `docket-key` was fetched
+into a shell variable exactly once, used inside one `curl -G
+--data-urlencode` call, and `unset` immediately after — only the resulting
+HTTP status code was ever recorded, and it was never placed in a browser
+URL. All outbound HTTP (both `curl` and the browser's own requests to the
+app) used the neutral `User-Agent: setback/0.1`; the browser's default UA
+was left as-is for the interactive QA pass itself, carrying no identity
+(no login, no cookie beyond the app's own). No personal identifier, secret,
+or internal hostname appears in this file, any command run, or any
+screenshot taken this pass. The one pre-existing browser tab found open at
+the start (a case page URL, no secret/key in it) was closed immediately,
+per the standing instruction, before any new navigation.
+
+## Status
+
+**Full smoke loop: green on the first pass.** Tabs (selection state,
+only-active-content, keyboard), mobile layout (no horizontal scroll,
+chat-first, 44px tap targets), the one-line chat input with a custom Upload
+button (no native file-input text anywhere), the header timestamp format,
+run-cost and live-ingest visibility, and every wave-9 checklist item are all
+confirmed live, at 390px/768px/desktop, in both themes. The wave-11
+grounding fix (site-plan-vocabulary overlay labels) is reconfirmed live on
+the actual redeployed revision. Zero defects found; nothing to fix; nothing
+rolled forward. **Build is RE-FROZEN for filming** — no further code change
+is expected before the founder's early-afternoon shoot today.
