@@ -18,8 +18,10 @@ from setback.interview.flow import (
     ConcernType,
     InterviewFlow,
     InterviewStage,
+    InterviewTurn,
     KeywordConcernNormaliser,
     ModelConcernNormaliser,
+    RaisedConcern,
     ResidentFeedback,
     capture_refusal_feedback,
     classify_concern,
@@ -375,3 +377,75 @@ async def test_capture_refusal_feedback_distinct_pushbacks_both_recorded() -> No
 def test_event_type_enum_unaffected_by_this_module() -> None:
     # Guards against accidentally shadowing state's own EventType constants.
     assert EventType.CASE_CREATED == "case_created"
+
+
+# --- InterviewFlow.resume: rebuilding state from a persisted transcript -----
+# (wave-9 fix for the documented cold-start no-resume bug: a fresh process
+# with no in-memory InterviewFlow used to call `.start()` unconditionally
+# and append a duplicate, differently-worded opening turn on top of what a
+# case already had durably stored -- LEO-FEEDBACK-UIUX.md §2.)
+
+
+def test_resume_rebuilds_transcript_and_stage_with_no_composer_call() -> None:
+    composer = _FakeComposer()
+    transcript = [
+        InterviewTurn(stage=InterviewStage.OPENING, prompt="What worries you?"),
+        InterviewTurn(stage=InterviewStage.OPENING, prompt="It overshadows my yard."),
+        InterviewTurn(stage=InterviewStage.CLARIFYING, prompt="When does it lose sun?"),
+    ]
+    flow = InterviewFlow.resume(composer=composer, transcript=transcript)
+    assert flow.transcript == transcript
+    assert flow.stage is InterviewStage.CLARIFYING
+    assert flow.concerns == []
+    assert composer.instructions == []  # never calls the composer to rebuild
+
+
+def test_resume_with_empty_transcript_starts_at_opening() -> None:
+    flow = InterviewFlow.resume(composer=_FakeComposer(), transcript=[])
+    assert flow.stage is InterviewStage.OPENING
+    assert flow.transcript == []
+
+
+def test_resume_carries_forward_confirmed_concerns_and_current_concern() -> None:
+    composer = _FakeComposer()
+    confirmed = RaisedConcern(
+        concern_type=ConcernType.OVERSHADOWING,
+        initial_statement="It overshadows my yard.",
+        confirmed=True,
+        redacted_text="It overshadows my yard.",
+    )
+    current = RaisedConcern(
+        concern_type=ConcernType.NOISE,
+        initial_statement="It's loud too.",
+        redacted_text="It's loud too.",
+    )
+    flow = InterviewFlow.resume(
+        composer=composer,
+        transcript=[InterviewTurn(stage=InterviewStage.CLARIFYING, prompt="It's loud too.")],
+        concerns=[confirmed],
+        current=current,
+    )
+    assert flow.concerns == [confirmed]
+    assert flow._current is current
+
+
+async def test_resume_can_continue_submitting_answers() -> None:
+    """A resumed flow, mid-CLARIFYING, must be able to advance exactly like
+    a freshly-started one -- proving `_current` is a real, usable
+    `RaisedConcern`, not just a placeholder that renders but crashes the
+    next `submit()`."""
+    composer = _FakeComposer()
+    current = RaisedConcern(
+        concern_type=ConcernType.OVERSHADOWING,
+        initial_statement="It overshadows my yard.",
+        redacted_text="It overshadows my yard.",
+    )
+    flow = InterviewFlow.resume(
+        composer=composer,
+        transcript=[
+            InterviewTurn(stage=InterviewStage.CLARIFYING, prompt="When does it lose sun?"),
+        ],
+        current=current,
+    )
+    turn = await flow.submit("In winter afternoons.")
+    assert turn.stage is InterviewStage.REQUESTING_EVIDENCE

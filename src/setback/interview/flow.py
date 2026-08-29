@@ -277,6 +277,38 @@ class InterviewFlow:
         self.concerns: list[RaisedConcern] = []
         self._current: RaisedConcern | None = None
 
+    @classmethod
+    def resume(
+        cls,
+        *,
+        composer: QuestionComposer,
+        concern_normaliser: ConcernNormaliser | None = None,
+        transcript: Sequence[InterviewTurn] = (),
+        concerns: Sequence[RaisedConcern] = (),
+        current: RaisedConcern | None = None,
+    ) -> InterviewFlow:
+        """Reconstruct a flow from an already-persisted transcript instead
+        of starting fresh -- the fix for the documented cold-start bug
+        (LEO-FEEDBACK-UIUX.md §2): a fresh process has no in-memory
+        `InterviewFlow` for a case, so `console.app`'s render path used to
+        call `.start()` unconditionally, appending a second, differently-
+        worded "opening" turn on top of what the case's event log already
+        durably held.
+
+        This never calls the composer and never advances state -- it is a
+        pure state-setter. Deriving `concerns`/`current` from a case's
+        persisted event log (grounds already confirmed, an in-progress
+        concern's own transcript fragment) is `console.app`'s job, not this
+        module's -- this classmethod doesn't touch the state-machine
+        transition logic at all, only how a flow's starting point is built.
+        """
+        flow = cls(composer=composer, concern_normaliser=concern_normaliser)
+        flow.transcript = list(transcript)
+        flow.stage = flow.transcript[-1].stage if flow.transcript else InterviewStage.OPENING
+        flow.concerns = list(concerns)
+        flow._current = current
+        return flow
+
     async def _ask(self, stage: InterviewStage, instruction: str) -> InterviewTurn:
         message = await self._composer.compose(instruction=instruction, context=self.transcript)
         turn = InterviewTurn(stage=stage, prompt=message)
