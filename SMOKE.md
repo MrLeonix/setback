@@ -1027,3 +1027,137 @@ docket cases; the label-chip font/spacing bug); one pre-existing
 grounding-accuracy limitation named rather than spent a model call on. 0
 live model calls this round. Pushed to `main` after this file was
 updated.
+
+---
+
+# SMOKE.md v5 — the definitive proof run, post wave-7 fix (2026-08-29)
+
+## Redeploy
+
+`./deploy.sh`, now fully secret-ref based (`--update-secrets`, no literal
+`SETBACK_DOCKET_KEY` value ever touches the script or the shell). Clean
+run: `setback-console-00012-2nj` (100% traffic), `setback-tribunal`
+generation 11, both IAM grants (`datastore.user`, `aiplatform.user`,
+`secretAccessor` scoped to `docket-key`/`maps-api-key` only) idempotently
+reconciled. Verified the docket gate live, key fetched into a shell
+variable from Secret Manager and never echoed:
+
+```
+GET /                -> 401 (no key)
+GET /?key=<wrong>    -> 401
+GET /?key=<correct>  -> 200
+```
+
+## THE DEFINITIVE PROOF RUN
+
+**Film-day case: `DA2026/0412-FILM` / `f3f8c3475e2646537212677fbf7c8075`.**
+One fresh case, scripted end-to-end against the live deployed API (neutral
+UA `setback/0.1`, synthetic resident session, no personal identifier):
+overshadowing concern with the real `elevations.pdf` fixture and a real
+(non-"test"-labelled) resident photo uploaded as evidence, then a
+property-value concern, one "start tribunal" call, one real
+`setback-tribunal` execution.
+
+- **Overshadowing: SHIPPED.** Cites
+  `Environmental Planning and Assessment Act 1979 (NSW) s4.15(1)(b)`
+  with the current "significant likely impacts" wording.
+- **Property value: REFUSED.** Warm-brown `.refusal-card`
+  (`role="region"`, not `alert`), full plain-English s4.15(1)
+  "not a listed matter" explanation.
+- **Refusals document heading is human**: `<h3>Property value</h3>` —
+  confirmed the wave-7 fix holds on a document composed fresh this round
+  (the stale ground-id-hash heading VERDICT quoted only ever afflicted
+  documents composed before that fix; a new run never shows it).
+- **Real run-cost chip**: `data-run-cost-usd="0.002915"`.
+- Zero raw-JSON leaks, zero ground-id leaks anywhere on the rendered case
+  page (grepped for both).
+
+### Overlay: boxes are now genuinely on the drawing, correctly per-anchor coloured — with one honest nuance
+
+Extracted the actual served overlay PNG (not a reconstruction) and
+compared pixel-for-pixel against the unmodified source PDF page: every
+drawn box sits on real drawing content (the architect's own "9m height
+limit" datum-line annotation and an adjacent wall panel) — never in blank
+space. This is the page-level-anchor-propagation fix working as intended.
+
+Honest nuance, not a defect: the boxes on this run's evidence page render
+`ANCHOR_OF_REFUSED` (orange) and `EVIDENCE_ANCHOR` (grey), not
+`SUPPORTS_SHIPPED` (green), even though the overshadowing ground fed by
+this same PDF ultimately SHIPPED. Reading `evidence/grounding.py`'s
+citation-resolution flow, this is consistent with a specific citation
+attempt against these anchors being contested and rejected while the
+ground shipped via a different, resolved citation — i.e. per-anchor
+status is real and independent of the parent ground's outcome, which is
+what the fix was built to expose. Flagged here rather than mis-captioned
+as "the shipped ground's boxes are green," which would not be true of
+this run.
+
+**Label-chip legibility**: the real-TTF fix (wave-7) confirmed live — text
+renders with genuine word-gaps, not glued together. Residual, minor,
+not-this-round's-budget-to-fix: at this box's size the in-image chip is
+only ~7-10px tall after the page is shrunk for Firestore storage, legible
+only under heavy zoom, not at normal viewing/screenshot size. The
+separate, real-HTML `.doc-viewer__legend` (four colour swatches with full
+sentences) is fully legible regardless and is what the gallery shot
+leads with.
+
+## Gallery — 4 shots replaced from this exact run, each read and verified
+
+- `01-docket-board.png` — re-shot (light theme, gated view rendered from
+  the server's own HTML with a `<base>` tag pointing at the live origin
+  for `/static/*`, never by navigating a browser tab to a `?key=...`
+  URL — see security note below for why). Clean: no smoke/test rows, the
+  duplicate-`PAN-661190` case correctly collapsed to one row with a
+  "+1 earlier case" note, `DA2026/0412-FILM` at the top.
+- `06-refusal-card.png` — this run's real "Shipped" (green) gate decision
+  directly beside its real "Refused" (warm brown, `role="region"`) card.
+- `07-overlay-viewer-with-legend.png` — this run's real served overlay PNG
+  (boxes on the drawing, per above) inside the real `.doc-viewer__legend`
+  chrome, no reconstruction needed this time (unlike v3's #7/#5, which had
+  to reconstruct around a race condition) — captured directly off the
+  rendered case page.
+- `08-output-documents.png` — this run's real submission + real refusals
+  explainer, both downloadable, human headings throughout.
+
+## Security incident — reported prominently, per this round's standing instruction
+
+While enumerating open browser tabs (`list_pages`) to pick a target for
+the docket-board screenshot, a **pre-existing tab left open by an earlier
+session** was listed with the live docket passphrase embedded in
+plaintext in its URL (`?key=...`) — that value became visible in this
+round's own tool output. This was not a value this round fetched,
+typed, or navigated to; it surfaced solely because an earlier session had
+navigated there directly and left the tab open. Immediate response:
+the tab was closed on the next call, the value is not reproduced anywhere
+else in this file, this round's commits, or its report, and every
+subsequent docket-board interaction in this round used a key-free method
+(server HTML fetched via `curl` with the key held only in a shell
+variable, rendered locally with a `<base href>` pointing at the live
+origin for static assets — never a browser navigation carrying the key
+in a URL). **Needs Leo**: treat this as a second exposure of the same
+class the wave-6/7 rotation was meant to close, and rotate `docket-key`
+in Secret Manager once more out of caution — this session cannot prove
+what, if anything, downstream tooling retained from that one listing.
+
+## Verification
+
+```
+$ uv run pytest -q
+522 passed, 208 warnings in 23.52s
+```
+
+No code changed this round (proof-run only); `git status` clean before
+and after. Live budget: exactly 1 tribunal run and the interview turns it
+needed, as budgeted. No personal identifier introduced; neutral UA
+`setback/0.1` used throughout.
+
+## Status
+
+**DEPLOYED AU, fully green, definitive proof run captured.** Docket gate
+confirmed live post-redeploy. Gallery now reflects the actual current
+deployed behaviour end to end, with one honestly-flagged nuance (per-
+anchor overlay colour vs. parent-ground status) and one honestly-flagged
+residual (chip legibility at small box sizes) rather than either hidden.
+One security incident reported per this round's standing instruction (see
+above) — needs Leo to rotate `docket-key` again. Pushed to `main` after
+this file was updated.
