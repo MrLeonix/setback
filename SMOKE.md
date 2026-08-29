@@ -1741,3 +1741,45 @@ this pass started; this pass supplied the first live, post-fix proof
 against a real DA). Deployed, redeployed cleanly, docket filter reconfirmed
 live. Remaining work is film-day/founder-only, per `STATUS.md`'s wave-9.5
 entry.
+
+## Wave-11 redeploy (film-day, 2026-08-30)
+
+Redeployed `setback-console` + `setback-tribunal` via `./deploy.sh` to pick
+up wave-11 (evidence-grounding fix + console UI round-2) — Cloud Build
+succeeded, console rolled to revision `setback-console-00018-z2s`, job
+`setback-tribunal` to generation 17, both idempotent IAM grants re-applied
+cleanly.
+
+Endpoint checks (codes only), `curl -A setback/0.1`:
+
+| Check | Result |
+|---|---|
+| `GET /` | `200` |
+| `GET /docket` (no key) | `401` |
+| `GET /docket?key=...` (key fetched to shell var, used once, `unset` immediately) | `200` |
+| `GET /cases/cc9bfc59084fd7cac527c479f0e71996` (FILM2 flagship) | `200` |
+| `GET /cases/5e791203b4b538ec8b4de27b981e7ab6` (real-DA PAN-661190) | `200` |
+
+Browser check (chrome-devtools MCP, 390×844 mobile emulation, pre-existing
+pages closed first — none were open):
+
+- FILM2 case page: `Grounds`/`Evidence`/`Overlay`/`Documents` tabs render,
+  `Grounds` selected shows only its own panel content (no bleed from other
+  tabs).
+- Header timestamp reads `29/08/2026 11:23 PM` — `DD/MM/YYYY HH:MM AM/PM`
+  format confirmed.
+- Chat input (`Type your answer...` + `Send` + `Upload`) renders as a
+  single row at 390px width, not wrapped.
+- Real-DA case page (`5e791203b4b538ec8b4de27b981e7ab6`) loads `200` in
+  browser too, confirming the page that exhibited this wave's target
+  overlay-grounding defect is reachable on the redeployed revision (full
+  visual overlay re-check deferred to whoever runs the next live tribunal
+  pass — no tribunal execution was in this pass's budget).
+
+No secret value was read, printed, or transmitted — `docket-key` only ever
+lived in one shell variable, used once, unset immediately; only its HTTP
+response code was recorded. All outbound HTTP used `User-Agent: setback/0.1`.
+No personal identifier appeared in any command, file, or screenshot this
+pass.
+
+**Status: deploy verified green, ready for filming.**
