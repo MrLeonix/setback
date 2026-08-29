@@ -13,6 +13,41 @@
 //      reviewer opinions / gate decisions / the submission appear live as
 //      the tribunal job progresses, with no client-side re-implementation
 //      of the rendering setback.console.app already does server-side.
+//
+// Wave 5 UI revamp (Package C -- static/app.js only, per UI-SPEC.md):
+//   - Bubble-asymmetry transcript rendering (Sec 2.1) + quick-reply chips
+//     (Sec 2.2), both funnelled through one `submitAnswer(text)` path.
+//   - A humanised stage stepper (Sec 2.3).
+//   - Citation-chip behaviour (Sec 2.5): clause popover / doc+page scroll /
+//     image-region scroll-and-highlight, docking onto the wave-4 overlay.
+//   - The tribunal "courtroom sitting" timeline (Sec 2.7/2.8/2.10, Sec 3.5)
+//     rendered live from the existing `review_verdict` / `adjudication_
+//     decision` / `gate_decision` SSE events -- no new backend events.
+//   - Graceful-degrade "Change" links on the check-answers summary list
+//     (per this wave's design-judgment notes): the interview state
+//     machine cannot reopen an arbitrary past stage this wave, so a
+//     "Change" click focuses the typed-answer input for a correction turn
+//     rather than attempting a stage jump that doesn't exist.
+//
+// Cross-lane data contract this file assumes from `console/app.py`
+// (Package B) -- documented here since this file cannot touch app.py
+// itself; see this work package's notesForOrchestrator for the same list:
+//   - `suggested_replies: string[] | null` on the interview turn JSON
+//     (both GET's auto-started turn and POST's response), for CONFIRMING/
+//     ASK_MORE stages only.
+//   - `data-ground-id="<id>"` on each rendered ground element, so this
+//     script can resolve a ground's human claim text for the tribunal
+//     timeline instead of falling back to its category label.
+//   - `data-doc-id`/`data-page` on the annotated-overlay `<img>` (or its
+//     wrapping element), so a `--doc`/`--region` citation chip can find
+//     and scroll to the right document viewer.
+//   - `data-run-cost-usd="0.0238"` on `<body>` (alongside the existing
+//     `data-case-id`/`data-last-sequence`), the case's ledger total, for
+//     the tribunal timeline's "This run: $0.02" cost chip.
+// Every feature that reads one of these degrades to a plain, correct
+// fallback when the attribute is absent (documented inline at each use),
+// so this file is fully functional against today's app.py and upgrades
+// automatically once Package B ships the attributes above.
 (function () {
   "use strict";
 
@@ -124,6 +159,30 @@
     return;
   }
 
+  // ===========================================================================
+  // Shared helpers
+  // ===========================================================================
+
+  function escapeHtml(value) {
+    const div = document.createElement("div");
+    div.textContent = value == null ? "" : String(value);
+    return div.innerHTML;
+  }
+
+  function formatCost(usd) {
+    const n = Number(usd);
+    // No chip before there is a real cost to be quietly proud of --
+    // `data-run-cost-usd` is always present (per Package B's contract,
+    // `"0.000000"` before any tribunal run), so treat <=0 as "nothing to
+    // show yet" rather than rendering a literal "$0.00".
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
+  }
+
+  // ===========================================================================
+  // Sec 2.1 -- message bubbles, Sec 2.3 -- stage stepper
+  // ===========================================================================
+
   const transcriptEl = document.getElementById("interview-transcript");
   const interviewForm = document.getElementById("interview-form");
   const interviewInput = document.getElementById("interview-input");
@@ -131,46 +190,198 @@
   const uploadInput = document.getElementById("upload-input");
   const startTribunalBtn = document.getElementById("start-tribunal");
 
+  const STAGE_LABELS = {
+    opening: "Starting",
+    clarifying: "Clarifying",
+    requesting_evidence: "Gathering evidence",
+    confirming: "Confirming",
+    ask_more: "Anything else?",
+    done: "Interview complete",
+  };
+
+  // The old role vocabulary ("system"/"resident") is renamed here to the
+  // wave-5 bubble vocabulary ("ai"/"resident"/"ai-system") -- see
+  // UI-SPEC.md Sec 2.1/3.2. `_persist_system_turn`'s stored `role: "system"`
+  // and `_turn_to_json`'s replayed turns are mapped through this alias so
+  // nothing in app.py needs to change for the bubble asymmetry to apply.
+  const ROLE_ALIASES = { system: "ai", ai: "ai", resident: "resident", "ai-system": "ai-system" };
+
+  let lastAiTurnEl = null;
+  let stageStepperEl = null;
+
+  function ensureStageStepper() {
+    if (stageStepperEl || !transcriptEl || !transcriptEl.parentNode) return stageStepperEl;
+    stageStepperEl = document.createElement("div");
+    stageStepperEl.className = "stage-stepper";
+    stageStepperEl.innerHTML = '<span class="stage-stepper__count"></span>';
+    // A working "go back" API doesn't exist in the interview flow this
+    // wave (UI-SPEC.md Sec 2.3) -- ship the counter alone rather than a
+    // back-arrow button that does nothing when pressed.
+    transcriptEl.parentNode.insertBefore(stageStepperEl, transcriptEl);
+    return stageStepperEl;
+  }
+
+  function updateStageStepper(stage) {
+    const el = ensureStageStepper();
+    if (!el) return;
+    const label = STAGE_LABELS[stage] || "Working";
+    const countEl = el.querySelector(".stage-stepper__count");
+    if (countEl) countEl.textContent = label;
+  }
+
   function appendTurn(role, text) {
-    if (!transcriptEl) return;
+    if (!transcriptEl) return null;
+    const resolvedRole = ROLE_ALIASES[role] || "ai";
     const turn = document.createElement("div");
-    turn.className = "chat-turn chat-turn--" + role;
-    turn.textContent = text;
+    turn.className = `chat-turn chat-turn--${resolvedRole}`;
+    if (resolvedRole === "ai") {
+      turn.innerHTML =
+        '<span class="chat-turn__label">Setback</span>' +
+        `<p class="chat-turn__text">${escapeHtml(text)}</p>`;
+      lastAiTurnEl = turn;
+    } else if (resolvedRole === "ai-system") {
+      turn.innerHTML = `<p class="chat-turn__text">${escapeHtml(text)}</p>`;
+    } else {
+      turn.innerHTML = `<p class="chat-turn__text">${escapeHtml(text)}</p>`;
+    }
     transcriptEl.appendChild(turn);
     transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    return turn;
   }
 
   function renderTranscript(turns) {
     if (!transcriptEl) return;
     transcriptEl.innerHTML = "";
+    lastAiTurnEl = null;
     for (const turn of turns) {
-      appendTurn("system", turn.prompt);
+      appendTurn("ai", turn.prompt);
     }
   }
 
-  async function loadInterview() {
-    const response = await fetch(`/api/cases/${caseId}/interview`);
-    if (!response.ok) return;
-    const body = await response.json();
-    renderTranscript(body.turns);
+  // --- Sec 2.2 -- quick-reply chip row --------------------------------------
+  //
+  // Renders under the latest AI turn when its response carries a closed
+  // answer set. Clicking a chip calls the *same* `submitAnswer` path the
+  // typed-input form uses -- this is what keeps "the input is never
+  // disabled while chips are showing" true by construction, not by
+  // convention, and it's why the chip row must be built after
+  // `submitAnswer` is declared but wired through it, never a fork.
+
+  function clearQuickReplies() {
+    if (!transcriptEl) return;
+    const existing = transcriptEl.querySelector(".quick-replies");
+    if (existing) existing.remove();
   }
 
-  if (interviewForm) {
-    interviewForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const answer = interviewInput.value.trim();
-      if (!answer) return;
-      appendTurn("resident", answer);
-      interviewInput.value = "";
+  function renderQuickReplies(suggestions) {
+    clearQuickReplies();
+    if (!transcriptEl || !Array.isArray(suggestions) || suggestions.length === 0) return;
+    const row = document.createElement("div");
+    row.className = "quick-replies";
+    for (const suggestion of suggestions) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip chip--reply";
+      chip.textContent = suggestion;
+      chip.addEventListener("click", () => {
+        row.remove();
+        submitAnswer(suggestion);
+      });
+      row.appendChild(chip);
+    }
+    // Anchored right after the AI turn it answers, not just appended at
+    // the very end -- keeps the row visually paired with its question
+    // even if a resident bubble is still mid-flight above it.
+    if (lastAiTurnEl && lastAiTurnEl.parentNode === transcriptEl) {
+      lastAiTurnEl.insertAdjacentElement("afterend", row);
+    } else {
+      transcriptEl.appendChild(row);
+    }
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  // --- Sec 2.13 -- inline error state (interview submit path only; the
+  // upload/tribunal actions below already have their own error handling
+  // from before this wave, now upgraded to the same three-part copy). ---
+
+  function renderTranscriptError(message, onRetry) {
+    if (!transcriptEl) return;
+    const card = document.createElement("div");
+    card.className = "state-card state-card--error";
+    card.setAttribute("role", "alert");
+    card.innerHTML = `<p class="state-card__heading">${escapeHtml(message)}</p>
+      <p>Nothing you've entered was lost, and your deadline is unaffected.</p>`;
+    if (onRetry) {
+      const retryBtn = document.createElement("button");
+      retryBtn.type = "button";
+      retryBtn.className = "chip chip--reply";
+      retryBtn.textContent = "Try again";
+      retryBtn.addEventListener("click", () => {
+        card.remove();
+        onRetry();
+      });
+      card.appendChild(retryBtn);
+    }
+    transcriptEl.appendChild(card);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  // --- the one submit path (Sec 2.2's prerequisite refactor) ----------------
+  //
+  // Split in two: `submitAnswer` appends the resident's bubble exactly
+  // once and hands off to `postAnswer`; a failed request's "Try again"
+  // retries `postAnswer` alone, so retrying never re-appends a second,
+  // duplicate resident bubble for the same answer.
+
+  async function postAnswer(answer) {
+    try {
       const response = await fetch(`/api/cases/${caseId}/interview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ answer }),
       });
-      if (response.ok) {
-        const body = await response.json();
-        appendTurn("system", body.prompt);
+      if (!response.ok) {
+        renderTranscriptError("We couldn't send that just now.", () => postAnswer(answer));
+        return;
       }
+      const body = await response.json();
+      appendTurn("ai", body.prompt);
+      updateStageStepper(body.stage);
+      renderQuickReplies(body.suggested_replies);
+    } catch (err) {
+      renderTranscriptError("We couldn't reach the server just now.", () => postAnswer(answer));
+    }
+  }
+
+  async function submitAnswer(text) {
+    const answer = (text || "").trim();
+    if (!answer) return;
+    clearQuickReplies();
+    appendTurn("resident", answer);
+    if (interviewInput) interviewInput.value = "";
+    await postAnswer(answer);
+  }
+
+  async function loadInterview() {
+    try {
+      const response = await fetch(`/api/cases/${caseId}/interview`);
+      if (!response.ok) return;
+      const body = await response.json();
+      renderTranscript(body.turns);
+      updateStageStepper(body.stage);
+      renderQuickReplies(body.suggested_replies);
+    } catch (err) {
+      // A failed initial load leaves the transcript empty -- the resident
+      // can still type once the form is visible; nothing to recover here
+      // beyond letting the next real interaction retry naturally.
+    }
+  }
+
+  if (interviewForm) {
+    interviewForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const answer = interviewInput ? interviewInput.value : "";
+      submitAnswer(answer);
     });
   }
 
@@ -181,13 +392,22 @@
       if (!file) return;
       const formData = new FormData();
       formData.append("file", file);
-      const response = await fetch(`/api/cases/${caseId}/documents`, {
-        method: "POST",
-        body: formData,
-      });
-      if (response.ok) {
-        appendTurn("resident", `[uploaded ${file.name}]`);
-        await loadInterview();
+      try {
+        const response = await fetch(`/api/cases/${caseId}/documents`, {
+          method: "POST",
+          body: formData,
+        });
+        if (response.ok) {
+          // A non-conversational log line (UI-SPEC.md Sec 2.1's `--ai-
+          // system` variant) -- an upload isn't something either party
+          // "said", so it shouldn't render as a resident bubble.
+          appendTurn("ai-system", `Evidence added: ${file.name}`);
+          await loadInterview();
+        } else {
+          renderTranscriptError("We couldn't upload that file just now.", null);
+        }
+      } catch (err) {
+        renderTranscriptError("We couldn't reach the server just now.", null);
       }
       uploadInput.value = "";
     });
@@ -235,11 +455,535 @@
     });
   }
 
+  // ===========================================================================
+  // Sec 3.8 -- check-answers "Change" links: graceful degrade
+  //
+  // The interview state machine cannot reopen an arbitrary past stage this
+  // wave (this wave's explicit design-judgment note) -- rather than fake a
+  // per-row edit that doesn't work, a "Change" click scrolls to the
+  // always-live typed-answer input and lets the resident say what to
+  // change in their own words, which posts through the exact same
+  // `submitAnswer` path as everything else (an appended correction turn,
+  // not a reopened stage).
+  // ===========================================================================
+
+  document.addEventListener("click", (event) => {
+    const changeLink = event.target.closest(".summary-list__change");
+    if (!changeLink) return;
+    event.preventDefault();
+    if (!interviewInput) return;
+    appendTurn(
+      "ai-system",
+      "No problem -- just tell us what you'd like to change below."
+    );
+    interviewInput.scrollIntoView({ behavior: "smooth", block: "center" });
+    interviewInput.focus();
+  });
+
+  // ===========================================================================
+  // Sec 2.5 -- citation chip behaviour
+  //
+  // One delegated handler for all three variants (`--clause`/`--doc`/
+  // `--region`), reused wherever a `.citation-chip` appears (transcript,
+  // ground cards, the final letter's rendered HTML) -- per the spec's
+  // `citationChip.onActivate(chipEl)` contract.
+  // ===========================================================================
+
+  const citationChip = (function () {
+    // Real statutory text, not invented -- copied from `gate/s415.py`'s
+    // own quoted chapeau/heads so the popover says something true even
+    // though this module cannot import Python. Any clause id outside this
+    // small set (e.g. a specific LEP/DCP clause number) still gets a
+    // correct, generic explanation rather than nothing.
+    const CLAUSE_TEXT = {
+      "s4.15(1)(a)": "The consent authority must consider the provisions of any relevant " +
+        "environmental planning instrument, DCP, or planning agreement -- s4.15(1)(a) of the " +
+        "Environmental Planning and Assessment Act 1979.",
+      "s4.15(1)(b)": "The consent authority must consider 'the likely impacts of that " +
+        "development, including environmental impacts on both the natural and built " +
+        "environments, and social and economic impacts in the locality' -- s4.15(1)(b) of the " +
+        "Environmental Planning and Assessment Act 1979.",
+      "s4.15(1)(c)": "The consent authority must consider 'the suitability of the site for " +
+        "the development' -- s4.15(1)(c) of the Environmental Planning and Assessment Act 1979.",
+      "s4.15(1)(d)": "The consent authority must consider 'any submissions made in " +
+        "accordance with this Act or the regulations' -- s4.15(1)(d) of the Environmental " +
+        "Planning and Assessment Act 1979.",
+      "s4.15(1)(e)": "The consent authority must consider 'the public interest' -- s4.15(1)(e) " +
+        "of the Environmental Planning and Assessment Act 1979.",
+    };
+    const GENERIC_CLAUSE_TEXT = (id) =>
+      `${id} is a clause of the Environmental Planning and Assessment Act 1979 or an ` +
+      "applicable planning instrument that the consent authority must weigh in assessing " +
+      "this development application.";
+
+    let openPopover = null;
+
+    function closePopover() {
+      if (openPopover) {
+        openPopover.remove();
+        openPopover = null;
+      }
+    }
+
+    function openClausePopover(chipEl) {
+      closePopover();
+      const clauseId = chipEl.getAttribute("data-clause") || chipEl.textContent.trim();
+      const popover = document.createElement("div");
+      popover.className = "citation-chip__popover";
+      popover.setAttribute("role", "note");
+      popover.textContent = CLAUSE_TEXT[clauseId] || GENERIC_CLAUSE_TEXT(clauseId);
+      document.body.appendChild(popover);
+      const rect = chipEl.getBoundingClientRect();
+      popover.style.top = `${window.scrollY + rect.bottom + 6}px`;
+      popover.style.left = `${window.scrollX + rect.left}px`;
+      openPopover = popover;
+    }
+
+    // A real per-anchor bbox overlay layer (individually clickable/
+    // highlightable regions in the DOM) isn't built this wave -- the
+    // annotated-overlay event still renders one flattened raster image
+    // server-side (`_render_annotated_overlay_item`). Degrade gracefully:
+    // scroll to the best-matching image and flash its whole frame rather
+    // than a precise sub-region, and upgrade automatically the moment a
+    // `[data-bbox-region]` element matching this chip's doc/page exists.
+    function findDocViewerImage(docId, page) {
+      if (docId) {
+        const byDoc = document.querySelector(
+          `[data-doc-id="${CSS.escape(docId)}"] img, img[data-doc-id="${CSS.escape(docId)}"]`
+        );
+        if (byDoc) return byDoc;
+      }
+      // Fallback: the wave-4 overlay section always renders at most one
+      // annotated image per document today, so the first (only) one on
+      // the page is the correct target in the common single-document case.
+      void page;
+      return document.querySelector(".doc-viewer__stage img, .annotated-overlay img");
+    }
+
+    function flashElement(el) {
+      if (!el) return;
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      const previousOutline = el.style.outline;
+      const previousOffset = el.style.outlineOffset;
+      el.style.outline = "3px solid var(--accent)";
+      el.style.outlineOffset = "2px";
+      window.setTimeout(() => {
+        el.style.outline = previousOutline;
+        el.style.outlineOffset = previousOffset;
+      }, 1200);
+    }
+
+    function activateRegion(chipEl) {
+      const docId = chipEl.getAttribute("data-doc-id");
+      const page = chipEl.getAttribute("data-page");
+      const bbox = chipEl.getAttribute("data-bbox");
+      let region = null;
+      if (docId && bbox) {
+        region = document.querySelector(
+          `[data-bbox-region][data-doc-id="${CSS.escape(docId)}"][data-bbox="${CSS.escape(bbox)}"]`
+        );
+      }
+      flashElement(region || findDocViewerImage(docId, page));
+    }
+
+    function activateDoc(chipEl) {
+      const docId = chipEl.getAttribute("data-doc-id");
+      const page = chipEl.getAttribute("data-page");
+      flashElement(findDocViewerImage(docId, page));
+    }
+
+    function onActivate(chipEl) {
+      if (chipEl.classList.contains("citation-chip--clause")) {
+        if (openPopover) {
+          closePopover();
+        } else {
+          openClausePopover(chipEl);
+        }
+      } else if (chipEl.classList.contains("citation-chip--region")) {
+        closePopover();
+        activateRegion(chipEl);
+      } else if (chipEl.classList.contains("citation-chip--doc")) {
+        closePopover();
+        activateDoc(chipEl);
+      }
+    }
+
+    document.addEventListener("click", (event) => {
+      const chip = event.target.closest(".citation-chip");
+      if (chip) {
+        onActivate(chip);
+        return;
+      }
+      if (!event.target.closest(".citation-chip__popover")) {
+        closePopover();
+      }
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        const chip = event.target.closest(".citation-chip");
+        if (chip) {
+          event.preventDefault();
+          onActivate(chip);
+        }
+      } else if (event.key === "Escape") {
+        closePopover();
+      }
+    });
+
+    return { onActivate };
+  })();
+  void citationChip; // exposed for the delegated listeners above only
+
+  // ===========================================================================
+  // Sec 2.7/2.8/2.10, Sec 3.5 -- the tribunal "courtroom sitting" timeline
+  //
+  // Built entirely from existing SSE events (no new backend events): the
+  // three formerly-flat "Reviewer opinions"/"Adjudication"/"Gate decisions"
+  // cards stay in the server-rendered page as a safety net (a case a
+  // resident reopens *after* its tribunal run already finished this
+  // session or a prior one still shows its full history there even if
+  // this script never runs), and are hidden only once this richer view has
+  // live data of its own to show in their place.
+  // ===========================================================================
+
+  const REVIEWER_LABELS = {
+    clause_reviewer: "Clause Reviewer",
+    evidence_reviewer: "Evidence Reviewer",
+  };
+
+  const CATEGORY_LABELS = {
+    epi_dcp_provisions: "Planning instrument compliance",
+    environmental_and_social_impacts: "Environmental & social impact",
+    site_suitability: "Site suitability",
+    public_submissions: "Public submissions",
+    public_interest: "Public interest",
+    property_value: "Property value",
+    private_view_loss: "Loss of a private view",
+  };
+
+  const GATE_WORD = {
+    shipped: "Shipped",
+    "refused-irrelevant": "Refused",
+    "refused-unsubstantiated": "Refused",
+  };
+  const GATE_BASIS = {
+    "refused-irrelevant": "not a planning matter",
+    "refused-unsubstantiated": "citation didn't check out",
+  };
+
+  const groundState = new Map(); // ground_id -> { claim, category, reviewers, adjudication, gate, rowEl }
+  let tribunalRunEl = null;
+  let tribunalTimelineEl = null;
+  let flatSectionsHidden = false;
+
+  function capitalize(word) {
+    const text = String(word || "");
+    return text.charAt(0).toUpperCase() + text.slice(1);
+  }
+
+  function lookupGroundClaim(groundId, fallback) {
+    // Upgrades automatically once Package B's ground renderer stamps
+    // `data-ground-id` onto each ground element (see this file's header
+    // notes) -- today it falls back to the category label captured from
+    // `ground_category_assigned`, which every confirmed concern already
+    // emits during the interview.
+    const el = document.querySelector(`[data-ground-id="${CSS.escape(groundId)}"]`);
+    if (el) {
+      const claimEl = el.querySelector(".ground-card__claim, .ground__claim");
+      const text = (claimEl || el).textContent.trim();
+      if (text) return text;
+    }
+    return fallback;
+  }
+
+  function getOrCreateGround(groundId) {
+    let entry = groundState.get(groundId);
+    if (!entry) {
+      entry = {
+        claim: lookupGroundClaim(groundId, `Ground ${groundId.replace(/^ground-/, "").slice(0, 8)}`),
+        category: null,
+        reviewers: {},
+        adjudication: null,
+        gate: null,
+        rowEl: null,
+      };
+      groundState.set(groundId, entry);
+    }
+    return entry;
+  }
+
+  function ensureTribunalRun() {
+    if (tribunalRunEl) return tribunalRunEl;
+    const anchor = document.querySelector(".case-page");
+    if (!anchor) return null;
+    tribunalRunEl = document.createElement("section");
+    tribunalRunEl.className = "card tribunal-run";
+    tribunalRunEl.innerHTML =
+      '<h3>Tribunal sitting</h3>' +
+      '<p class="tribunal-run__plan"></p>' +
+      '<ul class="tribunal-timeline"></ul>';
+    // Right after the grounds card when one is found -- keeps the reading
+    // order the spec implies (grounds, then how they're being checked,
+    // then the output docs); otherwise appended at the end is still a
+    // correct, visible placement.
+    const groundsSection = anchor.querySelector(".ground-list, .ground-card")?.closest("section");
+    if (groundsSection && groundsSection.parentNode === anchor) {
+      groundsSection.insertAdjacentElement("afterend", tribunalRunEl);
+    } else {
+      anchor.appendChild(tribunalRunEl);
+    }
+    tribunalTimelineEl = tribunalRunEl.querySelector(".tribunal-timeline");
+    return tribunalRunEl;
+  }
+
+  function hideFlatSectionsOnce() {
+    if (flatSectionsHidden) return;
+    const titles = [
+      "Reviewer opinions",
+      "Adjudication",
+      "Gate decisions",
+      "Annotated evidence overlay",
+      "Tribunal",
+    ];
+    document.querySelectorAll("main.case-page section.card").forEach((section) => {
+      const heading = section.querySelector("h3");
+      if (heading && titles.includes(heading.textContent.trim())) {
+        section.style.display = "none";
+      }
+    });
+    flatSectionsHidden = true;
+  }
+
+  function renderPlanLine() {
+    if (!tribunalRunEl) return;
+    const planEl = tribunalRunEl.querySelector(".tribunal-run__plan");
+    if (!planEl) return;
+    const count = groundState.size;
+    const groundsText = count > 0 ? `${count} ground${count === 1 ? "" : "s"}` : "your grounds";
+    let text =
+      `Checking ${groundsText} against s4.15(1) · Clause Reviewer, Evidence Reviewer, ` +
+      "Adjudicator on splits";
+    const cost = formatCost(document.body.getAttribute("data-run-cost-usd"));
+    if (cost) text += ` · This run: ${cost}`;
+    planEl.textContent = text;
+  }
+
+  function reviewerCardMarkup(key, state, label) {
+    return (
+      `<div class="reviewer-card reviewer-card--${key} reviewer-card--${state}" data-reviewer="${key}">` +
+      `<span class="reviewer-card__name">${escapeHtml(REVIEWER_LABELS[key] || capitalize(key))}</span>` +
+      `<span class="reviewer-card__state">${escapeHtml(label)}</span>` +
+      "</div>"
+    );
+  }
+
+  function renderRowColumns(entry) {
+    const clause = entry.reviewers.clause_reviewer;
+    const evidence = entry.reviewers.evidence_reviewer;
+    const clauseState = clause ? "done" : "active";
+    const evidenceState = evidence ? "done" : "active";
+    const clauseLabel = clause
+      ? clause.voided
+        ? "Opinion voided"
+        : `${capitalize(clause.stance)} (confidence ${Number(clause.confidence).toFixed(2)})`
+      : "Deliberating…";
+    const evidenceLabel = evidence
+      ? evidence.voided
+        ? "Opinion voided"
+        : `${capitalize(evidence.stance)} (confidence ${Number(evidence.confidence).toFixed(2)})`
+      : "Deliberating…";
+    const disagreeing =
+      clause && evidence && !clause.voided && !evidence.voided && clause.stance !== evidence.stance;
+    const adjudicatorState = entry.adjudication ? "done" : disagreeing ? "active" : "dim";
+    const adjudicatorLabel = entry.adjudication
+      ? "Ruled"
+      : disagreeing
+        ? "Deliberating…"
+        : "Standing by";
+    return (
+      '<div class="tribunal-columns">' +
+      reviewerCardMarkup("clause", clauseState, clauseLabel) +
+      reviewerCardMarkup("adjudicator", adjudicatorState, adjudicatorLabel) +
+      reviewerCardMarkup("evidence", evidenceState, evidenceLabel) +
+      "</div>"
+    );
+  }
+
+  function disruptionCardMarkup(entry) {
+    const clause = entry.reviewers.clause_reviewer;
+    const evidence = entry.reviewers.evidence_reviewer;
+    return (
+      '<div class="disruption-card">' +
+      '<span class="disruption-card__eyebrow">Reviewers disagree</span>' +
+      `<h4>${escapeHtml(entry.claim)}</h4>` +
+      '<div class="disruption-card__opinions">' +
+      `<p><strong>Clause Reviewer:</strong> ${escapeHtml(clause ? clause.rationale : "")}</p>` +
+      `<p><strong>Evidence Reviewer:</strong> ${escapeHtml(evidence ? evidence.rationale : "")}</p>` +
+      "</div>" +
+      `<p class="disruption-card__ruling"><strong>Adjudicator's ruling:</strong> ` +
+      `${escapeHtml(entry.adjudication ? entry.adjudication.rationale : "")}</p>` +
+      "</div>"
+    );
+  }
+
+  function verdictMarkup(status) {
+    const modifier = escapeHtml(status);
+    const word = GATE_WORD[status];
+    if (word) {
+      const basis = GATE_BASIS[status];
+      return (
+        `<div class="verdict-stamp verdict-stamp--${modifier} verdict-stamp--animating ` +
+        'verdict-stamp--fade" role="status">' +
+        `<span class="verdict-stamp__word">${escapeHtml(word)}</span>` +
+        (basis ? `<span class="verdict-stamp__basis">${escapeHtml(basis)}</span>` : "") +
+        "</div>"
+      );
+    }
+    // `flagged` has no verdict-stamp colour token of its own (this wave's
+    // 4-token status map reserves that visual weight for a genuine
+    // ship/refuse outcome) -- the shared `.tag` component already covers
+    // it correctly, so reuse that rather than mis-colouring a stamp.
+    return `<span class="tag tag--flagged">Flagged</span>`;
+  }
+
+  function renderGroundRow(groundId) {
+    const entry = getOrCreateGround(groundId);
+    ensureTribunalRun();
+    if (!tribunalTimelineEl) return;
+    if (!entry.rowEl) {
+      entry.rowEl = document.createElement("li");
+      entry.rowEl.className = "tribunal-row";
+      entry.rowEl.setAttribute("data-ground-id", groundId);
+      tribunalTimelineEl.appendChild(entry.rowEl);
+    }
+    if (entry.gate) {
+      entry.rowEl.className = "tribunal-row tribunal-row--collapsed";
+      entry.rowEl.innerHTML =
+        `<span class="tribunal-row__claim">${escapeHtml(entry.claim)}</span>` +
+        verdictMarkup(entry.gate.status);
+      return;
+    }
+    const clause = entry.reviewers.clause_reviewer;
+    const evidence = entry.reviewers.evidence_reviewer;
+    const disagreeing =
+      clause && evidence && !clause.voided && !evidence.voided && clause.stance !== evidence.stance;
+    entry.rowEl.className = "tribunal-row";
+    let body = `<span class="tribunal-row__claim">${escapeHtml(entry.claim)}</span>`;
+    if (disagreeing && entry.adjudication) {
+      body += disruptionCardMarkup(entry);
+    } else {
+      body += renderRowColumns(entry);
+    }
+    entry.rowEl.innerHTML = body;
+  }
+
+  function handleGroundCategoryAssigned(payload) {
+    const groundId = payload.ground_id;
+    if (!groundId) return;
+    const entry = getOrCreateGround(groundId);
+    entry.category = payload.category;
+    if (!lookupGroundClaim(groundId, null)) {
+      entry.claim = CATEGORY_LABELS[payload.category] || "Objection ground";
+    }
+  }
+
+  function handleTribunalRequested() {
+    ensureTribunalRun();
+    hideFlatSectionsOnce();
+    renderPlanLine();
+    for (const groundId of groundState.keys()) {
+      renderGroundRow(groundId);
+    }
+  }
+
+  function handleReviewVerdict(payload) {
+    const groundId = payload.ground_id;
+    if (!groundId) return;
+    const entry = getOrCreateGround(groundId);
+    entry.reviewers[payload.reviewer] = payload;
+    renderGroundRow(groundId);
+    renderPlanLine();
+  }
+
+  function handleAdjudicationDecision(payload) {
+    const groundId = payload.ground_id;
+    if (!groundId) return;
+    const entry = getOrCreateGround(groundId);
+    entry.adjudication = payload;
+    renderGroundRow(groundId);
+  }
+
+  function handleGateDecision(payload) {
+    const groundId = payload.ground_id;
+    if (!groundId) return;
+    const entry = getOrCreateGround(groundId);
+    entry.gate = payload;
+    renderGroundRow(groundId);
+    renderPlanLine();
+  }
+
+  function handleAnnotatedOverlay(payload) {
+    // The concurrent wave's semantic-overlay pixels; this wave only adds
+    // the docked chrome (Sec 2.12) around whatever image the event
+    // carries, mirroring `_render_annotated_overlay_item`'s own markup so
+    // this client render and a server re-render always agree.
+    hideFlatSectionsOnce();
+    const anchor = document.querySelector(".case-page");
+    if (!anchor) return;
+    let viewer = document.querySelector(".doc-viewer");
+    if (!viewer) {
+      viewer = document.createElement("section");
+      viewer.className = "card";
+      viewer.innerHTML =
+        '<h3>Annotated evidence overlay</h3>' +
+        '<div class="doc-viewer"><div class="doc-viewer__stage"></div>' +
+        '<div class="doc-viewer__legend">' +
+        '<span class="legend-item"><i class="legend-swatch legend-swatch--shipped"></i>Supports a shipped ground</span>' +
+        '<span class="legend-item"><i class="legend-swatch legend-swatch--flagged"></i>Needs more evidence</span>' +
+        '<span class="legend-item"><i class="legend-swatch legend-swatch--refused"></i>Cited in a refused ground</span>' +
+        "</div></div>";
+      anchor.appendChild(viewer);
+    }
+    const stage = viewer.querySelector(".doc-viewer__stage");
+    if (!stage) return;
+    const img = document.createElement("img");
+    img.src = `data:${payload.mime_type || "image/png"};base64,${payload.image_base64 || ""}`;
+    img.alt = "Annotated evidence overlay";
+    if (payload.document_id) img.setAttribute("data-doc-id", payload.document_id);
+    stage.innerHTML = "";
+    stage.appendChild(img);
+  }
+
+  // ===========================================================================
+  // SSE event stream
+  // ===========================================================================
+
   // Event types this page already reflects itself the moment it makes the
-  // request that produced them (an interview answer, an upload) -- reload
-  // is only useful for events the *background tribunal job* produces
-  // asynchronously, which this tab has no other way to learn about.
-  const LOCALLY_HANDLED_EVENT_TYPES = new Set(["interview_turn", "document_uploaded"]);
+  // request that produced them (an interview answer, an upload), or that
+  // the tribunal-timeline handlers above now render live in place --
+  // reload is reserved for events with no client-side renderer at all
+  // (the composed submission, refusal feedback), where a full reload of
+  // Package B's server-rendered section is still the simplest correct way
+  // to reflect them.
+  const LOCALLY_HANDLED_EVENT_TYPES = new Set([
+    "interview_turn",
+    "document_uploaded",
+    "ground_category_assigned",
+    "tribunal_requested",
+    "review_verdict",
+    "adjudication_decision",
+    "gate_decision",
+    "annotated_overlay",
+  ]);
+
+  const EVENT_HANDLERS = {
+    ground_category_assigned: handleGroundCategoryAssigned,
+    tribunal_requested: handleTribunalRequested,
+    review_verdict: handleReviewVerdict,
+    adjudication_decision: handleAdjudicationDecision,
+    gate_decision: handleGateDecision,
+    annotated_overlay: handleAnnotatedOverlay,
+  };
 
   function connectEventStream() {
     // `data-last-sequence` (rendered server-side, see console/app.py's
@@ -250,19 +994,22 @@
     const afterSequence = document.body.getAttribute("data-last-sequence") || "-1";
     const source = new EventSource(`/api/cases/${caseId}/events?after=${afterSequence}`);
     source.onmessage = (message) => {
-      let eventType = null;
+      let parsed = null;
       try {
-        eventType = JSON.parse(message.data).event_type;
+        parsed = JSON.parse(message.data);
       } catch (err) {
         // Malformed payload: fall through and reload defensively.
       }
+      const eventType = parsed && parsed.event_type;
       if (eventType && LOCALLY_HANDLED_EVENT_TYPES.has(eventType)) {
+        const handler = EVENT_HANDLERS[eventType];
+        if (handler) handler(parsed.payload || {});
         return;
       }
       // Any other new case event may have changed a server-rendered
-      // section (reviewer opinions, gate decisions, the submission) --
-      // reloading is the simplest correct way to reflect that without
-      // duplicating setback.console.app's rendering logic in JS.
+      // section (the submission, refusal feedback) -- reloading is the
+      // simplest correct way to reflect that without duplicating
+      // setback.console.app's rendering logic in JS.
       window.location.reload();
     };
     source.onerror = () => {

@@ -1,60 +1,181 @@
 /* Setback console -- shared styling for the docket board and case page.
    Deliberately dependency-free (no build step, no framework): plain CSS
    custom properties for a light/dark-safe palette, served as a static
-   file by console/app.py's StaticFiles mount. */
+   file by console/app.py's StaticFiles mount.
+
+   Wave 5 UI revamp (Package A -- style.css only, per UI-SPEC.md):
+   - Section "Tokens" below is the §1 token triad (light on bare :root,
+     dark redefinitions guarded under prefers-color-scheme, and again
+     under [data-theme="dark"] so an explicit toggle always wins).
+   - Legacy aliases keep every class already used by app.py/app.js
+     working unchanged (they resolve, at render time, to whichever
+     theme's tokens are in scope) -- B and C migrate markup to the new
+     class names in their own lanes; nothing in this file renames or
+     removes an existing selector.
+   - Section "Components (wave 5)" adds the 14 component blocks from
+     UI-SPEC.md §2, using exactly the class names documented there. */
 
 :root {
-  --bg: #f6f7f9;
-  --surface: #ffffff;
-  --border: #e2e5ea;
-  --text: #1c2128;
-  --text-muted: #5b6470;
-  --accent: #2454ff;
+  /* --- neutrals: warm, not clinical-grey --- */
+  --bg:             #f7f5f2;
+  --surface:        #ffffff;
+  --surface-sunken: #efece7;   /* chat transcript well, docked evidence rail */
+  --border:         #e4dfd7;
+  --border-strong:  #cfc8bb;
+  --text:           #201d19;
+  --text-muted:     #6b6459;
+
+  /* --- brand accent: ONE hue, interactive affordances only, never status --- */
+  --accent:          #1d4ed8;
+  --accent-hover:    #1739ab;
   --accent-contrast: #ffffff;
-  --success: #1a7f4e;
-  --success-bg: #e6f6ee;
-  --warn: #9a6400;
-  --warn-bg: #fff6e0;
-  --danger: #b3261e;
-  --danger-bg: #fdecea;
-  --radius: 10px;
-  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 1px rgba(16, 24, 40, 0.04);
+  --accent-soft:     #e8eefc;  /* chip/link hover backgrounds */
+
+  /* --- semantic status: 4 meanings, each pre-checked to 4.5:1 text /
+     3:1 non-text contrast (WCAG 1.4.3 / 1.4.11). The ONLY colours
+     allowed to mean something -- never reused decoratively. --- */
+  --status-shipped:        #0f6b3f;  /* ground survived: supported, ready to submit */
+  --status-shipped-bg:     #e4f5ea;
+  --status-shipped-border: #0f6b3f;
+
+  --status-refused:        #8a3a12;  /* statutory gate refused it -- NOT an error,
+                                         so this is a warm brown, not red */
+  --status-refused-bg:     #fbe9db;
+  --status-refused-border: #b8571c;
+
+  --status-flagged:        #8a6a00;  /* split reviewers / needs resident input */
+  --status-flagged-bg:     #fbf1d4;
+  --status-flagged-border: #b8901a;
+
+  --status-pending:        #45505c;  /* queued / under review / not started */
+  --status-pending-bg:     #eaedf1;
+  --status-pending-border: #8a94a1;
+
+  /* true system/input errors ONLY -- red is reserved exclusively for this */
+  --error:        #b3261e;
+  --error-bg:     #fdecea;
+  --error-border: #b3261e;
+
+  /* --- type scale: video-legibility floor (~18-20px effective body text
+     at 1080p capture); WCAG AA (4.5:1) is a floor, AAA (~7:1) the target
+     for anything that must read on a compressed recording --- */
+  --text-xs:   0.8125rem;  /* 13px -- metadata lines only, never a verdict */
+  --text-sm:   0.9375rem;  /* 15px -- secondary copy */
+  --text-base: 1.0625rem;  /* 17px -- body / chat bubbles */
+  --text-lg:   1.25rem;    /* 20px -- section headings, ground claims */
+  --text-xl:   1.75rem;    /* 28px -- verdict stamps, refusal headline */
+  --text-2xl:  2.25rem;    /* 36px -- gate REFUSED/SHIPPED stamp, video hero moments */
+
+  /* --- spacing scale (4px base) --- */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-8: 3rem;
+
+  --radius-sm:   6px;
+  --radius:      10px;
+  --radius-lg:   16px;   /* wide disruption cards (split/refusal) */
+  --radius-pill: 999px;
+
+  --shadow:    0 1px 2px rgba(32, 29, 25, 0.06), 0 1px 1px rgba(32, 29, 25, 0.04);
+  --shadow-lg: 0 8px 24px rgba(32, 29, 25, 0.12), 0 2px 6px rgba(32, 29, 25, 0.08);
+
+  /* --- legacy aliases: every selector below this token block that was
+     already shipping (docket rows, gate-decision, review-verdict,
+     badges, create-case-error, chat bubbles, buttons...) keeps working
+     unchanged -- these resolve lazily to whichever theme's tokens are
+     active, so no dark-mode redefinition is needed for the aliases
+     themselves, only for the canonical tokens above. Package B/C: new
+     markup should reach for the canonical --status-*/--error tokens or
+     the .tag/.ground-card/etc. components directly rather than these
+     aliases; they exist for zero-risk backward compatibility only. */
+  --success:    var(--status-shipped);
+  --success-bg: var(--status-shipped-bg);
+  --warn:       var(--status-flagged);
+  --warn-bg:    var(--status-flagged-bg);
+  --danger:     var(--error);
+  --danger-bg:  var(--error-bg);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #14161a;
-    --surface: #1c1f26;
-    --border: #2b2f38;
-    --text: #e8eaed;
-    --text-muted: #9aa2b1;
-    --accent: #6d8dff;
+    --bg:             #1b1815;
+    --surface:        #242019;
+    --surface-sunken: #171410;
+    --border:         #362f27;
+    --border-strong:  #4a4136;
+    --text:           #f0ece5;
+    --text-muted:     #a89f92;
+
+    --accent:          #6d93ff;
+    --accent-hover:    #86a6ff;
     --accent-contrast: #0b0d10;
-    --success: #4fd48c;
-    --success-bg: #123024;
-    --warn: #e0b64a;
-    --warn-bg: #332a10;
-    --danger: #ff8f87;
-    --danger-bg: #3a1613;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+    --accent-soft:     #1c2740;
+
+    --status-shipped:        #7ad9a5;
+    --status-shipped-bg:     #12301f;
+    --status-shipped-border: #7ad9a5;
+
+    --status-refused:        #e8996b;
+    --status-refused-bg:     #3a2214;
+    --status-refused-border: #e8996b;
+
+    --status-flagged:        #e0b64a;
+    --status-flagged-bg:     #332a10;
+    --status-flagged-border: #e0b64a;
+
+    --status-pending:        #c3ccd6;
+    --status-pending-bg:     #262b33;
+    --status-pending-border: #8a94a1;
+
+    --error:        #ff8f87;
+    --error-bg:     #3a1613;
+    --error-border: #ff8f87;
+
+    --shadow:    0 1px 2px rgba(0, 0, 0, 0.4);
+    --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.4);
   }
 }
 
 :root[data-theme="dark"] {
-  --bg: #14161a;
-  --surface: #1c1f26;
-  --border: #2b2f38;
-  --text: #e8eaed;
-  --text-muted: #9aa2b1;
-  --accent: #6d8dff;
+  --bg:             #1b1815;
+  --surface:        #242019;
+  --surface-sunken: #171410;
+  --border:         #362f27;
+  --border-strong:  #4a4136;
+  --text:           #f0ece5;
+  --text-muted:     #a89f92;
+
+  --accent:          #6d93ff;
+  --accent-hover:    #86a6ff;
   --accent-contrast: #0b0d10;
-  --success: #4fd48c;
-  --success-bg: #123024;
-  --warn: #e0b64a;
-  --warn-bg: #332a10;
-  --danger: #ff8f87;
-  --danger-bg: #3a1613;
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --accent-soft:     #1c2740;
+
+  --status-shipped:        #7ad9a5;
+  --status-shipped-bg:     #12301f;
+  --status-shipped-border: #7ad9a5;
+
+  --status-refused:        #e8996b;
+  --status-refused-bg:     #3a2214;
+  --status-refused-border: #e8996b;
+
+  --status-flagged:        #e0b64a;
+  --status-flagged-bg:     #332a10;
+  --status-flagged-border: #e0b64a;
+
+  --status-pending:        #c3ccd6;
+  --status-pending-bg:     #262b33;
+  --status-pending-border: #8a94a1;
+
+  --error:        #ff8f87;
+  --error-bg:     #3a1613;
+  --error-border: #ff8f87;
+
+  --shadow:    0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.4);
 }
 
 * {
@@ -67,7 +188,20 @@ body {
   color: var(--text);
   font-family:
     -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: var(--text-base);
   line-height: 1.5;
+}
+
+/* Baseline focus-visible for every interactive element that doesn't
+   define its own (component blocks below override this with a
+   tighter/contextual ring where documented; this is the fallback so
+   nothing interactive in the app is ever focus-invisible). */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+[tabindex]:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .topbar {
@@ -359,13 +493,13 @@ button:hover {
 
 .gate-decision--refused-irrelevant,
 .gate-decision--refused-unsubstantiated {
-  border-left-color: var(--danger);
-  background: var(--danger-bg);
+  border-left-color: var(--status-refused-border);
+  background: var(--status-refused-bg);
 }
 
 .gate-decision--refused-irrelevant strong,
 .gate-decision--refused-unsubstantiated strong {
-  color: var(--danger);
+  color: var(--status-refused);
 }
 
 .gate-decision--flagged {
@@ -442,4 +576,853 @@ button:hover {
 
 .document-downloads a {
   color: var(--accent);
+}
+
+/* =========================================================================
+   Components (wave 5) -- UI-SPEC.md §2. Class names and states are copied
+   verbatim from the spec; every one of the 14 components lives here so it
+   is defined exactly once and reused everywhere, per founder requirement
+   #5. Nothing above this line was renamed or removed.
+   ========================================================================= */
+
+/* --- §2.1 Message bubble (role-differentiated) --------------------------
+   `--ai` (plain text, left, labelled "Setback"), `--resident` (filled
+   accent bubble, right, unlabelled -- the fill itself signals "you"),
+   `--ai-system` (italic, centered, muted, no bubble -- non-conversational
+   log lines like "Evidence added: north-elevation.pdf"). `chat-turn--system`
+   above is the pre-wave-5 alias for this same AI-turn concept; both are
+   safe to use as ".chat-turn--system, .chat-turn--ai" selectors migrate. */
+
+.chat-turn { max-width: 78%; font-size: var(--text-base); }
+
+.chat-turn--ai {
+  align-self: flex-start;
+  background: transparent;
+  border: none;
+  padding: var(--space-1) 0;
+}
+
+.chat-turn--ai .chat-turn__label {
+  display: block;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+  letter-spacing: 0.01em;
+}
+
+.chat-turn__text {
+  margin: 0;
+}
+
+.chat-turn--resident {
+  align-self: flex-end;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-radius: var(--radius) var(--radius) var(--space-1) var(--radius);
+  padding: var(--space-2) var(--space-3);
+  box-shadow: var(--shadow);
+}
+
+.chat-turn--ai-system {
+  align-self: center;
+  background: transparent;
+  border: none;
+  padding: var(--space-1) 0;
+  font-style: italic;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+/* --- §2.2 Quick-reply chip row -------------------------------------------
+   Renders under the latest AI turn when its stage has a closed answer
+   set. Clicking a chip must call the same submit path as typed input
+   (app.js's lane); the row is removed once acted on, never left stale. */
+
+.quick-replies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 var(--space-3);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.chip--reply {
+  border: 1px solid var(--accent);
+  background: var(--surface);
+  color: var(--accent);
+  padding: var(--space-2) var(--space-4);
+  font-weight: 600;
+}
+
+.chip--reply:hover {
+  background: var(--accent-soft);
+}
+
+.chip--reply:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* --- §2.3 Stage stepper ---------------------------------------------------
+   Minimal by design (GOV.UK question-pages pattern): a text counter +
+   optional back-link, never a multi-segment progress bar. */
+
+.stage-stepper {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  margin-bottom: var(--space-2);
+}
+
+.stage-stepper__back {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--text-base);
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+}
+
+.stage-stepper__back:hover {
+  color: var(--accent);
+}
+
+.stage-stepper__back:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.stage-stepper__count {
+  font-weight: 500;
+}
+
+/* --- §2.4 Document card ----------------------------------------------------
+   Replaces the raw-JSON `document_uploaded` line. `.doc-card__thumb--
+   placeholder` is the kind-specific placeholder icon variant for when the
+   evidence pipeline hasn't produced a rendered first page yet (per this
+   wave's explicit non-goal: no new thumbnail pipeline). */
+
+.doc-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.doc-card__thumb {
+  width: 56px;
+  height: 56px;
+  flex: none;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--surface-sunken);
+}
+
+.doc-card__thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.doc-card__thumb--placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+  color: var(--text-muted);
+}
+
+.doc-card__thumb--placeholder::before {
+  content: "\1F4C4"; /* generic document glyph; no per-kind icon set built this wave */
+}
+
+.doc-card__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.doc-card__title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.doc-card__meta {
+  margin: 2px 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* Provenance-grade badge: a trust signal, not a status, so it is a plain
+   neutral tag -- never the --status-* palette (colour-discipline rule 2). */
+
+.tag--grade-a,
+.tag--grade-b {
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  border: 1px solid var(--border-strong);
+}
+
+/* --- §2.5 Citation chip -----------------------------------------------------
+   Three variants (--clause / --doc / --region) sharing one base class,
+   per the NotebookLM two-pane pattern. Behaviour lives in app.js's lane. */
+
+.citation-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-sunken);
+  color: var(--text);
+  border-radius: var(--radius-pill);
+  padding: 2px var(--space-2);
+  font-size: var(--text-xs);
+  font-family: ui-monospace, Menlo, monospace;
+  cursor: pointer;
+}
+
+.citation-chip:hover,
+.citation-chip:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.citation-chip:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Popover shell for the --clause variant's statute-text reveal. */
+
+.citation-chip__popover {
+  position: absolute;
+  z-index: 20;
+  max-width: 320px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-3);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* --- §2.6 Ground card -------------------------------------------------------
+   Extends the bare `.ground-list li` into the full spec'd card. Status
+   modifier covers all 5 GroundStatus values via the same 4-token map
+   the .tag component uses (§2.11) -- proposed/under_review -> --pending,
+   supported -> --shipped, refused -> --refused, flagged -> --flagged. */
+
+.ground-card {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+  margin-bottom: var(--space-3);
+  box-shadow: var(--shadow);
+  list-style: none;
+}
+
+.ground-card__stripe {
+  width: 5px;
+  flex: none;
+}
+
+.ground-card--shipped .ground-card__stripe { background: var(--status-shipped-border); }
+.ground-card--refused .ground-card__stripe { background: var(--status-refused-border); }
+.ground-card--flagged .ground-card__stripe { background: var(--status-flagged-border); }
+.ground-card--pending .ground-card__stripe { background: var(--status-pending-border); }
+
+.ground-card__body {
+  padding: var(--space-3) var(--space-4);
+  flex: 1;
+  min-width: 0;
+}
+
+.ground-card__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.ground-card__claim {
+  margin: 0;
+  font-size: var(--text-lg);
+}
+
+.ground-card__basis {
+  margin: var(--space-1) 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.ground-card__explanation {
+  margin: var(--space-2) 0;
+  font-size: var(--text-sm);
+}
+
+.ground-card__evidence {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.ground-card__thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  margin-right: var(--space-2);
+}
+
+/* --- §2.7 Tribunal live view ("courtroom sitting") -------------------------
+   3-column grid per ground; each row expands while active and collapses
+   to a verdict chip once resolved. Driven entirely by existing SSE
+   events -- app.js's lane, no new backend events required. */
+
+.tribunal-run__plan {
+  margin: 0 0 var(--space-3);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.tribunal-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.tribunal-row {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-3);
+  background: var(--surface);
+}
+
+.tribunal-row--collapsed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.tribunal-row__claim {
+  font-weight: 600;
+}
+
+.tribunal-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.reviewer-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.reviewer-card__name {
+  font-weight: 600;
+  font-size: var(--text-sm);
+}
+
+.reviewer-card__state {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.reviewer-card--active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.reviewer-card--dim {
+  opacity: 0.5;
+}
+
+.reviewer-card--done {
+  border-color: var(--status-shipped-border);
+}
+
+/* Small responsive floor: 3 equal columns get cramped below ~480px --
+   the tribunal row is the widest live-updating component in the app. */
+@media (max-width: 480px) {
+  .tribunal-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* --- §2.8 Disruption card (reviewer split) ---------------------------------
+   Full-width, breaks out of the timeline grid entirely -- deliberately
+   the widest, most visually weighted card on the page besides the final
+   verdict stamps (research: highest-drama beat). Sequential fade for the
+   video-choreography "Clause -> Evidence -> Ruling" reveal (§7 item 2);
+   reduced-motion drops straight to the settled state. */
+
+.disruption-card {
+  border: 1px solid var(--status-flagged-border);
+  background: var(--status-flagged-bg);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  margin: var(--space-4) 0;
+  box-shadow: var(--shadow-lg);
+}
+
+.disruption-card__eyebrow {
+  text-transform: uppercase;
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--status-flagged);
+}
+
+.disruption-card h4 {
+  margin: var(--space-1) 0 var(--space-3);
+  font-size: var(--text-lg);
+}
+
+.disruption-card__opinions p {
+  margin: 0 0 var(--space-2);
+}
+
+.disruption-card__ruling {
+  margin: var(--space-3) 0 0;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--status-flagged-border);
+}
+
+@keyframes disruption-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.disruption-card__opinions p,
+.disruption-card__ruling {
+  opacity: 0;
+  animation: disruption-fade-in 400ms ease forwards;
+}
+
+.disruption-card__opinions p:nth-child(1) { animation-delay: 0ms; }
+.disruption-card__opinions p:nth-child(2) { animation-delay: 150ms; }
+.disruption-card__ruling { animation-delay: 300ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  .disruption-card__opinions p,
+  .disruption-card__ruling {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+/* --- §2.9 Refusal card ------------------------------------------------------
+   Structurally distinct from a ground card -- no status stripe, an info
+   icon not a stamp: "a thing we correctly declined to submit," not "a
+   ground that lost." role="region" in the markup (informational,
+   non-interrupting) -- never role="alert", that's reserved for §2.13. */
+
+.refusal-card {
+  display: flex;
+  gap: var(--space-3);
+  border: 1px solid var(--status-refused-border);
+  background: var(--status-refused-bg);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+}
+
+.refusal-card__icon {
+  font-size: var(--text-lg);
+  color: var(--status-refused);
+  flex: none;
+}
+
+.refusal-card__heading {
+  margin: 0 0 var(--space-1);
+  font-weight: 700;
+}
+
+.refusal-card__claim {
+  margin: 0 0 var(--space-2);
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.refusal-card__reason {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+/* --- §2.10 Verdict banner / stamp -------------------------------------------
+   Deliberately the single largest text element in the app (36px) -- the
+   likely judge-screenshot frame. Colour uses the same 4-token status map
+   as ground cards; both refused-irrelevant and refused-unsubstantiated
+   map to --status-refused (warm brown, never red -- colour-discipline
+   rule 3), differing only in their sub-label text. */
+
+.verdict-stamp {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius);
+  font-weight: 700;
+}
+
+.verdict-stamp__word {
+  font-size: var(--text-2xl);
+  line-height: 1.1;
+}
+
+.verdict-stamp__basis {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  opacity: 0.85;
+}
+
+.verdict-stamp--shipped {
+  background: var(--status-shipped-bg);
+  color: var(--status-shipped);
+}
+
+.verdict-stamp--refused-irrelevant,
+.verdict-stamp--refused-unsubstantiated {
+  background: var(--status-refused-bg);
+  color: var(--status-refused);
+}
+
+@keyframes verdict-stamp-in {
+  from { opacity: 0; transform: scale(1.4); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes verdict-stamp-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.verdict-stamp--animating {
+  animation: verdict-stamp-in 320ms cubic-bezier(.2, .9, .3, 1.2);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .verdict-stamp--animating {
+    animation: none;
+  }
+  .verdict-stamp--animating.verdict-stamp--fade {
+    animation: verdict-stamp-fade 320ms ease;
+  }
+}
+
+/* --- §2.11 Tag (shared status component, single source of truth) ----------
+   Non-interactive by contract (GOV.UK rule: tags are never links/
+   buttons). Reused verbatim by the docket board, evidence cards, ground
+   cards, and the tribunal timeline's collapsed-row verdict chip -- every
+   other status-bearing element derives its colour from these same 4
+   tokens, never a locally-invented shade (founder requirement #5). */
+
+.tag {
+  display: inline-block;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  padding: 3px var(--space-2);
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+
+.tag--shipped { background: var(--status-shipped-bg); color: var(--status-shipped); }
+.tag--refused { background: var(--status-refused-bg); color: var(--status-refused); }
+.tag--flagged { background: var(--status-flagged-bg); color: var(--status-flagged); }
+.tag--pending { background: var(--status-pending-bg); color: var(--status-pending); }
+
+/* --- §2.12 Document viewer with overlay + legend ---------------------------
+   Chrome around the concurrent wave's bbox overlay work: a docked stage
+   plus the mandatory legend (colour-discipline rule 4: any time ≥1
+   overlay colour is on screen, its legend must be too). Bbox border
+   colours drawn by the overlay pipeline should use these same
+   --status-*-border hex values for consistency (that pipeline renders
+   pixels server-side in Python, outside this file's reach -- flagged in
+   this package's handover notes). */
+
+.doc-viewer {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.doc-viewer__stage {
+  position: relative;
+  background: var(--surface-sunken);
+}
+
+.doc-viewer__stage img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+
+.doc-viewer__legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  font-size: var(--text-xs);
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+.legend-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 4px;
+}
+
+.legend-swatch--shipped { background: var(--status-shipped-border); }
+.legend-swatch--refused { background: var(--status-refused-border); }
+.legend-swatch--flagged { background: var(--status-flagged-border); }
+.legend-swatch--pending { background: var(--status-pending-border); }
+
+/* --- §2.13 Empty / loading / error states -----------------------------------
+   One reusable card, three content variants. --error is the only variant
+   using --error/role="alert"; --empty and --loading use neutral tokens
+   only. Every failure path states (a) what happened, (b) that entered
+   data + deadline are unaffected, (c) one concrete next action. */
+
+.state-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  background: var(--surface);
+}
+
+.state-card--empty,
+.state-card--loading {
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.state-card--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+}
+
+.state-card--error {
+  border-color: var(--error-border);
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.state-card--error .state-card__heading {
+  margin: 0 0 var(--space-1);
+  font-weight: 700;
+}
+
+.state-card--error p:not(.state-card__heading) {
+  color: var(--text);
+}
+
+.spinner {
+  display: inline-block;
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spinner-spin 0.8s linear infinite;
+}
+
+@keyframes spinner-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
+/* --- §2.14 Disclaimer footer -------------------------------------------------
+   Present on every page (docket board + case page), never a dismissible
+   modal. Persistent non-affiliation + not-legal-advice statement -- see
+   UI-SPEC.md §5 for the exact civic-genre-not-NSW-brand line this
+   supports. */
+
+.disclaimer-footer {
+  padding: var(--space-4) var(--space-5);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  border-top: 1px solid var(--border);
+  text-align: center;
+}
+
+/* --- §3.8 Check-answers summary list ----------------------------------------
+   GOV.UK summary-list pattern for the interview CONFIRMING/DONE recap. */
+
+.check-answers h3 {
+  font-size: var(--text-lg);
+}
+
+.summary-list {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content;
+  gap: var(--space-2) var(--space-4);
+  margin: 0 0 var(--space-4);
+}
+
+.summary-list__row {
+  display: contents;
+}
+
+.summary-list dt {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.summary-list dd {
+  margin: 0;
+}
+
+.summary-list__change {
+  color: var(--accent);
+  font-size: var(--text-sm);
+  text-decoration: none;
+}
+
+.summary-list__change:hover {
+  text-decoration: underline;
+}
+
+.summary-list__change:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* --- Buttons: primary action + outline variant -----------------------------
+   .button--primary is the explicit affirmative-action class the
+   check-answers "Start the tribunal check" button uses (§3.8); the bare
+   `button` rule above stays the default for every existing untouched
+   form. .button--outline is for de-emphasised actions that still need a
+   visible boundary -- e.g. the §3.7 document-download links, which
+   should read as buttons, not lost mid-sentence as inline text links. */
+
+.button--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+}
+
+.button--primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.button--outline {
+  display: inline-block;
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  text-decoration: none;
+  margin-right: var(--space-2);
+}
+
+.button--outline:hover {
+  background: var(--accent-soft);
+}
+
+.button--outline:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* --- §3.1 Docket card ---------------------------------------------------
+   Replaces the bare docket-row text line with the shared .tag component
+   for an overall case status; the raw case-id hash moves to a title
+   attribute / monospace footer rather than the primary line. */
+
+.docket-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  text-decoration: none;
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.docket-card:hover {
+  border-color: var(--accent);
+}
+
+.docket-card:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.docket-card__main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.docket-card__app {
+  font-weight: 600;
+}
+
+.docket-card__address {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.docket-card__id {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }

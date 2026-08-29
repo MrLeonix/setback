@@ -36,8 +36,10 @@ import hashlib
 import html
 import json
 import os
+import re
 import secrets
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -47,6 +49,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from setback import config
+from setback.clerk import DocumentKind
+from setback.clerk import _classify_document_by_keywords as _classify_document_kind_offline
 from setback.console.guards import (
     enforce_concurrent_tribunal_cap,
     enforce_daily_spend_budget,
@@ -55,10 +59,12 @@ from setback.console.guards import (
 )
 from setback.ingest.tracker import DocumentSource, EvidenceUploadStore, UserUploadedDocumentSource
 from setback.interview.flow import (
+    ConcernNormaliser,
     ConcernType,
     InterviewFlow,
     InterviewStage,
     InterviewTurn,
+    ModelConcernNormaliser,
     ModelQuestionComposer,
     QuestionComposer,
     RaisedConcern,
@@ -71,7 +77,9 @@ from setback.state.firestore import (
     CaseRecord,
     CaseStore,
     GroundRecord,
+    GroundStatus,
 )
+from setback.state.ledger import Ledger
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _DEFAULT_MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB
@@ -254,11 +262,28 @@ class RefusalFeedbackRequest(BaseModel):
     pushback: str
 
 
+_SUGGESTED_REPLIES: Mapping[InterviewStage, tuple[str, ...]] = {
+    # Only stages with a genuinely closed answer set get chips (UI-SPEC.md
+    # §2.2) -- every other stage stays input-only (`None`), exactly like
+    # today. Chip text reads as a spoken confirmation, not a bare boolean
+    # (copy tone guide §4 rule 8).
+    InterviewStage.CONFIRMING: ("Yes, that's right", "No, let me fix that"),
+    InterviewStage.ASK_MORE: ("Yes, there's something else", "No, that's everything"),
+    InterviewStage.REQUESTING_EVIDENCE: ("Skip for now",),
+}
+
+
+def _suggested_replies_for(stage: InterviewStage) -> list[str] | None:
+    replies = _SUGGESTED_REPLIES.get(stage)
+    return list(replies) if replies is not None else None
+
+
 def _turn_to_json(turn: InterviewTurn, transcript: Sequence[InterviewTurn]) -> dict[str, Any]:
     return {
         "stage": turn.stage.value,
         "prompt": turn.prompt,
         "turns": [{"stage": t.stage.value, "prompt": t.prompt} for t in transcript],
+        "suggested_replies": _suggested_replies_for(turn.stage),
     }
 
 
@@ -314,9 +339,14 @@ async def _propose_ground_for_confirmed_concern(
     transcript itself, per `job.pipeline`'s module docstring.
     """
     ground_id = _ground_id_for(case_id, concern)
-    claim = concern.initial_statement
-    if concern.clarification:
-        claim = f"{claim} {concern.clarification}"
+    # P0 fix (wave-4 carry-forward): every ground claim must be built from
+    # the clerk's `redacted_text` -- never the resident's raw statement --
+    # so a name/phone/email the resident typed never reaches a downstream
+    # tribunal prompt or the resident-facing docket board. `redacted_text`
+    # falls back to `initial_statement` only in the defensive case it was
+    # somehow never populated (it always is, in practice -- see
+    # `InterviewFlow._handle_opening`).
+    claim = concern.redacted_text or concern.initial_statement
     await store.propose_ground(case_id, ground_id, claim=claim)
     category = _CONCERN_CATEGORY.get(concern.concern_type, "environmental_and_social_impacts")
     await store.append_event(
@@ -384,6 +414,7 @@ def create_app(
     composer: QuestionComposer,
     document_source: EvidenceUploadStore | None = None,
     job_trigger: JobTrigger | None = None,
+    concern_normaliser: ConcernNormaliser | None = None,
     max_upload_bytes: int = _DEFAULT_MAX_UPLOAD_BYTES,
     sse_poll_interval_seconds: float = 0.5,
     sse_idle_timeout_seconds: float | None = None,
@@ -401,6 +432,16 @@ def create_app(
             or `evidence.storage.GcsEvidenceStore` in production). Defaults
             to a fresh in-memory `UserUploadedDocumentSource` per app.
         job_trigger: Starts the tribunal job. Defaults to `LoggingJobTrigger`.
+        concern_normaliser: Classifies a resident's opening statement into
+            structured `NormalisedConcern`s (see `interview.flow.
+            ConcernNormaliser`). Defaults to `None`, which leaves
+            `InterviewFlow` to fall back to its own offline
+            `KeywordConcernNormaliser` -- production wiring
+            (`_build_production_app`) passes a real `ModelConcernNormaliser`
+            instead (P0 wave-4-carry-forward fix: this was previously never
+            wired at all, so every deployed interview silently ran the
+            keyword-only fallback regardless of the Gemma clerk's
+            availability).
         max_upload_bytes: Hard cap on a single document/photo upload.
         sse_poll_interval_seconds: How often the events stream re-checks
             `store` for new events.
@@ -443,7 +484,7 @@ def create_app(
         await _require_case(case_id)
         flow = interview_flows.get(case_id)
         if flow is None:
-            flow = InterviewFlow(composer=composer)
+            flow = InterviewFlow(composer=composer, concern_normaliser=concern_normaliser)
             interview_flows[case_id] = flow
             turn = await flow.start()
             await _persist_system_turn(store, case_id, turn)
@@ -619,7 +660,8 @@ def create_app(
         case = await _require_case(case_id)
         grounds = await store.list_grounds(case_id)
         events = await store.list_events(case_id)
-        return render_case_page(case, grounds, events)
+        ledger = await store.load_ledger(case_id)
+        return render_case_page(case, grounds, events, ledger)
 
     return app
 
@@ -636,21 +678,67 @@ _PAGE_STYLE = """
 """
 
 
-def render_docket_board(cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ...]]]) -> str:
-    """Render the docket board: every case this console instance has
-    created, with a live-updating grounds count."""
-    rows = "".join(
-        f"""
-        <a class="docket-row" href="/cases/{_esc(case.case_id)}">
-          <div class="docket-row__main">
-            <span class="docket-row__app">{_esc(case.application_number)}</span>
-            <span class="docket-row__id">{_esc(case.case_id)}</span>
+_DISCLAIMER_FOOTER = """
+  <footer class="disclaimer-footer">
+    <p>Setback is not a law firm and does not provide legal advice. It helps you prepare a
+    submission; council and the Land and Environment Court decide the outcome. Not affiliated
+    with, endorsed by, or a service of the NSW Government.</p>
+  </footer>
+"""
+"""Persistent, non-dismissible footer (UI-SPEC.md §2.14/§5) -- present on
+every page, not a modal a resident can dismiss once."""
+
+
+_DOCKET_STATUS_MODIFIER_AND_LABEL: Mapping[str, tuple[str, str]] = {
+    "flagged": ("flagged", "Needs your input"),
+    "in_review": ("pending", "In review"),
+    "ready": ("shipped", "Ready to submit"),
+    "just_started": ("pending", "Just started"),
+}
+
+
+def _docket_status_for(grounds: Sequence[GroundRecord]) -> tuple[str, str]:
+    """Derive the docket board's overall case status from the
+    worst-priority ground status present (UI-SPEC.md §3.1): any `flagged`
+    ground needs the resident's attention first; any ground still
+    `proposed`/`under_review` means the tribunal hasn't finished; once
+    every ground has reached a terminal state (`supported` or `refused`)
+    the case is ready to submit; no grounds at all means the interview
+    hasn't produced one yet.
+
+    Returns the `(tag_modifier, label)` pair -- `tag_modifier` is one of
+    the shared four-token `.tag--*` classes (§2.11), `label` the
+    plain-English adjective shown on it (copy tone guide §4 rule 6).
+    """
+    if not grounds:
+        modifier, label = _DOCKET_STATUS_MODIFIER_AND_LABEL["just_started"]
+        return modifier, label
+    statuses = {g.status for g in grounds}
+    if GroundStatus.FLAGGED in statuses:
+        return _DOCKET_STATUS_MODIFIER_AND_LABEL["flagged"]
+    if GroundStatus.PROPOSED in statuses or GroundStatus.UNDER_REVIEW in statuses:
+        return _DOCKET_STATUS_MODIFIER_AND_LABEL["in_review"]
+    return _DOCKET_STATUS_MODIFIER_AND_LABEL["ready"]
+
+
+def _render_docket_card(case: CaseRecord, grounds: Sequence[GroundRecord]) -> str:
+    modifier, label = _docket_status_for(grounds)
+    return f"""
+        <a class="docket-card" href="/cases/{_esc(case.case_id)}" title="{_esc(case.case_id)}">
+          <div class="docket-card__main">
+            <span class="docket-card__app">{_esc(case.application_number)}</span>
+            <span class="docket-card__id">{_esc(case.case_id)}</span>
           </div>
-          <span class="badge">{len(grounds)} ground(s)</span>
+          <span class="tag tag--{modifier}">{_esc(label)}</span>
         </a>
         """
-        for case, grounds in cases
-    )
+
+
+def render_docket_board(cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ...]]]) -> str:
+    """Render the docket board: every case this console instance has
+    created, each as a `.docket-card` (UI-SPEC.md §3.1) carrying a derived
+    overall-status tag rather than a bare grounds count."""
+    rows = "".join(_render_docket_card(case, grounds) for case, grounds in cases)
     if not rows:
         rows = '<p class="empty">No cases yet -- create one to get started.</p>'
     return f"""
@@ -672,6 +760,7 @@ def render_docket_board(cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ..
       {rows}
     </div>
   </main>
+{_DISCLAIMER_FOOTER}
   <script src="/static/app.js"></script>
 </body>
 </html>
@@ -708,11 +797,46 @@ def _render_review_verdict_item(event: CaseEvent) -> str:
     )
 
 
-def _render_gate_decision_item(event: CaseEvent) -> str:
+def _render_refusal_card_item(
+    event: CaseEvent, grounds_by_id: Mapping[str, GroundRecord], total_grounds: int
+) -> str:
+    """A statutory-gate refusal, framed as rigor rather than apology
+    (UI-SPEC.md §2.9 / copy tone guide §4 rules 4-5): `role="region"`
+    (informational, non-interrupting), warm brown (`--status-refused`) --
+    never `--error`/`role="alert"`, which is reserved for true system
+    failures (founder requirement #4)."""
     payload = event.payload
+    ground_id = str(payload.get("ground_id", ""))
+    ground = grounds_by_id.get(ground_id)
+    claim = ground.claim if ground is not None else "this ground"
+    explanation = str(payload.get("explanation", ""))
+    other_count = max(total_grounds - 1, 0)
+    reassurance = ""
+    if other_count > 0:
+        noun = "ground" if other_count == 1 else "grounds"
+        verb = "is" if other_count == 1 else "are"
+        reassurance = f" Your other {other_count} {noun} {verb} unaffected."
     return (
-        f'<li class="gate-decision gate-decision--{_esc(payload.get("status", ""))}">'
-        f"<strong>{_esc(payload.get('status', ''))}</strong> "
+        '<li><div class="refusal-card" role="region" aria-label="A ground that was not included">'
+        '<span class="refusal-card__icon" aria-hidden="true">&#9432;</span>'
+        "<div>"
+        '<p class="refusal-card__heading">We didn&rsquo;t include this ground</p>'
+        f'<p class="refusal-card__claim">&ldquo;{_esc(claim)}&rdquo;</p>'
+        f'<p class="refusal-card__reason">{_esc(explanation)}{reassurance}</p>'
+        "</div></div></li>"
+    )
+
+
+def _render_gate_decision_item(
+    event: CaseEvent, grounds_by_id: Mapping[str, GroundRecord], total_grounds: int
+) -> str:
+    payload = event.payload
+    status = str(payload.get("status", ""))
+    if status.startswith("refused"):
+        return _render_refusal_card_item(event, grounds_by_id, total_grounds)
+    return (
+        f'<li class="gate-decision gate-decision--{_esc(status)}">'
+        f"<strong>{_esc(status)}</strong> "
         f"({_esc(payload.get('statutory_basis', ''))})<br>"
         f"{_esc(payload.get('explanation', ''))}</li>"
     )
@@ -749,12 +873,117 @@ def _render_submission_composed_item(case_id: str, event: CaseEvent) -> str:
     </li>"""
 
 
+_DOCUMENT_KIND_LABELS: Mapping[DocumentKind, str] = {
+    DocumentKind.ELEVATIONS: "Elevations",
+    DocumentKind.SITE_PLAN: "Site plan",
+    DocumentKind.SEE: "Statement of Environmental Effects",
+    DocumentKind.SHADOW_DIAGRAM: "Shadow diagram",
+    DocumentKind.SURVEY: "Survey",
+    DocumentKind.BASIX: "BASIX certificate",
+    DocumentKind.WASTE: "Waste management plan",
+    DocumentKind.OTHER: "Document",
+}
+"""`DocumentKind` -> plain-English label (UI-SPEC.md §2.4) -- the raw enum
+value is never shown to a resident."""
+
+
+def _humanize_filename(filename: str) -> str:
+    """`"north-elevation.pdf"` -> `"North elevation"` -- a plain-English
+    doc-card title, not the raw filename with its extension and dashes."""
+    stem = filename.rsplit(".", 1)[0] if filename else ""
+    words = [w for w in re.split(r"[-_\s]+", stem) if w]
+    if not words:
+        return "Document"
+    first, *rest = words
+    return " ".join([first.capitalize(), *(w.lower() for w in rest)])
+
+
+def _format_clock_time(dt: datetime) -> str:
+    """`"2:14pm"`, not an ISO timestamp (copy tone guide §4 rule 2)."""
+    hour = dt.hour % 12 or 12
+    period = "am" if dt.hour < 12 else "pm"
+    return f"{hour}:{dt.minute:02d}{period}"
+
+
+def _is_photo_upload(filename: str, content_type: object) -> bool:
+    """Mirrors `job.pipeline._UploadedDocument.is_pdf`'s exact rule (a
+    non-PDF upload is treated as a photo) so the doc-card's provenance
+    badge, shown at upload time, agrees with the grade the tribunal
+    pipeline will actually assign this same document later."""
+    content_type_str = str(content_type or "").lower()
+    is_pdf = "pdf" in content_type_str or filename.lower().endswith(".pdf")
+    return not is_pdf
+
+
+def _render_document_uploaded_item(_case_id: str, event: CaseEvent) -> str:
+    """A `.doc-card` (UI-SPEC.md §2.4/§3.3) -- always the placeholder-icon
+    thumbnail variant, since the document-upload event fires before the
+    evidence pipeline has ever rendered a first page (this wave's explicit
+    non-goal: no new thumbnail pipeline). The `DocumentKind` is classified
+    via the clerk's own deterministic, no-model-call fallback
+    (`_classify_document_by_keywords`) over the filename alone -- the same
+    fallback the clerk itself degrades to on a Gemma outage, so this never
+    makes a live call and never blocks."""
+    payload = event.payload
+    filename = str(payload.get("filename") or "document")
+    content_type = payload.get("content_type")
+    kind = _classify_document_kind_offline(filename, "")
+    kind_label = _DOCUMENT_KIND_LABELS.get(kind, "Document")
+    title = _humanize_filename(filename)
+    uploaded_at = _format_clock_time(event.recorded_at)
+    grade_badge = ""
+    if _is_photo_upload(filename, content_type):
+        grade_badge = (
+            '<span class="tag tag--grade-a" title="Provenance grade A -- your own photo">'
+            "Your photo</span>"
+        )
+    return (
+        '<li><div class="doc-card">'
+        '<div class="doc-card__thumb doc-card__thumb--placeholder"></div>'
+        '<div class="doc-card__body">'
+        f'<p class="doc-card__title">{_esc(title)}</p>'
+        f'<p class="doc-card__meta">{_esc(kind_label)} &middot; uploaded {_esc(uploaded_at)}</p>'
+        "</div>"
+        f"{grade_badge}"
+        "</div></li>"
+    )
+
+
+def _render_interview_turn_item(_case_id: str, event: CaseEvent) -> str:
+    """The server-rendered twin of `app.js`'s client-side chat bubble
+    (UI-SPEC.md §2.1/§3.4) -- both must look identical, since they show the
+    same transcript on the same page."""
+    payload = event.payload
+    role = str(payload.get("role", "system"))
+    message = str(payload.get("message", ""))
+    if role == "resident":
+        bubble = (
+            '<div class="chat-turn chat-turn--resident">'
+            f'<p class="chat-turn__text">{_esc(message)}</p>'
+            "</div>"
+        )
+    else:
+        bubble = (
+            '<div class="chat-turn chat-turn--ai">'
+            '<span class="chat-turn__label">Setback</span>'
+            f'<p class="chat-turn__text">{_esc(message)}</p>'
+            "</div>"
+        )
+    return f"<li>{bubble}</li>"
+
+
 _EVENT_ITEM_RENDERERS: Mapping[str, Callable[[str, CaseEvent], str]] = {
     "review_verdict": lambda _case_id, e: _render_review_verdict_item(e),
-    "gate_decision": lambda _case_id, e: _render_gate_decision_item(e),
     "annotated_overlay": lambda _case_id, e: _render_annotated_overlay_item(e),
     "submission_composed": _render_submission_composed_item,
+    "document_uploaded": _render_document_uploaded_item,
+    "interview_turn": _render_interview_turn_item,
 }
+"""Event types rendered via the `(case_id, event) -> html` shape. `gate_
+decision` is deliberately absent -- it needs the case's full grounds list
+(to name a refused ground's claim and count its unaffected siblings), so
+it is rendered by `_render_gate_decisions_section` instead, called
+directly from `render_case_page`."""
 
 
 def _render_events_section(
@@ -779,41 +1008,149 @@ def _render_events_section(
     )
 
 
-def _render_grounds_section(grounds: Sequence[GroundRecord]) -> str:
+def _render_gate_decisions_section(
+    events: Sequence[CaseEvent], grounds_by_id: Mapping[str, GroundRecord], total_grounds: int
+) -> str:
+    title = _EVENT_SECTION_TITLES["gate_decision"]
+    if not events:
+        return (
+            f'<section class="card"><h3>{_esc(title)}</h3>'
+            '<p class="empty">Nothing yet.</p></section>'
+        )
+    items = "".join(_render_gate_decision_item(e, grounds_by_id, total_grounds) for e in events)
+    return (
+        f'<section class="card"><h3>{_esc(title)}</h3><ul class="event-list">{items}</ul></section>'
+    )
+
+
+_GROUND_STATUS_MODIFIER_AND_LABEL: Mapping[GroundStatus, tuple[str, str]] = {
+    # All 5 `GroundStatus` values covered (UI-SPEC.md §2.6/§3.6) -- the
+    # pre-wave-5 code only styled 3 of them, leaving `proposed`/`under_
+    # review` unstyled. Both map to the neutral `pending` token; the other
+    # three map 1:1 onto their own status.
+    GroundStatus.PROPOSED: ("pending", "Pending"),
+    GroundStatus.UNDER_REVIEW: ("pending", "Pending"),
+    GroundStatus.SUPPORTED: ("shipped", "Shipped"),
+    GroundStatus.REFUSED: ("refused", "Refused"),
+    GroundStatus.FLAGGED: ("flagged", "Flagged"),
+}
+
+
+def _render_ground_card(ground: GroundRecord, gate_decision: Mapping[str, Any] | None) -> str:
+    modifier, label = _GROUND_STATUS_MODIFIER_AND_LABEL[ground.status]
+    basis_html = ""
+    explanation_html = ""
+    if gate_decision is not None:
+        basis = str(gate_decision.get("statutory_basis") or "")
+        if basis:
+            basis_html = (
+                '<p class="ground-card__basis">Statutory basis: '
+                f'<span class="citation-chip citation-chip--clause">{_esc(basis)}</span></p>'
+            )
+        explanation = str(gate_decision.get("explanation") or "")
+        if explanation:
+            explanation_html = f'<p class="ground-card__explanation">{_esc(explanation)}</p>'
+    return (
+        f'<li class="ground-card ground-card--{modifier}">'
+        '<div class="ground-card__stripe" aria-hidden="true"></div>'
+        '<div class="ground-card__body">'
+        '<div class="ground-card__head">'
+        f'<h4 class="ground-card__claim">{_esc(ground.claim)}</h4>'
+        f'<span class="tag tag--{modifier}">{_esc(label)}</span>'
+        "</div>"
+        f"{basis_html}{explanation_html}"
+        "</div></li>"
+    )
+
+
+def _render_grounds_section(
+    grounds: Sequence[GroundRecord], gate_decisions_by_ground: Mapping[str, Mapping[str, Any]]
+) -> str:
     if not grounds:
         return (
             '<section class="card"><h3>Grounds</h3>'
             '<p class="empty">No grounds proposed yet.</p></section>'
         )
-    rows = "".join(
-        f"""<li class="ground ground--{_esc(g.status.value)}">
-              <span class="ground__claim">{_esc(g.claim)}</span>
-              <span class="badge">{_esc(g.status.value)}</span>
-            </li>"""
-        for g in grounds
+    items = "".join(
+        _render_ground_card(g, gate_decisions_by_ground.get(g.ground_id)) for g in grounds
     )
-    return f'<section class="card"><h3>Grounds</h3><ul class="ground-list">{rows}</ul></section>'
+    return f'<section class="card"><h3>Grounds</h3><ul class="ground-list">{items}</ul></section>'
+
+
+def _render_check_answers_section(
+    grounds: Sequence[GroundRecord], events: Sequence[CaseEvent]
+) -> str:
+    """The GOV.UK-pattern check-your-answers recap (UI-SPEC.md §3.8), shown
+    once the interview reaches `InterviewStage.DONE`. Read-only: the
+    interview state machine cannot reopen an arbitrary past stage this
+    wave, so per the spec's own graceful-degradation rule this ships a
+    single "Change" link that reopens the full transcript rather than a
+    fake per-row edit that would not actually work."""
+    interview_done = any(
+        e.event_type == "interview_turn" and e.payload.get("stage") == InterviewStage.DONE.value
+        for e in events
+    )
+    if not interview_done or not grounds:
+        return ""
+    document_count = sum(1 for e in events if e.event_type == "document_uploaded")
+    rows = "".join(
+        f'<div class="summary-list__row"><dt>Ground {i}</dt><dd>{_esc(g.claim)}</dd></div>'
+        for i, g in enumerate(grounds, start=1)
+    )
+    rows += (
+        '<div class="summary-list__row"><dt>Evidence</dt>'
+        f"<dd>{document_count} document(s) uploaded</dd></div>"
+    )
+    return f"""
+    <section class="card check-answers">
+      <h3>Check your answers before we check them against the Act</h3>
+      <dl class="summary-list">{rows}</dl>
+      <a class="summary-list__change" href="#interview-transcript">Change something</a>
+    </section>
+    """
 
 
 def render_case_page(
-    case: CaseRecord, grounds: Sequence[GroundRecord], events: Sequence[CaseEvent]
+    case: CaseRecord,
+    grounds: Sequence[GroundRecord],
+    events: Sequence[CaseEvent],
+    ledger: Ledger | None = None,
 ) -> str:
     """Render the case page: interview transcript, evidence, reviewer
     opinions, adjudication, gate decisions with refusal explanations, and
     output documents -- each section reads directly from the case's event
     log, so it renders correctly (as "nothing yet") for every stage the
     tribunal pipeline hasn't reached, and fills in automatically once a
-    future wave starts emitting that event type."""
+    future wave starts emitting that event type.
+
+    `ledger`: the case's token-spend ledger (`CaseStore.load_ledger`), if
+    any run has booked cost against it yet. Cost-visibility carry-forward
+    (wave-4 -> wave-5): there was previously no UI/API surface for this at
+    all. This package exposes the total as a `data-run-cost-usd` attribute
+    on `<body>` -- the tribunal-timeline "This run: $0.02" chip itself is
+    package C's (`app.js`) to render, reading this attribute.
+    """
     by_type: dict[str, list[CaseEvent]] = {}
     for event in events:
         by_type.setdefault(event.event_type, []).append(event)
 
+    grounds_by_id = {g.ground_id: g for g in grounds}
+    total_grounds = len(grounds)
+    gate_decision_events = by_type.get("gate_decision", ())
+    gate_decisions_by_ground: dict[str, Mapping[str, Any]] = {
+        str(e.payload.get("ground_id", "")): e.payload for e in gate_decision_events
+    }
+
     sections = "".join(
-        _render_events_section(case.case_id, event_type, title, by_type.get(event_type, ()))
+        _render_gate_decisions_section(gate_decision_events, grounds_by_id, total_grounds)
+        if event_type == "gate_decision"
+        else _render_events_section(case.case_id, event_type, title, by_type.get(event_type, ()))
         for event_type, title in _EVENT_SECTION_TITLES.items()
     )
-    grounds_section = _render_grounds_section(grounds)
+    grounds_section = _render_grounds_section(grounds, gate_decisions_by_ground)
+    check_answers_section = _render_check_answers_section(grounds, events)
     last_sequence = max((e.sequence for e in events), default=-1)
+    run_cost_usd = ledger.total_cost_usd if ledger is not None else 0.0
 
     return f"""
 <!doctype html>
@@ -823,7 +1160,8 @@ def render_case_page(
   <title>Setback -- {_esc(case.application_number)}</title>
   {_PAGE_STYLE}
 </head>
-<body data-case-id="{_esc(case.case_id)}" data-last-sequence="{last_sequence}">
+<body data-case-id="{_esc(case.case_id)}" data-last-sequence="{last_sequence}"
+      data-run-cost-usd="{run_cost_usd:.6f}">
   <header class="topbar">
     <h1>Setback</h1>
     <p class="tagline">Case {_esc(case.application_number)} &middot; {_esc(case.case_id)}</p>
@@ -843,9 +1181,11 @@ def render_case_page(
       </form>
       <button id="start-tribunal" type="button">Start tribunal</button>
     </section>
+    {check_answers_section}
     {grounds_section}
     {sections}
   </main>
+{_DISCLAIMER_FOOTER}
   <script src="/static/app.js"></script>
 </body>
 </html>
@@ -890,6 +1230,7 @@ def _build_production_app() -> FastAPI:
         composer=ModelQuestionComposer(model_client),
         document_source=document_source,
         job_trigger=job_trigger,
+        concern_normaliser=ModelConcernNormaliser(model_client),
     )
 
 

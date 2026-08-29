@@ -18,7 +18,8 @@ from fastapi.testclient import TestClient
 
 from setback.console.app import RealJobTrigger, create_app
 from setback.ingest.tracker import ExhibitedDocument, UserUploadedDocumentSource
-from setback.state.firestore import InMemoryCaseStore, case_id_for
+from setback.interview.flow import NormalisedConcern
+from setback.state.firestore import GroundStatus, InMemoryCaseStore, case_id_for
 
 
 class _FakeComposer:
@@ -667,3 +668,412 @@ async def test_real_job_trigger_defaults_project_and_region_from_config() -> Non
     assert client.requests[0]["name"] == (
         f"projects/{config.GCP_PROJECT}/locations/{config.REGION}/jobs/setback-tribunal"
     )
+
+
+# --- wave 5: human-rendered document_uploaded / interview_turn (UI-SPEC.md §3.3/§3.4) ---
+
+
+def test_document_uploaded_renders_a_doc_card_with_no_raw_json(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("north-elevation.pdf", io.BytesIO(b"%PDF-fake"), "application/pdf")},
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    # No raw event payload keys leaking through as literal JSON text.
+    assert '"document_id"' not in response.text
+    assert '"content_type"' not in response.text
+    assert '"size_bytes"' not in response.text
+    assert 'class="doc-card"' in response.text
+    assert "North elevation" in response.text
+    # A plain-English DocumentKind label, never the raw enum value.
+    assert "Elevations" in response.text
+
+
+def test_document_uploaded_pdf_gets_no_provenance_badge(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("site-plan.pdf", io.BytesIO(b"%PDF-fake"), "application/pdf")},
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert "tag--grade-a" not in response.text
+
+
+def test_document_uploaded_photo_gets_your_photo_provenance_tag(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert 'class="tag tag--grade-a"' in response.text
+    assert "Your photo" in response.text
+
+
+def test_interview_turn_renders_as_chat_bubbles_with_no_raw_json(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    client.post(
+        f"/api/cases/{case_id}/interview",
+        json={"answer": "It'll overshadow my garden."},
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert '"role"' not in response.text
+    assert '"stage"' not in response.text
+    assert 'class="chat-turn chat-turn--ai"' in response.text
+    assert 'class="chat-turn chat-turn--resident"' in response.text
+    assert 'class="chat-turn__label"' in response.text
+    assert "It&#x27;ll overshadow my garden." in response.text or (
+        "It'll overshadow my garden." in response.text
+    )
+
+
+def test_interview_turn_ai_bubble_is_labelled_setback_resident_bubble_is_not(
+    client: TestClient,
+) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    response = client.get(f"/cases/{case_id}")
+    assert "Setback" in response.text
+    # The AI label appears exactly once per AI turn (one opening turn so far).
+    assert response.text.count('class="chat-turn__label">Setback<') == 1
+
+
+# --- wave 5: suggested_replies (UI-SPEC.md §2.2) -----------------------------
+
+
+def test_suggested_replies_present_at_confirming_stage(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Overshadowing my garden."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Loses sun in winter."})
+    response = client.post(f"/api/cases/{case_id}/interview", json={"answer": "No photos."})
+    body = response.json()
+    assert body["stage"] == "confirming"
+    assert body["suggested_replies"] == ["Yes, that's right", "No, let me fix that"]
+
+
+def test_suggested_replies_present_for_requesting_evidence_stage(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    response = client.post(
+        f"/api/cases/{case_id}/interview", json={"answer": "Overshadowing my garden."}
+    )
+    assert response.json()["stage"] == "clarifying"
+    response = client.post(
+        f"/api/cases/{case_id}/interview", json={"answer": "Loses sun in winter."}
+    )
+    assert response.json()["stage"] == "requesting_evidence"
+    assert response.json()["suggested_replies"] == ["Skip for now"]
+
+
+def test_suggested_replies_absent_for_clarifying_stage(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    response = client.post(
+        f"/api/cases/{case_id}/interview", json={"answer": "Overshadowing my garden."}
+    )
+    assert response.json()["stage"] == "clarifying"
+    assert response.json()["suggested_replies"] is None
+
+
+# --- wave 5: ground cards, all 5 GroundStatus values (UI-SPEC.md §2.6/§3.6) --
+
+
+async def _make_ground(
+    store: InMemoryCaseStore, case_id: str, ground_id: str, status: GroundStatus
+) -> None:
+    await store.propose_ground(case_id, ground_id, claim=f"Claim for {ground_id}")
+    if status is not GroundStatus.PROPOSED:
+        await store.transition_ground(case_id, ground_id, GroundStatus.UNDER_REVIEW)
+    if status not in (GroundStatus.PROPOSED, GroundStatus.UNDER_REVIEW):
+        await store.transition_ground(case_id, ground_id, status)
+
+
+def test_ground_card_covers_all_five_ground_statuses(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-proposed", GroundStatus.PROPOSED))
+    asyncio.run(_make_ground(store, case_id, "g-under-review", GroundStatus.UNDER_REVIEW))
+    asyncio.run(_make_ground(store, case_id, "g-supported", GroundStatus.SUPPORTED))
+    asyncio.run(_make_ground(store, case_id, "g-refused", GroundStatus.REFUSED))
+    asyncio.run(_make_ground(store, case_id, "g-flagged", GroundStatus.FLAGGED))
+
+    response = client.get(f"/cases/{case_id}")
+    body = response.text
+    assert 'class="ground-card ground-card--pending"' in body  # proposed + under_review
+    assert body.count("ground-card--pending") == 2
+    assert 'class="ground-card ground-card--shipped"' in body
+    assert 'class="ground-card ground-card--refused"' in body
+    assert 'class="ground-card ground-card--flagged"' in body
+    assert '<span class="tag tag--shipped">Shipped</span>' in body
+    assert '<span class="tag tag--refused">Refused</span>' in body
+    assert '<span class="tag tag--flagged">Flagged</span>' in body
+
+
+def test_ground_card_shows_statutory_basis_and_explanation_from_gate_decision(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-shipped", GroundStatus.SUPPORTED))
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "gate-decision:g-shipped",
+            "gate_decision",
+            payload={
+                "ground_id": "g-shipped",
+                "status": "shipped",
+                "category": "environmental_and_social_impacts",
+                "explanation": "The shadow diagram shows a clear winter impact.",
+                "statutory_basis": "s4.15(1)(b)",
+                "citation_issues": [],
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    body = response.text
+    assert "s4.15(1)(b)" in body
+    assert "The shadow diagram shows a clear winter impact." in body
+    assert 'class="citation-chip citation-chip--clause"' in body
+
+
+# --- wave 5: refusal card is informational, warm brown, never --error (UI-SPEC.md §2.9) ---
+
+
+def test_refused_gate_decision_renders_as_a_refusal_card_region(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.REFUSED))
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "gate-decision:g-1",
+            "gate_decision",
+            payload={
+                "ground_id": "g-1",
+                "status": "refused-irrelevant",
+                "category": "property_value",
+                "explanation": "Property value alone is not a s4.15(1) planning matter.",
+                "statutory_basis": "s4.15(1)",
+                "citation_issues": [],
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    body = response.text
+    assert 'class="refusal-card" role="region"' in body
+    assert "We didn" in body  # "We didn't include this ground" (curly apostrophe)
+    assert "Claim for g-1" in body
+    assert "Property value alone is not a s4.15(1) planning matter." in body
+    assert 'role="alert"' not in body  # never framed as an error
+    assert 'class="state-card--error"' not in body
+
+
+def test_refusal_card_states_how_many_other_grounds_are_unaffected(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-refused", GroundStatus.REFUSED))
+    asyncio.run(_make_ground(store, case_id, "g-supported-1", GroundStatus.SUPPORTED))
+    asyncio.run(_make_ground(store, case_id, "g-supported-2", GroundStatus.SUPPORTED))
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "gate-decision:g-refused",
+            "gate_decision",
+            payload={
+                "ground_id": "g-refused",
+                "status": "refused-unsubstantiated",
+                "category": "environmental_and_social_impacts",
+                "explanation": "Not well-founded on the material provided.",
+                "statutory_basis": "s4.15(1)(b)",
+                "citation_issues": [],
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert "Your other 2 grounds are unaffected." in response.text
+
+
+# --- wave 5: docket board derived status tag (UI-SPEC.md §3.1) --------------
+
+
+def test_docket_board_shows_just_started_when_no_grounds(client: TestClient) -> None:
+    _create_case(client)
+    response = client.get("/")
+    assert '<span class="tag tag--pending">Just started</span>' in response.text
+
+
+def test_docket_board_shows_needs_your_input_when_a_ground_is_flagged(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.FLAGGED))
+    response = client.get("/")
+    assert '<span class="tag tag--flagged">Needs your input</span>' in response.text
+
+
+def test_docket_board_shows_in_review_while_a_ground_is_still_pending(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.PROPOSED))
+    response = client.get("/")
+    assert '<span class="tag tag--pending">In review</span>' in response.text
+
+
+def test_docket_board_shows_ready_to_submit_once_every_ground_is_terminal(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.SUPPORTED))
+    asyncio.run(_make_ground(store, case_id, "g-2", GroundStatus.REFUSED))
+    response = client.get("/")
+    assert '<span class="tag tag--shipped">Ready to submit</span>' in response.text
+
+
+# --- wave 5: disclaimer footer, every page (UI-SPEC.md §2.14) ----------------
+
+
+def test_disclaimer_footer_present_on_docket_board(client: TestClient) -> None:
+    response = client.get("/")
+    assert 'class="disclaimer-footer"' in response.text
+    assert "not a law firm" in response.text
+    assert "NSW Government" in response.text
+
+
+def test_disclaimer_footer_present_on_case_page(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert 'class="disclaimer-footer"' in response.text
+
+
+# --- wave 5: check-your-answers summary list (UI-SPEC.md §3.8) --------------
+
+
+def test_check_answers_absent_before_interview_reaches_done(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    response = client.get(f"/cases/{case_id}")
+    assert 'class="card check-answers"' not in response.text
+
+
+def test_check_answers_appears_once_interview_reaches_done(client: TestClient) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Overshadowing my garden."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Loses sun in winter."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "No photos."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Yes, correct."})
+    response = client.post(f"/api/cases/{case_id}/interview", json={"answer": "No, that's all."})
+    assert response.json()["stage"] == "done"
+
+    page = client.get(f"/cases/{case_id}")
+    assert 'class="card check-answers"' in page.text
+    assert "Ground 1" in page.text
+    assert "Change" in page.text
+    assert "overshadow" in page.text.lower()
+
+
+# --- wave 5 / P0 carry-forward: ground claims use redacted_text, never raw PII ---
+# (UI-SPEC.md's wave-4 carry-forward: NormalisedConcern.redacted_text, never
+# raw resident text, must back every ground claim.)
+
+
+def test_ground_claim_uses_redacted_text_not_raw_resident_statement(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    client.post(
+        f"/api/cases/{case_id}/interview",
+        json={"answer": "My name is Jane Smith, it'll overshadow my garden."},
+    )
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "Loses sun in winter."})
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "No photos."})
+    response = client.post(f"/api/cases/{case_id}/interview", json={"answer": "Yes, correct."})
+    assert response.json()["stage"] == "ask_more"
+
+    grounds = asyncio.run(store.list_grounds(case_id))
+    assert len(grounds) == 1
+    assert "Jane Smith" not in grounds[0].claim
+    assert "[NAME]" in grounds[0].claim
+    assert "overshadow" in grounds[0].claim.lower()
+
+
+# --- wave 5 / P0 carry-forward: ConcernNormaliser wired into production InterviewFlow ---
+
+
+class _RecordingConcernNormaliser:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def normalise(self, text: str) -> list[NormalisedConcern]:
+        self.calls.append(text)
+        from setback.clerk import ConcernType
+
+        return [
+            NormalisedConcern(
+                category=ConcernType.OVERSHADOWING,
+                target=None,
+                qualifiers=[],
+                redacted_text=text,
+            )
+        ]
+
+
+def test_create_app_wires_an_injected_concern_normaliser_into_the_interview_flow(
+    store: InMemoryCaseStore, composer: _FakeComposer
+) -> None:
+    normaliser = _RecordingConcernNormaliser()
+    app = create_app(
+        store,
+        composer=composer,
+        document_source=UserUploadedDocumentSource(),
+        concern_normaliser=normaliser,
+    )
+    client = TestClient(app)
+    case_id = _create_case(client)
+    client.get(f"/api/cases/{case_id}/interview")
+    client.post(f"/api/cases/{case_id}/interview", json={"answer": "It overshadows my garden."})
+
+    assert normaliser.calls == ["It overshadows my garden."]
+
+
+# --- wave 5: cost visibility -- ledger total exposed on the case page (P0 carry-forward) ---
+
+
+def test_case_page_exposes_the_run_cost_as_a_data_attribute(
+    store: InMemoryCaseStore, composer: _FakeComposer
+) -> None:
+    from setback.models.client import TokenUsage
+    from setback.state.ledger import Ledger
+
+    app = create_app(store, composer=composer, document_source=UserUploadedDocumentSource())
+    client = TestClient(app)
+    case_id = _create_case(client)
+
+    ledger = Ledger()
+    ledger.record(
+        stage="test",
+        model="gemini-3.5-flash-lite",
+        usage=TokenUsage(prompt_tokens=1000, output_tokens=1000),
+    )
+    asyncio.run(store.save_ledger(case_id, ledger))
+
+    response = client.get(f"/cases/{case_id}")
+    assert ledger.total_cost_usd > 0
+    expected = f"{ledger.total_cost_usd:.6f}"
+    assert f'data-run-cost-usd="{expected}"' in response.text
+
+
+def test_case_page_exposes_zero_run_cost_with_no_ledger(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert 'data-run-cost-usd="0.000000"' in response.text

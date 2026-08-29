@@ -1,3 +1,124 @@
+# STATUS — wave 5 integration checkpoint: UI revamp (2026-08-29)
+
+Integrator's reconciliation pass over wave 5 (UI revamp, per `UI-SPEC.md`), which ran as
+three strictly-laned concurrent packages against the working tree left by wave 4: **A**
+(`console/static/style.css` only — tokens + every component's CSS), **B**
+(`console/app.py` + `tests/console/test_app.py` — the human-rendered event renderers and
+the `suggested_replies` contract), **C** (`console/static/app.js` only — bubble/chip/
+citation-chip/tribunal-timeline behaviour). This section is the authoritative status for
+the UI wave; it does not re-run or re-verify the wave-4 AU-deploy checkpoint above, which
+stands as-is.
+
+## Cross-lane reconciliation (the two named seams)
+
+- **`suggested_replies` contract**: B added the field to `_turn_to_json` (`_SUGGESTED_
+  REPLIES` map, populated only for `CONFIRMING`/`ASK_MORE`/`REQUESTING_EVIDENCE`, `None`
+  elsewhere); C's `renderQuickReplies` consumes it identically from both `loadInterview`
+  and `postAnswer`, always routed through the single `submitAnswer(text)` path a typed
+  reply also uses — confirmed by reading both sides, no signature drift. The `<input>`/
+  `Send` button are never disabled while chips render (founder requirement #2 verified in
+  code, not just by convention).
+- **Citation-chip/overlay docking**: C's `citationChip.onActivate` degrades gracefully
+  where the wave-4 overlay work doesn't yet expose per-anchor clickable regions — it
+  flashes/scrolls to the whole annotated-overlay image (or a `[data-bbox-region]` element
+  if one exists) rather than a precise sub-region, upgrading automatically the moment such
+  an element is added by a future wave. Documented in `app.js` at the integration point;
+  no gap requiring a code change this checkpoint.
+- **Run-cost visibility (wave-4 carry-forward, closed this wave)**: B exposes
+  `data-run-cost-usd` on `<body>` in `render_case_page` (from `CaseStore.load_ledger`,
+  `0.0` before any run); C's tribunal-timeline footer renders the "This run: $X.XX" chip
+  from that attribute, suppressed entirely at `<= 0` (no premature "$0.00").
+
+## Contract/founder-requirement verification (read against the code, not claimed)
+
+1. Bubble asymmetry (§2.1): confirmed in `style.css`/`app.js` — plain-left-labelled `--ai`
+   vs filled-right `--resident`, survives a greyscale screenshot (shape+alignment, not just
+   colour).
+2. Quick-reply chips post through the normal send path: confirmed — see seam above.
+3. Zero raw JSON user-facing: `document_uploaded` and `interview_turn` are now registered
+   in `_EVENT_ITEM_RENDERERS` (`_render_document_uploaded_item`, `_render_interview_turn_
+   item`), closing the two raw-JSON leaks `UI-SPEC.md` §3.3/§3.4 named exactly; tests
+   (`test_document_uploaded_renders_a_doc_card_with_no_raw_json`, `test_interview_turn_
+   renders_as_chat_bubbles_with_no_raw_json`) assert the literal payload keys are absent
+   from the rendered page.
+4. Semantic colour discipline: `--status-refused` is a warm brown (`#8a3a12` light /
+   `#e8996b` dark), never `--error` (red); `_render_gate_decision_item` routes any
+   `status.startswith("refused")` to the brown `.refusal-card`, never `role="alert"`.
+   `--error` appears only in `.state-card--error` (`role="alert"`, true system failures).
+5. Reusable components / no per-section drift: the single `.tag--{status}` component (four
+   tokens) is the sole source of ground-card stripe, verdict-stamp, docket-card, and
+   tribunal-timeline collapsed-row colour — confirmed by grep, no locally-invented shade.
+
+## Design-judgment notes, applied as specified
+
+- Check-answers "Change" — the interview state machine cannot reopen an arbitrary past
+  stage this wave; `_render_check_answers_section` ships read-only with one "Change
+  something" link back to the transcript, per the spec's explicit degrade-gracefully
+  instruction. No stage-reopening was built.
+- Doc-card thumbnails — no new thumbnail pipeline was built; `_render_document_uploaded_
+  item` always renders the placeholder-icon variant (`.doc-card__thumb--placeholder`).
+
+## Full-tree verification (verbatim)
+
+```
+$ uv run pytest -q
+474 passed, 202 warnings in 20.44s
+```
+
+```
+$ uv run ruff check .
+All checks passed!
+```
+
+```
+$ uv run ruff format --check .
+80 files already formatted
+```
+
+```
+$ uv run mypy
+Success: no issues found in 38 source files
+```
+
+(`uv run mypy` — the project's canonical invocation per `pyproject.toml`'s `files =
+["src/setback"]` / the `Makefile`'s `typecheck` target — is the command of record here;
+an ad hoc `mypy src tests` also tried during this checkpoint fails on two pre-existing,
+out-of-lane test-tree issues (`tests/court/_fakes.py` module-path collision,
+`tests/job/test_pipeline.py:141`'s ignore-comment syntax) that predate this wave and were
+not touched by any of A/B/C — not this checkpoint's lane to fix, flagged here rather than
+silently worked around.)
+
+## Security diff check (staged diff, this checkpoint)
+
+Grepped the full staged diff for credentials/secrets/API keys, the user's email/name, and
+hostnames (`kratos`/`mimir`/`.local`) — zero hits beyond incidental token-system
+vocabulary (CSS custom-property "tokens", cost "ledger") and the pre-existing stdlib
+`import secrets`. No personal identifier, no live User-Agent string, no secret value
+appears anywhere in this diff. No live model calls were made by this checkpoint (pure
+static review + offline test/lint/typecheck run).
+
+## Outstanding — explicitly NOT closed by this checkpoint
+
+- **Gemma publisher-qualified model id (P0, still live-broken)**: `src/setback/models/
+  client.py` has **zero diff** in this wave's tree — the wave-4 carry-forward fix
+  (`gemma-4-26b-a4b-it-maas` → a publisher-qualified form, `google/gemma-...` or
+  `publishers/google/models/...`, verified empirically with exactly one live call) was
+  never applied by any of this wave's three lanes (none of A/style.css, B/app.py, C/app.js
+  touch `models/client.py`, and it carries no owner in the strict A/B/C lanes this wave).
+  The clerk's "+0.2 bonus" claim remains dishonest until this lands — **not this
+  checkpoint's lane to apply** (would need a live call, which only a package explicitly
+  scoped for it may make per this wave's rules); flagged here precisely rather than
+  silently left for a judge to find.
+- **Multi-instance session-affinity redeploy** and **the property-value REFUSED beat's
+  single unbroken live run**: both are ship-phase work (deploy/demo scripting), out of
+  this UI-focused checkpoint's scope entirely; not attempted here.
+- **`--session-affinity` tradeoff documentation** and any remaining in-process console
+  state: not reviewed by this checkpoint (no console/app.py changes touched job-trigger or
+  state-affinity code paths this wave — B's diff is scoped to render functions and the
+  `suggested_replies`/ledger-exposure additions only).
+
+---
+
 # STATUS — wave 4 deploy checkpoint: australia-southeast1 (2026-08-29)
 
 Deploy agent's pass over the integration checkpoint below: ran `deploy.sh` against
