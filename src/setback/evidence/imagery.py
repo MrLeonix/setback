@@ -133,10 +133,10 @@ async def _get_with_retry(
 
 
 async def _fetch_metadata(
-    client: httpx.AsyncClient, lat: float, lng: float, *, api_key: str
+    client: httpx.AsyncClient, location: str, *, api_key: str
 ) -> StreetViewMetadata:
     response = await _get_with_retry(
-        client, STREET_VIEW_METADATA_URL, params={"location": f"{lat},{lng}", "key": api_key}
+        client, STREET_VIEW_METADATA_URL, params={"location": location, "key": api_key}
     )
     try:
         raw = response.json()
@@ -155,21 +155,25 @@ async def _fetch_metadata(
 
 
 async def fetch_street_view_fallback(
-    lat: float,
-    lng: float,
+    location: str,
     *,
     client: httpx.AsyncClient | None = None,
     secret_accessor: SecretAccessor | None = None,
     size: str = _DEFAULT_IMAGE_SIZE,
     fov: int = _DEFAULT_FOV,
 ) -> StreetViewFallback | None:
-    """Fetch a Street View fallback image for `(lat, lng)`, checking the
+    """Fetch a Street View fallback image for `location`, checking the
     free metadata endpoint first and only paying for the image if coverage
     exists.
 
     Args:
-        lat: Latitude of the site.
-        lng: Longitude of the site.
+        location: Anything the Street View Static API's own `location`
+            parameter accepts — a `"lat,lng"` pair, or a free-text address.
+            Setback has no geocoding step of its own; the trigger this
+            module exists for (`job.pipeline`'s no-resident-photo fallback)
+            has only a resolved DA address string on hand, and the Street
+            View API resolves that to a pano itself, exactly like its own
+            web UI does.
         client: An injectable `httpx.AsyncClient` (tests use respx against
             a default-constructed one). When omitted, one is constructed
             and closed for the duration of this call.
@@ -194,14 +198,14 @@ async def fetch_street_view_fallback(
     owns_client = client is None
     http_client = client or httpx.AsyncClient(timeout=_REQUEST_TIMEOUT)
     try:
-        metadata = await _fetch_metadata(http_client, lat, lng, api_key=api_key)
+        metadata = await _fetch_metadata(http_client, location, api_key=api_key)
         if metadata.status != "OK":
             return None
 
         response = await _get_with_retry(
             http_client,
             STREET_VIEW_IMAGE_URL,
-            params={"location": f"{lat},{lng}", "size": size, "fov": str(fov), "key": api_key},
+            params={"location": location, "size": size, "fov": str(fov), "key": api_key},
         )
         attribution = f"(c) Google Street View, {metadata.capture_date or 'date unknown'}"
         return StreetViewFallback(

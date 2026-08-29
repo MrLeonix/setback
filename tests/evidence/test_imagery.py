@@ -46,7 +46,7 @@ async def test_fetch_street_view_fallback_returns_grade_b_with_attribution() -> 
 
     async with httpx.AsyncClient() as http_client:
         result = await fetch_street_view_fallback(
-            -33.9966876, 151.1248784, client=http_client, secret_accessor=_fake_secret_accessor
+            "-33.9966876,151.1248784", client=http_client, secret_accessor=_fake_secret_accessor
         )
 
     assert result is not None
@@ -54,6 +54,31 @@ async def test_fetch_street_view_fallback_returns_grade_b_with_attribution() -> 
     assert result.image_bytes == b"\xff\xd8\xff-jpeg-bytes"
     assert result.attribution == "(c) Google Street View, 2022-02"
     assert result.metadata.pano_id == "s3YYyBVc6ohLRMk2Uh1EJQ"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_fetch_street_view_fallback_accepts_a_free_text_address() -> None:
+    """Setback has no geocoding step of its own -- a resolved DA address
+    string must be usable directly as `location`, exactly as the Street
+    View Static API's own docs promise (it resolves a text address to a
+    pano itself); this is the exact call shape `job.pipeline` uses for the
+    real trigger (a case's DA record address, not lat/lng)."""
+    metadata_route = respx.get(STREET_VIEW_METADATA_URL).mock(
+        return_value=httpx.Response(200, json={"status": "OK", "pano_id": "p1", "date": "2024-05"})
+    )
+    respx.get(STREET_VIEW_IMAGE_URL).mock(return_value=httpx.Response(200, content=b"img"))
+
+    async with httpx.AsyncClient() as http_client:
+        result = await fetch_street_view_fallback(
+            "65A Vista Street Sans Souci NSW 2219",
+            client=http_client,
+            secret_accessor=_fake_secret_accessor,
+        )
+
+    assert result is not None
+    sent_location = dict(httpx.QueryParams(metadata_route.calls[0].request.url.params))["location"]
+    assert sent_location == "65A Vista Street Sans Souci NSW 2219"
 
 
 @pytest.mark.asyncio
@@ -68,7 +93,7 @@ async def test_fetch_street_view_fallback_returns_none_when_metadata_is_not_ok()
 
     async with httpx.AsyncClient() as http_client:
         result = await fetch_street_view_fallback(
-            0.0, 0.0, client=http_client, secret_accessor=_fake_secret_accessor
+            "0.0,0.0", client=http_client, secret_accessor=_fake_secret_accessor
         )
 
     assert result is None
@@ -88,7 +113,7 @@ async def test_fetch_street_view_fallback_never_sends_the_key_in_a_readable_log_
 
     async with httpx.AsyncClient() as http_client:
         result = await fetch_street_view_fallback(
-            1.0, 2.0, client=http_client, secret_accessor=_fake_secret_accessor
+            "1.0,2.0", client=http_client, secret_accessor=_fake_secret_accessor
         )
 
     assert result is not None
@@ -108,7 +133,7 @@ async def test_metadata_request_is_retried_once_on_a_transient_failure() -> None
 
     async with httpx.AsyncClient() as http_client:
         result = await fetch_street_view_fallback(
-            1.0, 2.0, client=http_client, secret_accessor=_fake_secret_accessor
+            "1.0,2.0", client=http_client, secret_accessor=_fake_secret_accessor
         )
 
     assert result is not None
@@ -123,5 +148,5 @@ async def test_metadata_request_raises_after_repeated_failures() -> None:
     async with httpx.AsyncClient() as http_client:
         with pytest.raises(StreetViewUnavailableError):
             await fetch_street_view_fallback(
-                1.0, 2.0, client=http_client, secret_accessor=_fake_secret_accessor
+                "1.0,2.0", client=http_client, secret_accessor=_fake_secret_accessor
             )
