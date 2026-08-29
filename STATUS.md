@@ -1,3 +1,42 @@
+# STATUS — wave 7 landed (2026-08-29)
+
+Final-polish wave. The orchestrator rotated the docket passphrase after a prior
+verifier leaked it, moving it to a Secret Manager secret (`docket-key`) on the live
+service directly; `deploy.sh` still passed `SETBACK_DOCKET_KEY` as a literal
+`--set-env-vars` string, which would have hit a type conflict (env var vs.
+secret-mounted var on the same name) on the next deploy. Reconciled FIX-A/B here
+(FIX-C stayed scratchpad-only, not integrated):
+
+- **deploy.sh**: `SETBACK_DOCKET_KEY` is now mounted via `--update-secrets` from the
+  `docket-key` Secret Manager secret, never passed as a literal env-var value — this
+  script never reads, prints, or holds the passphrase itself. Fails fast before any
+  build/deploy work if the secret doesn't exist yet, and grants `sa-console`
+  `secretAccessor` scoped to that one secret only.
+- **Overlay text fix**: label chips now draw with a real TTF font instead of PIL's
+  implicit bitmap default, whose near-invisible space glyph was collapsing multi-word
+  captions (e.g. "This element" → "Thiselement") — found live, see SMOKE.md wave 6.
+- **Overlay anchor-status fix**: a reviewer citing a whole page (rather than a
+  specific crop) now correctly colours every fine-grained bbox anchor on that page
+  instead of leaving them all neutral/grey; most-severe status wins when more than
+  one ground is in contention for the same anchor.
+- **Docket hygiene**: the public docket list now excludes smoke/test/wiring-
+  proof/rate-limit debris by content (not just session-id shape) and collapses
+  duplicate `application_number` rows to the latest case, with an "+N earlier cases"
+  note — older cases stay reachable at their own URL (hide only, never delete).
+
+Full suite: **522 passed** (up from 503), ruff check/format clean, mypy clean
+(canonical `mypy` invocation per `Makefile`'s `typecheck` target, respecting
+pyproject's `files = ["src/setback"]`). Security diff check on the full wave-7 diff:
+clean — no secret values, personal identifiers, or hostnames introduced; the
+passphrase is referenced only by its Secret Manager resource name throughout.
+Committed and pushed to `origin/main` (`caa40fa`).
+
+**Remaining = film-day items only**, unchanged from wave 6 — see that section below
+for the founder-only checklist (live pipeline reruns, Devpost category confirmation,
+deploy freeze, timed rehearsal, video cold open/close, DISCLOSURE.md narrative).
+
+---
+
 # STATUS — wave 6 fix-plan landed (2026-08-29)
 
 Wave-6 panel review (VERDICT.md) found the engineering ahead of median but every
