@@ -24,8 +24,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # ca-certificates: outbound HTTPS to Vertex AI / Firestore / the NSW ingest
 # hosts (OnlineDA, ePlanning, eTrack) all need a working trust store.
+# fonts-dejavu-core: `evidence/overlays.py::_label_font` needs a real TTF on
+# disk for annotated-overlay label chips -- this base image ships none, so
+# without it every deployed overlay silently fell back to PIL's own
+# `ImageFont.load_default()`, a tiny bitmap font whose ~2px space glyph
+# collapses a multi-word caption ("This element" -> "Thiselement") once
+# anti-aliased/resized (found live, SMOKE.md wave 6/v5). DejaVu Sans is the
+# specific family `_LABEL_FONT_PATHS` looks for at
+# `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` on a Debian/Ubuntu base.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin uv itself so a Cloud Build re-run resolves dependencies identically.

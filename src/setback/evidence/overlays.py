@@ -49,6 +49,19 @@ time >=1 overlay colour is on screen, its legend must be too), which stays
 legible in dark mode and never drifts out of sync with a second,
 image-baked copy the way the old approach could.
 
+**Chip legibility scales with image width, not a fixed pixel size.** The
+fine-grained bbox anchors this module draws boxes/chips for are typically
+located on a full-resolution rendered PDF page (several thousand pixels
+wide), which a caller (`job/pipeline.py::_shrink_png_for_storage`) then
+downscales for Firestore's document-size limit before storage/display. A
+fixed-size chip font read fine on this module's own small offline test
+fixtures but shrank to ~7-10px tall -- illegible at normal viewing zoom --
+once that real-world downscale was applied (SMOKE.md v5). `_label_font_
+size_for_width` sizes the chip font as a ratio of whatever image
+`render_semantic_overlay` is actually asked to draw on, so the ratio (and
+therefore the readable size) survives any later *uniform* resize a caller
+applies, without this module needing to know that resize ever happens.
+
 **Lane boundary.** Input is deliberately narrow: a
 :class:`~setback.evidence.dossier.RenderedPage`, a sequence of
 :class:`AnchoredElement` (this module's own minimal join of an anchor's
@@ -234,23 +247,31 @@ _BOX_WIDTH_PX: Final[int] = 4
 _CHIP_PADDING_PX: Final[int] = 4
 _CHIP_TEXT_COLOR: Final[tuple[int, int, int]] = (255, 255, 255)
 
-_LABEL_FONT_SIZE_PX: Final[int] = 16
+_LABEL_FONT_MIN_SIZE_PX: Final[int] = 16
+_LABEL_FONT_WIDTH_RATIO: Final[float] = 0.02
+"""`render_semantic_overlay` sizes the label-chip font as
+``max(_LABEL_FONT_MIN_SIZE_PX, round(image_width_px * _LABEL_FONT_WIDTH_RATIO))``
+-- see `_label_font_size_for_width`'s docstring for why this must be a
+function of the image actually being drawn on, not a fixed pixel size."""
 _LABEL_FONT_PATHS: Final[tuple[str, ...]] = (
     # macOS (dev boxes, screenshots taken locally).
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/Library/Fonts/Arial.ttf",
     # Linux (Debian/Ubuntu-family container base images, e.g. this repo's
     # own `python:3.12-slim` -- present only if a font package such as
-    # `fonts-dejavu-core`/`fonts-liberation` is installed in the image).
+    # `fonts-dejavu-core`/`fonts-liberation` is installed in the image,
+    # see `Dockerfile`).
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
 )
 
 
-@functools.lru_cache(maxsize=1)
-def _label_font() -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
-    """A real TTF/TTC font for label-chip captions, tried in order down
-    `_LABEL_FONT_PATHS`.
+@functools.lru_cache(maxsize=8)
+def _label_font(
+    size_px: int = _LABEL_FONT_MIN_SIZE_PX,
+) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
+    """A real TTF/TTC font at `size_px` for label-chip captions, tried in
+    order down `_LABEL_FONT_PATHS`.
 
     Fixes a live-reported bug: `ImageDraw.text`/`textbbox` called with no
     `font=` (this module's previous behaviour) falls back to PIL's own
@@ -267,29 +288,69 @@ def _label_font() -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
     `_LABEL_FONT_PATHS` exists on this machine at all, so this function
     never raises -- a missing font package on a given deploy target
     degrades the chip's legibility, it must never crash the overlay
-    render. Cached (`lru_cache`) since every call in one process resolves
-    to the same font -- filesystem probing on every box drawn would be
-    wasteful over a page with many anchors.
+    render. Cached (`lru_cache`, keyed by `size_px`) since every call for a
+    given size in one process resolves to the same font object --
+    filesystem probing on every box drawn would be wasteful over a page
+    with many anchors.
     """
     for path in _LABEL_FONT_PATHS:
         try:
-            return ImageFont.truetype(path, _LABEL_FONT_SIZE_PX)
+            return ImageFont.truetype(path, size_px)
         except OSError:
             continue
     return ImageFont.load_default()
 
 
+def _label_font_size_for_width(width_px: int) -> int:
+    """The label-chip font size to use when drawing on an image `width_px`
+    pixels wide.
+
+    Fixes a second, live-reported legibility bug (SMOKE.md v5): the
+    fine-grained bbox anchors `_ground_annotated_evidence` locates are
+    drawn onto the full-resolution rendered PDF page (routinely several
+    thousand pixels wide for a real drawing), at a *fixed* 16px chip font
+    -- reasonable on this module's own small offline test fixtures, but
+    once `job/pipeline.py::_shrink_png_for_storage` downscales that same
+    page ~4x for Firestore's document-size limit before it is ever stored
+    or displayed, the chip shrinks along with it to ~7-10px tall,
+    illegible at normal viewing/screenshot zoom.
+
+    This module has no visibility into that downstream resize (its own
+    lane boundary -- see the module docstring): it never imports
+    `job.pipeline`. Instead, the font is sized as a fixed *ratio* of
+    whatever image `render_semantic_overlay` is actually asked to draw
+    on. Since `_shrink_png_for_storage`'s resize is uniform (both
+    dimensions scaled by the same factor), a chip drawn at
+    `width_px * _LABEL_FONT_WIDTH_RATIO` keeps that same ratio -- and
+    therefore roughly the same *readable* size -- however much the image
+    is downscaled afterwards. `_LABEL_FONT_MIN_SIZE_PX` is the floor, so
+    this module's own small fixtures (well under the ~800px width where
+    the ratio alone would already exceed it) render exactly as before.
+    """
+    return max(_LABEL_FONT_MIN_SIZE_PX, round(width_px * _LABEL_FONT_WIDTH_RATIO))
+
+
 def _draw_label_chip(
-    draw: ImageDraw.ImageDraw, x: float, y: float, text: str, color: tuple[int, int, int]
+    draw: ImageDraw.ImageDraw,
+    x: float,
+    y: float,
+    text: str,
+    color: tuple[int, int, int],
+    *,
+    font: ImageFont.ImageFont | ImageFont.FreeTypeFont | None = None,
 ) -> None:
     """Draw a filled, coloured tag with white text, anchored just above
     `(x, y)` (a box's top-left corner) -- clamped so it never draws above
     the image's top edge.
 
-    Uses `_label_font()` (a real TTF, not PIL's implicit bitmap default)
-    so a multi-word caption's spaces render as real, visible gaps -- see
-    that function's docstring."""
-    font = _label_font()
+    Uses a real TTF (`font`, or `_label_font()`'s default if omitted --
+    never PIL's implicit bitmap default) so a multi-word caption's spaces
+    render as real, visible gaps -- see `_label_font`'s docstring.
+    `render_semantic_overlay` always passes an explicit, width-scaled
+    `font` (`_label_font_size_for_width`); the default here exists so this
+    function's own direct callers/tests can draw a chip without picking a
+    size themselves."""
+    font = font or _label_font()
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
     width = (right - left) + 2 * _CHIP_PADDING_PX
     height = (bottom - top) + 2 * _CHIP_PADDING_PX
@@ -321,10 +382,14 @@ def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> 
     """
     image = Image.open(io.BytesIO(page.png_bytes)).convert("RGB")
     draw = ImageDraw.Draw(image)
+    # One font, sized once from this image's own width (see
+    # `_label_font_size_for_width`'s docstring) and reused for every box on
+    # the page -- not recomputed per box, since it depends only on `image`.
+    font = _label_font(_label_font_size_for_width(image.width))
     for box in boxes:
         x0, y0, x1, y1 = _page_points_to_full_res_pixels(box.bbox, page)
         draw.rectangle((x0, y0, x1, y1), outline=box.color, width=_BOX_WIDTH_PX)
-        _draw_label_chip(draw, x0, y0, box.label, box.color)
+        _draw_label_chip(draw, x0, y0, box.label, box.color, font=font)
 
     buf = io.BytesIO()
     image.save(buf, format="PNG")

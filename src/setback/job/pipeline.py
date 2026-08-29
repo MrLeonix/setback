@@ -62,6 +62,27 @@ grounding/polish/classification calls it already booked directly, so the
 $2 self-abort ceiling is now load-bearing on the full tribunal run,
 reviewers and adjudicator included, not just this module's own direct
 calls.
+
+**Page-level anchor-status propagation (SMOKE.md v5).** A reviewer looking
+at one full-page plan image plausibly cites that whole page rather than a
+specific fine-grained crop `_ground_annotated_evidence` also registered on
+it; `_propagate_page_level_anchor_status` spreads such a page-level
+citation's ground/status down onto every bbox anchor on that same page, so
+the annotated overlay colours them by outcome instead of leaving them
+permanently neutral grey. Three rules, in order, govern exactly how: (a) a
+bbox anchor a reviewer cited *directly* always keeps that citation's own
+ground and status -- never put into contention with, or overridden by, a
+status merely inherited from the page it sits on, however much more severe
+that inherited claim is; (b) page-level inheritance is considered only for
+a bbox anchor with no direct citation of its own; (c) when more than one
+ground's page-level citation competes for the same such anchor, the ground
+whose own `EvidenceSlice` actually included this anchor's document is
+preferred over one that did not, before falling back to severity (refused
+beats flagged beats shipped) as the final tie-break. Before rule (a), a
+SHIPPED ground's own directly-cited bbox anchor could render orange purely
+because an unrelated REFUSED ground's page-level citation of the same page
+was more severe -- exactly backwards from what a resident needs to see.
+See that function's own docstring for the full detail.
 """
 
 from __future__ import annotations
@@ -515,11 +536,44 @@ def _most_severe_ground(
     return winner
 
 
+def _most_severe_page_level_ground(
+    ground_ids: Sequence[str],
+    ground_status: Mapping[str, GateStatus],
+    ground_document_ids: Mapping[str, frozenset[str]] | None,
+    document_id: str,
+) -> str | None:
+    """Resolve which of `ground_ids` (every ground that cited *this exact*
+    page-level anchor -- never a direct bbox citation, see
+    `_propagate_page_level_anchor_status`'s rule (b)) wins the inherited
+    status for a bbox anchor with no citation of its own.
+
+    Rule (c): a ground whose own `EvidenceSlice` actually included
+    `document_id` is preferred over one that did not -- naming the
+    ground's own reviewed material as the primary tie-break, rather than
+    letting outcome severity alone decide which ground's citation "counts"
+    more for a document it may never have been shown. `_most_severe_ground`
+    (refused > flagged > shipped) is the tie-break both within that
+    preferred group and, if `ground_document_ids` is unavailable (`None`,
+    e.g. a caller with no document-membership data at all) or no candidate
+    qualifies, across every candidate unchanged -- exactly `_most_severe_
+    ground`'s own prior, still-correct behaviour, preserved as the
+    fallback rather than replaced by it.
+    """
+    if ground_document_ids is not None:
+        qualifying = [
+            gid for gid in ground_ids if document_id in ground_document_ids.get(gid, frozenset())
+        ]
+        if qualifying:
+            return _most_severe_ground(qualifying, ground_status)
+    return _most_severe_ground(ground_ids, ground_status)
+
+
 def _propagate_page_level_anchor_status(
     dossier: CaseDossier,
     anchor_ground: Mapping[str, str],
     page_level_ground_ids: Mapping[str, Sequence[str]],
     ground_status: Mapping[str, GateStatus],
+    ground_document_ids: Mapping[str, frozenset[str]] | None = None,
 ) -> dict[str, str]:
     """Fix for the root cause of neutral (grey) overlay boxes seen in live
     runs: `_court_slices` registers a whole-page anchor
@@ -534,34 +588,57 @@ def _propagate_page_level_anchor_status(
     cited and decided.
 
     Propagates every page-level citation's ground down onto every bbox
-    anchor registered on that same ``(source_doc, page)``. A bbox anchor
-    that was itself *also* directly cited competes on equal footing with
-    any inherited page-level ground rather than being overridden
-    unconditionally: when more than one ground is in contention for the
-    same bbox anchor (multiple grounds cited the page, or a direct
-    citation's ground differs from an inherited one), the most severe
-    resulting status wins (`_most_severe_ground`) -- refused beats
-    flagged beats shipped -- so a box already cited by a ground the gate
-    refused is never quietly overwritten green by an unrelated ground
-    that also happens to cite the same page.
+    anchor registered on that same ``(source_doc, page)``, under three
+    rules (SMOKE.md v5's "one honest nuance" -- a SHIPPED ground's own
+    directly-cited bbox anchor was rendering orange, overridden by an
+    unrelated REFUSED ground's page-level citation of the same page --
+    named the refinement this function now implements):
+
+    * **(a) a direct citation always wins, never overridden.** A bbox
+      anchor a reviewer cited *by its own anchor id* keeps that citation's
+      ground and status outright, full stop -- it never even enters
+      contention with a page-level-only citation from a *different*
+      ground, no matter how much more severe that other ground's outcome
+      is. Before this rule, a directly-cited-and-SHIPPED box could be
+      quietly recoloured refused/orange purely because some other,
+      unrelated ground also happened to cite the whole page it sits on --
+      exactly backwards from what a resident needs to see (a box they
+      were shown evidence about keeps that evidence's own verdict).
+    * **(b) page-level inheritance only reaches anchors with no citation
+      of their own.** Once (a) has claimed every directly-cited anchor,
+      inheritance from `page_level_ground_ids` is considered only for the
+      bbox anchors left over -- an anchor that was never cited by anything
+      at all, direct or page-level, stays absent from the result (renders
+      `EVIDENCE_ANCHOR`, per `classify_role`), exactly as before.
+    * **(c) among competing page-level-only claims, prefer the ground
+      whose evidence was actually shown this document.** When more than
+      one ground's page-level citation reaches the same uncited bbox
+      anchor, `_most_severe_page_level_ground` resolves the winner --
+      preferring a ground whose own `EvidenceSlice` actually included this
+      bbox's document over one that did not, before falling back to
+      severity (refused beats flagged beats shipped) as the tie-break.
 
     `anchor_ground` is never mutated; a new mapping is returned with an
     entry for every bbox anchor that ends up with an effective ground
-    (direct, inherited, or both) -- a bbox anchor with neither stays
-    absent, exactly as `anchor_ground` already represents "no ground"
-    today (renders `EVIDENCE_ANCHOR`, per `classify_role`).
+    (direct or inherited) -- a bbox anchor with neither stays absent.
     """
     result = dict(anchor_ground)
     for anchor in dossier.anchors.values():
         if anchor.bbox is None:
             continue  # only propagating *onto* fine-grained bbox anchors
+        if anchor.anchor_id in anchor_ground:
+            # Rule (a): already carried over via the `dict(anchor_ground)`
+            # copy above -- explicit `continue` so a direct citation is
+            # never put into contention with (and can never be overridden
+            # by) an inherited page-level one, regardless of severity.
+            continue
         page_anchor_id = anchor_id_for(anchor.source_doc, anchor.page, None)
         inherited = page_level_ground_ids.get(page_anchor_id)
         if not inherited:
-            continue  # nothing cited this bbox's page-level anchor
-        direct = anchor_ground.get(anchor.anchor_id)
-        candidates = list(inherited) + ([direct] if direct is not None else [])
-        winner = _most_severe_ground(candidates, ground_status)
+            continue  # rule (b): no citation of its own, nothing to inherit either
+        winner = _most_severe_page_level_ground(
+            inherited, ground_status, ground_document_ids, anchor.source_doc
+        )
         if winner is not None:
             result[anchor.anchor_id] = winner
     return result
@@ -758,6 +835,12 @@ class RealPipelineRunner:
         # can resolve the most severe outcome when more than one ground
         # cites the same page. See that function's docstring.
         page_level_ground_ids: dict[str, list[str]] = defaultdict(list)
+        # Every ground_id's own `EvidenceSlice` document membership (source
+        # ids from its `plans`/`photos`), for `_propagate_page_level_anchor_
+        # status` rule (c) -- which ground actually had this document in
+        # the material it was shown, not just which one happens to cite the
+        # right page-level anchor id.
+        ground_document_ids: dict[str, frozenset[str]] = {}
 
         ledger = resume.ledger or Ledger()
         adjudicator_breaker = resume.breakers.get(_ADJUDICATOR_BREAKER_NAME) or CircuitBreaker(
@@ -773,6 +856,9 @@ class RealPipelineRunner:
         for ground in _candidate_grounds(resume.events, resume.grounds):
             await store.transition_ground(case_id, ground.ground_id, GroundStatus.UNDER_REVIEW)
             clause_slice, evidence_slice = _court_slices(ground, dossier)
+            ground_document_ids[ground.ground_id] = frozenset(
+                p.source_ref for p in evidence_slice.plans
+            ) | frozenset(p.source_ref for p in evidence_slice.photos)
 
             result = await run_court_verbose(
                 clause_slice,
@@ -915,7 +1001,11 @@ class RealPipelineRunner:
         if grounding_ctx is not None:
             ground_status: dict[str, GateStatus] = {d.ground_id: d.status for d in decisions}
             effective_anchor_ground = _propagate_page_level_anchor_status(
-                dossier, anchor_ground, page_level_ground_ids, ground_status
+                dossier,
+                anchor_ground,
+                page_level_ground_ids,
+                ground_status,
+                ground_document_ids=ground_document_ids,
             )
             overlay_png = self._semantic_overlay_png(
                 grounding_ctx, ground_status=ground_status, anchor_ground=effective_anchor_ground

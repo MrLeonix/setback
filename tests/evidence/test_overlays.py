@@ -35,6 +35,7 @@ from setback.evidence.overlays import (
     OverlayRole,
     _draw_label_chip,
     _label_font,
+    _label_font_size_for_width,
     build_overlay_boxes,
     classify_role,
     label_for,
@@ -381,3 +382,87 @@ def test_draw_label_chip_renders_a_two_word_caption_wider_than_the_concatenated_
     two_word_width = _chip_pixel_width("This element")
     concatenated_width = _chip_pixel_width("Thiselement")
     assert two_word_width - concatenated_width > 3
+
+
+# --- chip legibility scales with image width (SMOKE.md v5 live finding) ----
+#
+# The label-chip font was a fixed 16px regardless of the image being drawn
+# on. Fine, drawn directly on this module's own small offline fixtures --
+# but the real pipeline draws on a full-resolution rendered PDF page (often
+# several thousand pixels wide) and then downscales that same page ~4x for
+# Firestore's document-size limit before it is ever stored or displayed
+# (`job/pipeline.py::_shrink_png_for_storage`). A fixed 16px chip font
+# shrinks right along with it -- measured live at only ~7-10px tall,
+# illegible at normal viewing/screenshot zoom. The fix must size the chip
+# font as a function of the image actually being drawn on.
+
+
+def test_label_font_size_for_width_stays_at_the_floor_for_a_small_image() -> None:
+    """This module's own small offline test fixtures (e.g. `_page`'s
+    400px-wide photos) must keep rendering at exactly the previous, already-
+    legible 16px -- the width-based scale-up must not shrink anything that
+    already worked."""
+    assert _label_font_size_for_width(400) == 16
+
+
+def test_label_font_size_for_width_scales_up_for_a_wide_image() -> None:
+    """A page wide enough to plausibly be a real full-resolution PDF render
+    must get a font noticeably larger than the small-fixture floor."""
+    assert _label_font_size_for_width(1600) > 16
+    assert _label_font_size_for_width(4962) > _label_font_size_for_width(1600)
+
+
+def test_label_font_size_for_width_produces_a_legible_chip_at_a_1600px_wide_output() -> None:
+    """The measurable acceptance criterion this fix must satisfy: a chip's
+    actual glyph height (not just the nominal font size passed to
+    `ImageFont.truetype`, which can measure noticeably shorter once
+    ascent/descent metrics are applied) must be at least ~18px tall once
+    drawn on a 1600px-wide image -- large enough to read at 100% zoom in a
+    1080p-scale frame, per this fix's acceptance test."""
+    size_px = _label_font_size_for_width(1600)
+    font = _label_font(size_px)
+    image = Image.new("RGB", (10, 10))
+    draw = ImageDraw.Draw(image)
+    _left, top, _right, bottom = draw.textbbox((0, 0), "This element", font=font)
+    assert bottom - top >= 18
+
+
+def test_render_semantic_overlay_draws_a_measurably_taller_chip_on_a_wider_page() -> None:
+    """End-to-end (not just the font-size helper in isolation): the actual
+    pixels `render_semantic_overlay` draws for a chip must be measurably
+    taller on a page wide enough to trigger the scale-up than on this
+    module's small fixtures, which stay at the unscaled floor -- proving
+    the render path really does derive its font from the image it draws
+    on, not a constant baked in at import time."""
+
+    def _chip_height_px(width_px: int) -> int:
+        # A fixed `height_px`/`dpi` (so `page.height_pts` -- and therefore
+        # where `box`'s page-point bbox actually lands -- stays identical
+        # across calls) with only `width_px` varying between the two calls
+        # below.
+        page = _pdf_like_page(width_px=width_px, height_px=1200, dpi=300)
+        box = OverlayBox(
+            anchor_id="a1",
+            bbox=BoundingBox(x0=40.0, y0=200.0, x1=120.0, y1=260.0),
+            role=OverlayRole.SUPPORTS_SHIPPED,
+            color=OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED],
+            label="window W.1",
+        )
+        png_bytes = render_semantic_overlay(page, [box])
+        image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+        blank = Image.new("RGB", image.size, color="white")
+        # The chip is drawn strictly above the box's own top edge (see
+        # `_draw_label_chip`'s "anchored just above" contract) -- crop to
+        # that strip so the diff below measures only the chip, never the
+        # box's own 4px-wide outline underneath it.
+        pt_to_px = page.dpi / 72.0
+        box_top_px = round((page.height_pts - box.bbox.y1) * pt_to_px)
+        region = (0, 0, image.width, box_top_px)
+        diff_bbox = ImageChops.difference(image.crop(region), blank.crop(region)).getbbox()
+        assert diff_bbox is not None, "the chip must draw something above the box"
+        return diff_bbox[3] - diff_bbox[1]
+
+    small_page_chip_height = _chip_height_px(400)
+    wide_page_chip_height = _chip_height_px(1600)
+    assert wide_page_chip_height > small_page_chip_height
+    assert wide_page_chip_height >= 18
