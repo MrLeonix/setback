@@ -20,16 +20,13 @@ Routes
 ``POST /api/cases/{case_id}/tribunal``                 start the tribunal job
 ``GET  /api/cases/{case_id}/events``                   SSE stream of case events
 ``POST /api/cases/{case_id}/grounds/{ground_id}/feedback``   capture refusal pushback
-``GET  /``                                             docket board (known cases)
+``GET  /``                                             docket board (via `CaseStore.list_cases`)
 ``GET  /cases/{case_id}``                              the case page
 ``GET  /static/*``                                     app.js / style.css
 
-Known MVP limitation: `CaseStore` (wave 2's port) has no "list all cases"
-method, so the docket board can only show cases this console *process*
-instance has created (an in-memory registry) -- acceptable for a
-single-Cloud-Run-Service, single-demo-case hackathon build; a future wave
-adding a `list_cases` method to the port would let the board survive a
-restart.
+The docket board renders `CaseStore.list_cases`, not an in-process
+registry -- it survives a console restart/redeploy and reflects every case
+across every console instance, not just the one that happened to create it.
 """
 
 from __future__ import annotations
@@ -43,12 +40,19 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from setback.ingest.tracker import UserUploadedDocumentSource
+from setback import config
+from setback.console.guards import (
+    enforce_concurrent_tribunal_cap,
+    enforce_daily_spend_budget,
+    per_case_interview_turn_guard,
+    per_ip_case_creation_guard,
+)
+from setback.ingest.tracker import DocumentSource, EvidenceUploadStore, UserUploadedDocumentSource
 from setback.interview.flow import (
     ConcernType,
     InterviewFlow,
@@ -102,15 +106,15 @@ class JobTrigger(Protocol):
 
 
 class LoggingJobTrigger:
-    """The default `JobTrigger`: records that a trigger was requested
+    """A `JobTrigger` test double: records that a trigger was requested
     in-process without invoking a real Cloud Run Jobs execution.
 
-    No `google-cloud-run` client is a declared dependency of this package
-    yet -- wiring a real execution trigger is future deploy-stage work
-    (STATUS.md already tracks `make deploy` as a stub). The console route
-    that calls this always records the request as a durable case event
-    regardless of what `JobTrigger` is wired in, so a request is never
-    silently lost even before a real trigger exists.
+    Used by tests and by `SETBACK_LOCAL_TRIBUNAL=1` mode's sibling
+    `LocalPipelineJobTrigger` below -- `RealJobTrigger` is the production
+    default (see `_build_production_app`). The console route that calls a
+    `JobTrigger` always records the request as a durable case event
+    regardless of which one is wired in, so a request is never silently
+    lost even if the trigger itself does nothing.
     """
 
     def __init__(self) -> None:
@@ -118,6 +122,70 @@ class LoggingJobTrigger:
 
     async def trigger(self, case_id: str) -> None:
         self.triggered_case_ids.append(case_id)
+
+
+_TRIBUNAL_JOB_NAME = "setback-tribunal"
+"""Matches `deploy.sh`'s `TRIBUNAL_JOB` -- the one Cloud Run Job resource
+every case's tribunal run executes against, distinguished per run only by
+the `CASE_ID` environment override `RealJobTrigger` sets below."""
+
+
+class RealJobTrigger:
+    """The production `JobTrigger`: starts a real `setback-tribunal` Cloud
+    Run Job execution via the `google-cloud-run` client, overriding the
+    container's `CASE_ID` environment variable per execution so one
+    deployed Job resource serves every case.
+
+    `google-cloud-run` was added to `pyproject.toml` at this wave's
+    integration checkpoint (WP-B's dependency report). Importing
+    `google.cloud.run_v2` is still deferred to the moment a real client is
+    actually needed (`_build_client`), never at import time or construction
+    time, so this module keeps importing cleanly and this class keeps being
+    constructible even in an environment without network access. The
+    request itself is built as a plain `dict` (`_build_request`) rather
+    than the typed `run_v2.RunJobRequest` for the same reason -- Google's
+    generated API clients accept a plain dict matching the request
+    message's shape just as validly as the typed message, which is what
+    lets tests exercise the real request-building logic against a fake
+    client with no real network dependency at all.
+    """
+
+    def __init__(
+        self,
+        *,
+        project: str | None = None,
+        region: str | None = None,
+        job_name: str = _TRIBUNAL_JOB_NAME,
+        client: Any | None = None,
+    ) -> None:
+        self._project = project or config.GCP_PROJECT
+        self._region = region or config.REGION
+        self._job_name = job_name
+        self._client = client
+
+    def _job_path(self) -> str:
+        return f"projects/{self._project}/locations/{self._region}/jobs/{self._job_name}"
+
+    def _build_request(self, case_id: str) -> dict[str, Any]:
+        return {
+            "name": self._job_path(),
+            "overrides": {
+                "container_overrides": [{"env": [{"name": "CASE_ID", "value": case_id}]}],
+            },
+        }
+
+    def _build_client(self) -> Any:
+        from google.cloud import run_v2
+
+        return run_v2.JobsClient()
+
+    async def trigger(self, case_id: str) -> None:
+        client = (
+            self._client
+            if self._client is not None
+            else await asyncio.to_thread(self._build_client)
+        )
+        await asyncio.to_thread(client.run_job, request=self._build_request(case_id))
 
 
 class LocalPipelineJobTrigger:
@@ -145,7 +213,7 @@ class LocalPipelineJobTrigger:
         self,
         *,
         store: CaseStore,
-        document_source: UserUploadedDocumentSource,
+        document_source: DocumentSource,
         model_client: ModelClient,
     ) -> None:
         self._store = store
@@ -313,7 +381,7 @@ def create_app(
     store: CaseStore,
     *,
     composer: QuestionComposer,
-    document_source: UserUploadedDocumentSource | None = None,
+    document_source: EvidenceUploadStore | None = None,
     job_trigger: JobTrigger | None = None,
     max_upload_bytes: int = _DEFAULT_MAX_UPLOAD_BYTES,
     sse_poll_interval_seconds: float = 0.5,
@@ -326,7 +394,10 @@ def create_app(
             `FirestoreCaseStore` in production).
         composer: Composes interview turn wording (a fake in tests, a
             `ModelQuestionComposer` in production).
-        document_source: Where uploaded photos/documents are kept. Defaults
+        document_source: Where uploaded photos/documents are durably
+            written and later read back from -- an `EvidenceUploadStore`
+            (`UserUploadedDocumentSource`'s in-memory offline-test double,
+            or `evidence.storage.GcsEvidenceStore` in production). Defaults
             to a fresh in-memory `UserUploadedDocumentSource` per app.
         job_trigger: Starts the tribunal job. Defaults to `LoggingJobTrigger`.
         max_upload_bytes: Hard cap on a single document/photo upload.
@@ -345,7 +416,8 @@ def create_app(
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
     interview_flows: dict[str, InterviewFlow] = {}
-    known_case_ids: list[str] = []
+    _case_creation_guard = per_ip_case_creation_guard()
+    _interview_turn_guard = per_case_interview_turn_guard()
 
     async def _require_case(case_id: str) -> CaseRecord:
         case = await store.get_case(case_id)
@@ -353,13 +425,11 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"case {case_id!r} not found")
         return case
 
-    @app.post("/api/cases", status_code=201)
+    @app.post("/api/cases", status_code=201, dependencies=[Depends(_case_creation_guard)])
     async def create_case(body: CreateCaseRequest) -> dict[str, Any]:
         case = await store.create_case(
             application_number=body.application_number, resident_session=body.resident_session
         )
-        if case.case_id not in known_case_ids:
-            known_case_ids.append(case.case_id)
         return {
             "case_id": case.case_id,
             "application_number": case.application_number,
@@ -378,7 +448,7 @@ def create_app(
             await _persist_system_turn(store, case_id, turn)
         return _turn_to_json(flow.transcript[-1], flow.transcript)
 
-    @app.post("/api/cases/{case_id}/interview")
+    @app.post("/api/cases/{case_id}/interview", dependencies=[Depends(_interview_turn_guard)])
     async def answer_interview(case_id: str, body: InterviewAnswerRequest) -> dict[str, Any]:
         await _require_case(case_id)
         flow = interview_flows.get(case_id)
@@ -399,7 +469,7 @@ def create_app(
         case_id: str,
         file: UploadFile = File(...),  # noqa: B008 -- required FastAPI idiom
     ) -> JSONResponse:
-        case = await _require_case(case_id)
+        await _require_case(case_id)
         content = await file.read(max_upload_bytes + 1)
         if len(content) > max_upload_bytes:
             raise HTTPException(
@@ -407,7 +477,9 @@ def create_app(
                 detail=f"document exceeds the {max_upload_bytes}-byte upload limit",
             )
         document_id = hashlib.sha256(content).hexdigest()[:16]
-        documents.add_document(case.application_number, document_id, content)
+        await documents.add_evidence_document(
+            case_id, document_id, content, content_type=file.content_type
+        )
         await store.append_event(
             case_id,
             f"document-uploaded:{document_id}",
@@ -428,6 +500,8 @@ def create_app(
     @app.post("/api/cases/{case_id}/tribunal", status_code=202)
     async def start_tribunal(case_id: str) -> dict[str, Any]:
         await _require_case(case_id)
+        await enforce_concurrent_tribunal_cap(store)
+        await enforce_daily_spend_budget(store)
         await store.append_event(
             case_id, f"tribunal-requested:{case_id}", "tribunal_requested", payload={}
         )
@@ -503,10 +577,8 @@ def create_app(
     @app.get("/", response_class=HTMLResponse)
     async def docket_board() -> str:
         cases: list[tuple[CaseRecord, tuple[GroundRecord, ...]]] = []
-        for case_id in known_case_ids:
-            case = await store.get_case(case_id)
-            if case is not None:
-                cases.append((case, await store.list_grounds(case_id)))
+        for case in await store.list_cases():
+            cases.append((case, await store.list_grounds(case.case_id)))
         return render_docket_board(cases)
 
     @app.get("/cases/{case_id}", response_class=HTMLResponse)
@@ -752,24 +824,28 @@ def render_case_page(
 def _build_production_app() -> FastAPI:
     """Construct the production app with real GCP-backed dependencies.
 
-    Constructing `FirestoreCaseStore()`/`ModelClient()` builds client
-    objects only -- neither makes a network call in its constructor -- so
-    this runs safely at import time (needed for `uvicorn
+    Constructing `FirestoreCaseStore()`/`ModelClient()`/`GcsEvidenceStore()`
+    builds client objects only -- none makes a network call in its
+    constructor -- so this runs safely at import time (needed for `uvicorn
     setback.console.app:app`) without ever touching the network during
     test collection.
 
     `SETBACK_LOCAL_TRIBUNAL=1` swaps in `LocalPipelineJobTrigger` (see its
     docstring) for local/dev testing -- unset (the default, and always
-    unset on the deployed Cloud Run Service), `start_tribunal` keeps only
-    recording the request via `LoggingJobTrigger`, exactly as before.
+    unset on the deployed Cloud Run Service), `start_tribunal` triggers a
+    real `setback-tribunal` Cloud Run Job execution via `RealJobTrigger`.
+    Uploads always go through `GcsEvidenceStore` in production regardless
+    of which trigger is active, so a real job execution (a separate
+    container) can see them either way.
     """
+    from setback.evidence.storage import GcsEvidenceStore
     from setback.state.firestore import FirestoreCaseStore
 
     store = FirestoreCaseStore()
-    document_source = UserUploadedDocumentSource()
+    document_source = GcsEvidenceStore()
     model_client = ModelClient()
 
-    job_trigger: JobTrigger | None = None
+    job_trigger: JobTrigger = RealJobTrigger()
     if os.environ.get("SETBACK_LOCAL_TRIBUNAL") == "1":
         job_trigger = LocalPipelineJobTrigger(
             store=store, document_source=document_source, model_client=model_client

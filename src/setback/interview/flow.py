@@ -32,7 +32,6 @@ firestore.CaseStore` port everything else in Setback persists through.
 from __future__ import annotations
 
 import hashlib
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -40,103 +39,62 @@ from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel
 
+from setback.clerk import ConcernType as ConcernType  # re-export: this used to be defined here
+from setback.clerk import NormalisedConcern, normalise_concerns, redact_personal_information
+from setback.clerk import classify_concern as classify_concern  # re-export: ditto
 from setback.config import INTERVIEW
 
 if TYPE_CHECKING:
     from setback.models.client import ModelClient
     from setback.state.firestore import CaseStore
 
-# --- concern classification: deterministic, no model call --------------------
+# --- concern classification: Gemma-clerk-backed, with an offline fallback ----
+#
+# `ConcernType` and `classify_concern` used to be defined in this module;
+# they now live in `setback.clerk` (see that module's docstring for why --
+# avoiding an import cycle with `normalise_concerns`) and are re-exported
+# above so every existing caller (`setback.console.app`, this package's own
+# tests) keeps working unchanged.
 
 
-class ConcernType(StrEnum):
-    """The presenting concern types the interview recognises.
+class ConcernNormaliser(Protocol):
+    """Classifies a resident's free-text concern into one or more
+    :class:`~setback.clerk.NormalisedConcern`\\ s -- the seam between the
+    interview state machine and the Gemma clerk."""
 
-    This is the interview's own light triage -- a fixed, keyword-matched
-    classification used purely to pick which targeted clarifying question
-    to ask next. It is deliberately *not* the s4.15(1) category a ground is
-    later tagged with (that is the reviewers'/gate's job, over richer
-    evidence than one opening sentence); several of these concern types
-    (e.g. `PROPERTY_VALUE`, `VIEW_LOSS`) map to categories the gate refuses
-    outright, and that is fine -- the interview's job is to draw the
-    resident out, not to pre-judge relevance.
-    """
-
-    HEIGHT_BULK = "height_bulk"
-    PRIVACY_OVERLOOKING = "privacy_overlooking"
-    OVERSHADOWING = "overshadowing"
-    TREES_LANDSCAPE = "trees_landscape"
-    TRAFFIC_PARKING = "traffic_parking"
-    HERITAGE_CHARACTER = "heritage_character"
-    VIEW_LOSS = "view_loss"
-    PROPERTY_VALUE = "property_value"
-    NOISE = "noise"
-    OTHER = "other"
+    async def normalise(self, text: str) -> list[NormalisedConcern]: ...
 
 
-# Order matters: checked top to bottom, first match wins. Overshadowing is
-# checked before height/bulk since both mention height-adjacent words but
-# "shade"/"sun" are the more specific signal.
-_CONCERN_KEYWORDS: tuple[tuple[ConcernType, tuple[str, ...]], ...] = (
-    (
-        ConcernType.OVERSHADOWING,
-        ("shadow", "overshadow", "shade", "sunlight", "sun ", "block the sky", "block the sun"),
-    ),
-    (
-        ConcernType.PRIVACY_OVERLOOKING,
-        ("privacy", "overlook", "see into", "see straight into", "bedroom window"),
-    ),
-    (
-        ConcernType.VIEW_LOSS,
-        ("view", "harbour", "outlook", "skyline"),
-    ),
-    (
-        ConcernType.TREES_LANDSCAPE,
-        ("tree", "fig", "canopy", "landscap", "vegetation"),
-    ),
-    (
-        ConcernType.TRAFFIC_PARKING,
-        ("traffic", "parking", "park ", "cars", "congestion"),
-    ),
-    (
-        ConcernType.HERITAGE_CHARACTER,
-        ("heritage", "streetscape", "character of the street", "conservation"),
-    ),
-    (
-        ConcernType.NOISE,
-        ("noise", "noisy", "loud", "jackhammer", "construction hours"),
-    ),
-    (
-        ConcernType.PROPERTY_VALUE,
-        ("property value", "worth less", "resale", "devalue"),
-    ),
-    (
-        ConcernType.HEIGHT_BULK,
-        ("tall", "height", "storey", "storeys", "bulk", "massing", "towers over"),
-    ),
-)
+class KeywordConcernNormaliser:
+    """The default, fully offline :class:`ConcernNormaliser`: the same
+    keyword matcher (:func:`~setback.clerk.classify_concern`) that used to
+    be this state machine's only classification, now demoted to the
+    default -- every existing offline test keeps passing unchanged unless a
+    real, model-backed normaliser is explicitly injected. Redaction still
+    runs (:func:`~setback.clerk.redact_personal_information`), so
+    `redacted_text` is safe even with no model call at all."""
+
+    async def normalise(self, text: str) -> list[NormalisedConcern]:
+        return [
+            NormalisedConcern(
+                category=classify_concern(text),
+                target=None,
+                qualifiers=[],
+                redacted_text=redact_personal_information(text),
+            )
+        ]
 
 
-def _keyword_present(keyword: str, lowered_text: str) -> bool:
-    """True if `keyword` occurs in `lowered_text` with a real word start
-    immediately before it (not embedded mid-word, e.g. "tree" inside
-    "street") -- but no trailing boundary required, so a stem like
-    "landscap" still matches "landscaping"."""
-    pattern = r"(?<![a-z])" + re.escape(keyword)
-    return re.search(pattern, lowered_text) is not None
+class ModelConcernNormaliser:
+    """The production :class:`ConcernNormaliser`: one ``CLERK``-tier call
+    (via :func:`~setback.clerk.normalise_concerns`, which carries its own
+    deterministic fallback) per opening statement."""
 
+    def __init__(self, client: ModelClient) -> None:
+        self._client = client
 
-def classify_concern(text: str) -> ConcernType:
-    """Classify a resident's free-text concern into a :class:`ConcernType`
-    via simple, deterministic keyword matching -- no model call, and no
-    silent fallback to "probably fine": an unrecognised concern is
-    classified `OTHER`, which still gets a real (generic) clarifying
-    question, never dropped."""
-    lowered = text.lower()
-    for concern_type, keywords in _CONCERN_KEYWORDS:
-        if any(_keyword_present(keyword, lowered) for keyword in keywords):
-            return concern_type
-    return ConcernType.OTHER
+    async def normalise(self, text: str) -> list[NormalisedConcern]:
+        return await normalise_concerns(text, client=self._client)
 
 
 _CLARIFYING_INSTRUCTIONS: dict[ConcernType, str] = {
@@ -229,7 +187,14 @@ class InterviewTurn:
 
 @dataclass
 class RaisedConcern:
-    """One concern the resident has raised, accumulated across turns."""
+    """One concern the resident has raised, accumulated across turns.
+
+    `redacted_text` mirrors `initial_statement` (and, once clarified,
+    `clarification` appended to it) with personal names/phones/emails
+    stripped via :func:`~setback.clerk.redact_personal_information` --
+    every downstream tribunal prompt should consume THIS field, never
+    `initial_statement`/`clarification` directly.
+    """
 
     concern_type: ConcernType
     initial_statement: str
@@ -237,6 +202,7 @@ class RaisedConcern:
     evidence_document_ids: tuple[str, ...] = ()
     disputed_confirmations: tuple[str, ...] = ()
     confirmed: bool = False
+    redacted_text: str = ""
 
 
 @dataclass(frozen=True)
@@ -298,8 +264,14 @@ class InterviewFlow:
     always deterministic given the current stage and the resident's answer.
     """
 
-    def __init__(self, *, composer: QuestionComposer) -> None:
+    def __init__(
+        self,
+        *,
+        composer: QuestionComposer,
+        concern_normaliser: ConcernNormaliser | None = None,
+    ) -> None:
         self._composer = composer
+        self._concern_normaliser = concern_normaliser or KeywordConcernNormaliser()
         self.stage: InterviewStage = InterviewStage.OPENING
         self.transcript: list[InterviewTurn] = []
         self.concerns: list[RaisedConcern] = []
@@ -337,13 +309,24 @@ class InterviewFlow:
         raise RuntimeError(f"interview is already {self.stage.value}: nothing left to submit")
 
     async def _handle_opening(self, answer: str) -> InterviewTurn:
-        concern_type = classify_concern(answer)
-        self._current = RaisedConcern(concern_type=concern_type, initial_statement=answer)
+        normalised = await self._concern_normaliser.normalise(answer)
+        if normalised:
+            concern_type = normalised[0].category
+            redacted_text = " ".join(concern.redacted_text for concern in normalised).strip()
+        else:
+            concern_type = classify_concern(answer)
+            redacted_text = redact_personal_information(answer)
+        self._current = RaisedConcern(
+            concern_type=concern_type, initial_statement=answer, redacted_text=redacted_text
+        )
         return await self._ask(InterviewStage.CLARIFYING, _CLARIFYING_INSTRUCTIONS[concern_type])
 
     async def _handle_clarifying(self, answer: str) -> InterviewTurn:
         assert self._current is not None
         self._current.clarification = answer
+        self._current.redacted_text = (
+            f"{self._current.redacted_text} {redact_personal_information(answer)}".strip()
+        )
         return await self._ask(
             InterviewStage.REQUESTING_EVIDENCE,
             "Ask the resident if they have any photos, plans, or documents that show this, "
@@ -355,6 +338,9 @@ class InterviewFlow:
         if not _declines(answer):
             # Free-text elaboration rather than an upload -- keep it as context.
             self._current.clarification = f"{self._current.clarification}\n{answer}".strip()
+            self._current.redacted_text = (
+                f"{self._current.redacted_text}\n{redact_personal_information(answer)}".strip()
+            )
         return await self._ask_confirmation()
 
     async def record_evidence_upload(self, document_id: str) -> InterviewTurn:

@@ -28,24 +28,40 @@ concern`), not re-derived from the interview transcript here -- the console
 is the one place that already has the live `InterviewFlow` object with its
 parsed `RaisedConcern`s at the moment a concern is confirmed.
 
-**Known gaps, flagged rather than hidden:**
+**Durable uploads.** `_build_dossier` reads a case's uploaded documents back
+via its injected `DocumentSource` -- in production,
+:class:`~setback.evidence.storage.GcsEvidenceStore`, which survives the
+container boundary between `setback-console` and a `setback-tribunal` Cloud
+Run Job execution (the in-memory `UserUploadedDocumentSource` this module
+degrades gracefully around, below, remains the local/offline-test double).
+Every `ExhibitedDocument` constructed here carries `case_id` so a
+case-scoped store can locate the object; a source that doesn't need it
+(`UserUploadedDocumentSource`) simply ignores the field.
 
-* Only the grounding/polish model calls this module makes directly are
-  booked against the run's :class:`~setback.state.ledger.Ledger`; the two
-  reviewers' and the adjudicator's token usage happen inside ADK's
-  `LlmAgent` machinery and are not surfaced back to a caller today, so they
-  are not ledgered. The $2 self-abort ceiling is not fully load-bearing on
-  a full tribunal run — this is a real cost-observability gap, not silently
-  swept under the rug.
-* A resident's uploaded photo/document bytes live only in the console
-  process's in-memory `UserUploadedDocumentSource` (see that class's
-  docstring). A `setback-tribunal` Cloud Run Job execution runs in an
-  entirely separate container with no access to that memory, so
-  `RealPipelineRunner` degrades gracefully (an empty `EvidenceSlice`) rather
-  than crashing when no photo/document bytes are reachable -- this is
-  Street-View-fallback-shaped "degrade, don't halt", but a real fix needs a
-  shared, persistent document store (Firestore or GCS) between the two
-  deployables, which is out of this checkpoint's scope.
+**Clerical classification.** Every uploaded PDF is classified via
+:func:`setback.clerk.classify_document` (Gemma, the low-cost clerical
+tier) before its dossier document is registered, so its title reflects
+what kind of exhibited document it actually is (an elevations drawing, a
+site plan, a shadow diagram, ...) rather than only its raw filename --
+this happens strictly before `evidence.dossier.build_dossier` constructs
+the Clause/Evidence reviewer slices, per the classification contract's
+intent. `setback.clerk` is a separate work package's module: the import is
+deferred to the moment classification actually runs
+(`_default_document_classifier`), and only ever runs when a model client
+is configured -- classification enriches a document's label, it is never a
+hard requirement for a ground to ship on its citation, so a classification
+failure (or no model client at all, as in this module's own offline tests)
+degrades to the raw filename rather than failing the run.
+
+**Ledger truth (wave 4).** `court.graph.run_court_verbose` now extracts
+token usage from ADK's own `Event.usage_metadata` per reviewer/adjudicator
+stage and books it against a caller-supplied
+:class:`~setback.state.ledger.Ledger` -- this module passes its own
+per-case `ledger` through on every call, alongside the
+grounding/polish/classification calls it already booked directly, so the
+$2 self-abort ceiling is now load-bearing on the full tribunal run,
+reviewers and adjudicator included, not just this module's own direct
+calls.
 """
 
 from __future__ import annotations
@@ -56,9 +72,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Final
+from typing import Any, Final, Protocol
 
 import httpx
+import pypdfium2 as pdfium  # type: ignore[import-untyped]
 from google.adk.models import BaseLlm
 from PIL import Image
 
@@ -77,6 +94,7 @@ from setback.dispatch.composer import CaseInfo, GroundContent, compose_dispatch_
 from setback.evidence.dossier import (
     CaseDossier,
     ProvenanceGrade,
+    RenderedPage,
     anchor_id_for,
     build_dossier,
     to_gate_dossier,
@@ -84,7 +102,8 @@ from setback.evidence.dossier import (
 from setback.evidence.dossier import (
     EvidenceAnchor as DossierEvidenceAnchor,
 )
-from setback.evidence.grounding import ground_elements, render_overlay
+from setback.evidence.grounding import GroundedBox, ground_elements
+from setback.evidence.overlays import AnchoredElement, build_overlay_boxes, render_semantic_overlay
 from setback.gate.relevance import classify_relevance
 from setback.gate.validator import BoundingBox as GateBoundingBox
 from setback.gate.validator import (
@@ -155,6 +174,84 @@ def _shrink_png_for_storage(
     buf = io.BytesIO()
     resized.save(buf, format="PNG")
     return buf.getvalue()
+
+
+@dataclass(frozen=True)
+class _GroundedOverlayContext:
+    """What one grounding pass located, kept around between
+    `_ground_annotated_evidence` and the semantic overlay `run` renders
+    once every candidate ground has a gate decision -- see
+    `_ground_annotated_evidence`'s docstring for why the render itself is
+    deferred."""
+
+    document_id: str
+    page: RenderedPage
+    boxes: tuple[GroundedBox, ...]
+
+
+_CLASSIFY_FIRST_PAGE_MAX_CHARS: Final[int] = 4000
+"""Cap on how much of a PDF's first page text is sent to `classify_document`
+-- classification only needs enough text to recognise the document type,
+not the whole page."""
+
+
+class DocumentClassifier(Protocol):
+    """Matches `setback.clerk.classify_document`'s signature -- injectable
+    so tests exercise this module's classification wiring against a fake,
+    with zero dependency on `setback.clerk` (a separate work package's
+    module) actually being importable. Typed `-> Any` rather than
+    `setback.clerk.DocumentKind` for the same reason: this module never
+    inspects the returned value beyond generic `Enum` attributes
+    (`.name`/`str(...)`, see `_plan_document_title`), so it never needs
+    that module's type either.
+    """
+
+    async def __call__(
+        self, filename: str, first_page_text: str, *, client: ModelClient
+    ) -> Any: ...
+
+
+async def _default_document_classifier(
+    filename: str, first_page_text: str, *, client: ModelClient
+) -> Any:
+    """The production `DocumentClassifier`: calls the real
+    `setback.clerk.classify_document`. Imported lazily (rather than at
+    module scope) purely to keep this module's own import graph from
+    growing a hard dependency on `setback.clerk` at the top -- classifying
+    a document is one optional enrichment step among many this module
+    performs, not a defining dependency of it."""
+    from setback.clerk import classify_document
+
+    return await classify_document(filename, first_page_text, client=client)
+
+
+def _first_page_text(pdf_bytes: bytes, *, max_chars: int = _CLASSIFY_FIRST_PAGE_MAX_CHARS) -> str:
+    """The first page's extracted text, truncated to `max_chars` -- enough
+    for `classify_document` to recognise the document type without sending
+    a whole page of legal/technical text through the clerical tier."""
+    pdf = pdfium.PdfDocument(pdf_bytes)
+    try:
+        if len(pdf) == 0:
+            return ""
+        textpage = pdf[0].get_textpage()
+        try:
+            text = textpage.get_text_bounded()
+        finally:
+            textpage.close()
+    finally:
+        pdf.close()
+    return str(text)[:max_chars]
+
+
+def _plan_document_title(filename: str, kind: Any) -> str:
+    """A human-readable document title combining the classified kind with
+    the original filename (e.g. ``"Elevations (elevations.pdf)"``), or just
+    `filename` unchanged when `kind` is `None` (classification was skipped
+    or failed) or classified as the catch-all `OTHER` category, which adds
+    no information over the filename alone."""
+    if kind is None or getattr(kind, "name", None) == "OTHER":
+        return filename
+    return f"{str(kind).replace('_', ' ').title()} ({filename})"
 
 
 def _fixture_transport(request: httpx.Request) -> httpx.Response:
@@ -393,28 +490,39 @@ class RealPipelineRunner:
         clause_model: str | BaseLlm = "gemini-3.5-flash-lite",
         evidence_model: str | BaseLlm = "gemini-3.5-flash-lite",
         ingest_client: httpx.AsyncClient | None = None,
+        document_classifier: DocumentClassifier | None = None,
     ) -> None:
         """Args mirror the pipeline's real dependencies; `clause_model`/
-        `evidence_model`/`ingest_client`/`grounding_client` exist so tests
-        can inject fakes -- production (`job.main`) leaves them at their
-        live defaults."""
+        `evidence_model`/`ingest_client`/`grounding_client`/
+        `document_classifier` exist so tests can inject fakes -- production
+        (`job.main`) leaves them at their live defaults.
+        `document_classifier` defaults to the real
+        `setback.clerk.classify_document` (see `_default_document_classifier`)."""
         self._document_source = document_source
         self._polisher = polisher
         self._grounding_client = grounding_client
         self._clause_model = clause_model
         self._evidence_model = evidence_model
         self._ingest_client = ingest_client
+        self._document_classifier = document_classifier or _default_document_classifier
 
     async def _ground_annotated_evidence(
         self, dossier: CaseDossier
-    ) -> tuple[CaseDossier, list[tuple[str, bytes]]]:
+    ) -> tuple[CaseDossier, _GroundedOverlayContext | None]:
         """Run one grounding pass over the first rendered plan document (the
         uploaded elevations PDF), registering each located element as a
-        fine-grained bbox anchor and producing its annotated overlay PNG.
-        Returns the dossier unchanged (with `[]`) if there is no plan
-        document or no grounding client was configured -- grounding is a
-        richer-evidence enhancement, not a hard requirement for a ground to
-        ship on its page-level anchor."""
+        fine-grained bbox anchor. Returns the dossier unchanged (with
+        `None`) if there is no plan document or no grounding client was
+        configured -- grounding is a richer-evidence enhancement, not a
+        hard requirement for a ground to ship on its page-level anchor.
+
+        Deliberately does **not** render the annotated overlay image here:
+        `evidence.overlays.render_semantic_overlay` colours each box by
+        its ground's eventual gate outcome (green/red/neutral -- see that
+        module's docstring), which isn't known until every candidate
+        ground in this run has a `GateDecision`. `run` renders the actual
+        overlay once, after its ground loop, from the context this method
+        returns."""
         plan_document = next(
             (
                 d
@@ -424,12 +532,12 @@ class RealPipelineRunner:
             None,
         )
         if plan_document is None or self._grounding_client is None or not plan_document.pages:
-            return dossier, []
+            return dossier, None
 
         page = plan_document.pages[0]
         result = await ground_elements(self._grounding_client, page, _GROUNDING_LABELS)
         if not result.boxes:
-            return dossier, []
+            return dossier, None
 
         for box in result.boxes:
             anchor = DossierEvidenceAnchor(
@@ -442,10 +550,56 @@ class RealPipelineRunner:
             )
             dossier = dossier.with_anchor(anchor)
 
-        overlay_png = _shrink_png_for_storage(render_overlay(page, result.boxes))
-        return dossier, [(plan_document.document_id, overlay_png)]
+        return dossier, _GroundedOverlayContext(
+            document_id=plan_document.document_id, page=page, boxes=tuple(result.boxes)
+        )
 
-    async def _build_dossier(self, resume: ResumeState) -> CaseDossier:
+    def _semantic_overlay_png(
+        self,
+        ctx: _GroundedOverlayContext,
+        *,
+        ground_status: Mapping[str, GateStatus],
+        anchor_ground: Mapping[str, str],
+    ) -> bytes:
+        """Render `ctx`'s located boxes as the semantic overlay
+        (`evidence.overlays.render_semantic_overlay`), each coloured by
+        whether the ground it was cited for (if any, via `anchor_ground`)
+        ended up SHIPPED, refused/flagged, or has no ground at all --
+        exactly the anchor ids `_ground_annotated_evidence` registered on
+        the dossier, recomputed here the same deterministic way
+        (`anchor_id_for`) rather than looked up, since this method only
+        has `ctx`, not the dossier itself."""
+        elements = [
+            AnchoredElement(
+                anchor_id=anchor_id_for(ctx.document_id, ctx.page.page_number, box.bbox),
+                bbox=box.bbox,
+                caption=box.label,
+                ground_id=anchor_ground.get(
+                    anchor_id_for(ctx.document_id, ctx.page.page_number, box.bbox)
+                ),
+            )
+            for box in ctx.boxes
+        ]
+        overlay_boxes = build_overlay_boxes(elements, ground_status)
+        return _shrink_png_for_storage(render_semantic_overlay(ctx.page, overlay_boxes))
+
+    async def _classify_plan_document(self, filename: str, pdf_bytes: bytes) -> Any:
+        """Classify an uploaded PDF via `setback.clerk.classify_document`
+        before it is registered in the dossier, returning `None` (degrade
+        to the raw filename, see `_plan_document_title`) when no model
+        client is configured or classification itself fails -- enrichment,
+        never a hard requirement for a ground to ship."""
+        client = self._grounding_client or self._polisher
+        if client is None:
+            return None
+        try:
+            return await self._document_classifier(
+                filename, _first_page_text(pdf_bytes), client=client
+            )
+        except Exception:  # noqa: BLE001 -- classification enriches, never blocks the run
+            return None
+
+    async def _build_dossier(self, case_id: str, resume: ResumeState) -> CaseDossier:
         da_record, controls, dcp_documents = await _load_frozen_ingest(client=self._ingest_client)
 
         plan_documents: list[tuple[str, str, bytes]] = []
@@ -454,13 +608,18 @@ class RealPipelineRunner:
             try:
                 content = await self._document_source.download_document(
                     ExhibitedDocument(
-                        document_id=upload.document_id, title=upload.filename, source="user-upload"
+                        document_id=upload.document_id,
+                        title=upload.filename,
+                        source="user-upload",
+                        case_id=case_id,
                     )
                 )
             except Exception:  # noqa: BLE001 -- see module docstring's known-gap note
                 continue
             if upload.is_pdf:
-                plan_documents.append((upload.document_id, upload.filename, content))
+                kind = await self._classify_plan_document(upload.filename, content)
+                title = _plan_document_title(upload.filename, kind)
+                plan_documents.append((upload.document_id, title, content))
             else:
                 photo_documents.append(
                     (upload.document_id, upload.filename, content, ProvenanceGrade.RESIDENT_PHOTO)
@@ -481,19 +640,12 @@ class RealPipelineRunner:
         if resume.case is None:
             raise ValueError(f"case {case_id!r} has no resumable state")
 
-        dossier = await self._build_dossier(resume)
-        dossier, overlays = await self._ground_annotated_evidence(dossier)
-        for document_id, overlay_png in overlays:
-            await store.append_event(
-                case_id,
-                f"annotated-overlay:{document_id}",
-                "annotated_overlay",
-                payload={
-                    "document_id": document_id,
-                    "mime_type": "image/png",
-                    "image_base64": base64.b64encode(overlay_png).decode("ascii"),
-                },
-            )
+        dossier = await self._build_dossier(case_id, resume)
+        dossier, grounding_ctx = await self._ground_annotated_evidence(dossier)
+        # The semantic overlay itself (colour-coded by each anchor's
+        # ground's gate outcome) is rendered and emitted below, after the
+        # ground loop -- see `_ground_annotated_evidence`'s docstring.
+        anchor_ground: dict[str, str] = {}
 
         ledger = resume.ledger or Ledger()
         adjudicator_breaker = resume.breakers.get(_ADJUDICATOR_BREAKER_NAME) or CircuitBreaker(
@@ -517,6 +669,7 @@ class RealPipelineRunner:
                 clause_model=self._clause_model,
                 evidence_model=self._evidence_model,
                 bench=bench,
+                ledger=ledger,
             )
             for reviewer, review in (
                 ("clause_reviewer", result.clause_review),
@@ -545,6 +698,7 @@ class RealPipelineRunner:
                 )
 
             for anchor_id in result.verdict.cited_anchor_ids:
+                anchor_ground[anchor_id] = ground.ground_id
                 anchor = dossier.anchors.get(anchor_id)
                 if anchor is not None and anchor.bbox is not None:
                     await store.add_evidence_anchor(
@@ -628,9 +782,9 @@ class RealPipelineRunner:
                 )
                 annotated_ref = (
                     f"{first_citation.document_id} (grounded overlay)"
-                    if overlays
+                    if grounding_ctx is not None
                     and first_citation is not None
-                    and first_citation.document_id == overlays[0][0]
+                    and first_citation.document_id == grounding_ctx.document_id
                     else None
                 )
                 ground_content[ground.ground_id] = GroundContent(
@@ -639,6 +793,22 @@ class RealPipelineRunner:
                     page=first_citation.page if first_citation is not None else 1,
                     annotated_image_ref=annotated_ref,
                 )
+
+        if grounding_ctx is not None:
+            ground_status: dict[str, GateStatus] = {d.ground_id: d.status for d in decisions}
+            overlay_png = self._semantic_overlay_png(
+                grounding_ctx, ground_status=ground_status, anchor_ground=anchor_ground
+            )
+            await store.append_event(
+                case_id,
+                f"annotated-overlay:{grounding_ctx.document_id}",
+                "annotated_overlay",
+                payload={
+                    "document_id": grounding_ctx.document_id,
+                    "mime_type": "image/png",
+                    "image_base64": base64.b64encode(overlay_png).decode("ascii"),
+                },
+            )
 
         await store.save_breaker(case_id, adjudicator_breaker)
         await store.save_ledger(case_id, ledger)

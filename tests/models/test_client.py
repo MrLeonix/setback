@@ -96,6 +96,29 @@ async def test_generate_routes_interview_tier_through_gemini_and_parses_output()
     assert fake_models.calls[0]["config"].thinking_config.thinking_level == INTERVIEW.thinking_level
 
 
+async def test_generate_omits_temperature_from_gemini_config_by_default() -> None:
+    """Unset by default -- preserves the model's own default temperature,
+    matching this client's behaviour before the `temperature` parameter
+    existed (no existing caller should see any change)."""
+    fake_models = _FakeAsyncModels([_FakeResponse(SampleOutput(answer="ok"), _FakeUsage(1, 1, 0))])
+    client = ModelClient(genai_client=_FakeGenaiClient(fake_models))
+
+    await client.generate(INTERVIEW, "hello", SampleOutput)
+
+    assert fake_models.calls[0]["config"].temperature is None
+
+
+async def test_generate_passes_explicit_temperature_to_gemini_config() -> None:
+    """Grounding (`evidence/grounding.py`) needs `temperature=0.0` per the
+    spike; this is the parameter that closes that documented gap."""
+    fake_models = _FakeAsyncModels([_FakeResponse(SampleOutput(answer="ok"), _FakeUsage(1, 1, 0))])
+    client = ModelClient(genai_client=_FakeGenaiClient(fake_models))
+
+    await client.generate(INTERVIEW, "hello", SampleOutput, temperature=0.0)
+
+    assert fake_models.calls[0]["config"].temperature == 0.0
+
+
 async def test_generate_counts_thinking_tokens_for_bench_tier() -> None:
     fake_models = _FakeAsyncModels(
         [_FakeResponse(SampleOutput(answer="ok"), _FakeUsage(20, 8, 486))]
@@ -249,6 +272,33 @@ async def test_generate_routes_clerk_tier_through_maas_openai_endpoint() -> None
     assert result.output == SampleOutput(answer="ok")
     assert result.usage == TokenUsage(prompt_tokens=12, output_tokens=4, thinking_tokens=0)
     assert route.calls.last.request.headers["authorization"] == "Bearer fake-token"
+    assert "temperature" not in route.calls.last.request.content.decode()
+
+
+@respx.mock
+async def test_generate_passes_explicit_temperature_to_maas_payload() -> None:
+    url = _maas_base_url("test-project", "global") + "/chat/completions"
+    route = respx.post(url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"answer": "ok"}'}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+        )
+    )
+    client = ModelClient(
+        project="test-project",
+        location="global",
+        token_provider=lambda: "fake-token",
+    )
+
+    await client.generate(CLERK, "hello", SampleOutput, temperature=0.0)
+
+    import json as _json
+
+    body = _json.loads(route.calls.last.request.content.decode())
+    assert body["temperature"] == 0.0
 
 
 @respx.mock
@@ -285,3 +335,12 @@ def test_token_usage_billable_output_includes_thinking() -> None:
 
     assert usage.billable_output_tokens == 75
     assert usage.total_tokens == 175
+
+
+def test_token_usage_defaults_to_not_estimated() -> None:
+    """A real, model-reported usage figure is the default assumption --
+    `estimated=True` is something a caller has to opt into explicitly when
+    it had to fall back to a token-count guess (see `court.graph`)."""
+    usage = TokenUsage(prompt_tokens=1, output_tokens=1)
+
+    assert usage.estimated is False

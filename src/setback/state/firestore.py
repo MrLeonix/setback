@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from google.cloud import firestore
 
-from setback.config import GCP_PROJECT
+from setback.config import FIRESTORE_DB, GCP_PROJECT
 from setback.evidence.dossier import ProvenanceGrade
 from setback.models.client import TokenUsage
 from setback.state.breakers import CircuitBreaker, CircuitState
@@ -344,6 +344,8 @@ class CaseStore(Protocol):
 
     async def get_case(self, case_id: str) -> CaseRecord | None: ...
 
+    async def list_cases(self, limit: int = 50) -> tuple[CaseRecord, ...]: ...
+
     async def propose_ground(
         self,
         case_id: str,
@@ -475,6 +477,14 @@ class InMemoryCaseStore:
     async def get_case(self, case_id: str) -> CaseRecord | None:
         data = self._get(case_id)
         return data.case if data is not None else None
+
+    async def list_cases(self, limit: int = 50) -> tuple[CaseRecord, ...]:
+        cases = sorted(
+            (data.case for data in self._cases.values()),
+            key=lambda c: c.created_at,
+            reverse=True,
+        )
+        return tuple(cases[:limit])
 
     async def propose_ground(
         self,
@@ -613,12 +623,16 @@ class InMemoryCaseStore:
 def get_firestore_client() -> firestore.AsyncClient:
     """Build the default Firestore async client for `setback.config.GCP_PROJECT`.
 
-    Uses Application Default Credentials and the database's default
-    ("(default)") database id. Never called by the test suite, which always
-    injects a fake or uses `InMemoryCaseStore` instead. See the module
-    docstring for the `SETBACK_GCP_PROJECT` note.
+    Uses Application Default Credentials and the database id from
+    :data:`setback.config.FIRESTORE_DB` (default ``"(default)"``, the
+    original us-central1 database, so local/us environments keep working
+    unchanged unless `SETBACK_FIRESTORE_DB` is set — e.g. to
+    ``"setback-au"`` for this wave's australia-southeast1 deployment).
+    Never called by the test suite, which always injects a fake or uses
+    `InMemoryCaseStore` instead. See the module docstring for the
+    `SETBACK_GCP_PROJECT` note.
     """
-    return firestore.AsyncClient(project=GCP_PROJECT)
+    return firestore.AsyncClient(project=GCP_PROJECT, database=FIRESTORE_DB)
 
 
 def _case_to_dict(case: CaseRecord) -> dict[str, Any]:
@@ -811,6 +825,19 @@ class FirestoreCaseStore:
         data = snapshot.to_dict()
         assert data is not None
         return _case_from_dict(case_id, data)
+
+    async def list_cases(self, limit: int = 50) -> tuple[CaseRecord, ...]:
+        query = (
+            self._client.collection("cases")
+            .order_by("created_at", direction=firestore.Query.DESCENDING)
+            .limit(limit)
+        )
+        cases: list[CaseRecord] = []
+        async for snapshot in query.stream():
+            data = snapshot.to_dict()
+            if data is not None:
+                cases.append(_case_from_dict(snapshot.id, data))
+        return tuple(cases)
 
     async def propose_ground(
         self,

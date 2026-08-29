@@ -207,3 +207,25 @@ async def test_user_uploaded_source_satisfies_the_document_source_port() -> None
 
     source: DocumentSource = UserUploadedDocumentSource()
     assert isinstance(source, DocumentSource)
+
+
+async def test_user_uploaded_source_satisfies_the_evidence_upload_store_port() -> None:
+    """`console.app`'s upload endpoint writes through `EvidenceUploadStore`
+    -- the in-memory double must satisfy it exactly like
+    `evidence.storage.GcsEvidenceStore` does in production."""
+    from setback.ingest.tracker import EvidenceUploadStore
+
+    source: EvidenceUploadStore = UserUploadedDocumentSource()
+    assert isinstance(source, EvidenceUploadStore)
+
+
+async def test_add_evidence_document_is_downloadable_afterwards() -> None:
+    source = UserUploadedDocumentSource()
+    await source.add_evidence_document(
+        "case-1", "upload-1", b"the actual content", content_type="image/jpeg"
+    )
+    document = ExhibitedDocument(document_id="upload-1", title="upload-1", source="user-upload")
+
+    content = await source.download_document(document)
+
+    assert content == b"the actual content"

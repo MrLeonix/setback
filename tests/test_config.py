@@ -42,10 +42,12 @@ def test_gcp_project_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     importlib.reload(config)
 
 
-def test_gcs_bucket_defaults_to_setback_app_corpus(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gcs_bucket_defaults_to_vexcourt_agent_setback_corpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("SETBACK_GCS_BUCKET", raising=False)
     importlib.reload(config)
-    assert config.GCS_BUCKET == "setback-app-corpus"
+    assert config.GCS_BUCKET == "vexcourt-agent-setback-corpus"
 
 
 def test_gcs_bucket_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,6 +55,48 @@ def test_gcs_bucket_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     importlib.reload(config)
     assert config.GCS_BUCKET == "custom-bucket"
     monkeypatch.delenv("SETBACK_GCS_BUCKET", raising=False)
+    importlib.reload(config)
+
+
+def test_region_defaults_to_australia_southeast1(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SETBACK_REGION", raising=False)
+    importlib.reload(config)
+    assert config.REGION == "australia-southeast1"
+
+
+def test_region_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SETBACK_REGION", "us-central1")
+    importlib.reload(config)
+    assert config.REGION == "us-central1"
+    monkeypatch.delenv("SETBACK_REGION", raising=False)
+    importlib.reload(config)
+
+
+def test_firestore_db_defaults_to_default_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SETBACK_FIRESTORE_DB", raising=False)
+    importlib.reload(config)
+    assert config.FIRESTORE_DB == "(default)"
+
+
+def test_firestore_db_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SETBACK_FIRESTORE_DB", "setback-au")
+    importlib.reload(config)
+    assert config.FIRESTORE_DB == "setback-au"
+    monkeypatch.delenv("SETBACK_FIRESTORE_DB", raising=False)
+    importlib.reload(config)
+
+
+def test_gcs_uploads_bucket_defaults_to_setback_au(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SETBACK_GCS_UPLOADS_BUCKET", raising=False)
+    importlib.reload(config)
+    assert config.GCS_UPLOADS_BUCKET == "vexcourt-agent-setback-au"
+
+
+def test_gcs_uploads_bucket_reads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SETBACK_GCS_UPLOADS_BUCKET", "custom-uploads-bucket")
+    importlib.reload(config)
+    assert config.GCS_UPLOADS_BUCKET == "custom-uploads-bucket"
+    monkeypatch.delenv("SETBACK_GCS_UPLOADS_BUCKET", raising=False)
     importlib.reload(config)
 
 

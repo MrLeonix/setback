@@ -286,3 +286,160 @@ button:hover {
   background: var(--surface);
   color: var(--accent);
 }
+
+/* --- create-case flow (docket board) ------------------------------------
+   `app.js` injects this form's markup into the docket board on load --
+   the board's server-rendered HTML has no case-creation UI of its own
+   (only the JSON `POST /api/cases` route existed before this pass), so the
+   form and its styling both live entirely in this work package's lane. */
+
+.create-case-card {
+  border: 1px solid var(--accent);
+}
+
+.create-case-card h3 {
+  margin-bottom: 0.3rem;
+}
+
+.create-case-hint {
+  margin: 0.5rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.create-case-form {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.create-case-form input[type="text"] {
+  flex: 1;
+  min-width: 220px;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+.create-case-error {
+  margin: 0.6rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  background: var(--danger-bg);
+  color: var(--danger);
+  font-size: 0.85rem;
+}
+
+/* --- refusal / gate-decision cards: status must read at a glance -------- */
+
+.gate-decision {
+  list-style: none;
+  padding: 0.7rem 0.9rem;
+  border-radius: 8px;
+  border-left: 4px solid var(--border);
+  background: var(--bg);
+}
+
+.gate-decision strong {
+  text-transform: capitalize;
+  letter-spacing: 0.01em;
+}
+
+.gate-decision--shipped {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+
+.gate-decision--shipped strong {
+  color: var(--success);
+}
+
+.gate-decision--refused-irrelevant,
+.gate-decision--refused-unsubstantiated {
+  border-left-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.gate-decision--refused-irrelevant strong,
+.gate-decision--refused-unsubstantiated strong {
+  color: var(--danger);
+}
+
+.gate-decision--flagged {
+  border-left-color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.gate-decision--flagged strong {
+  color: var(--warn);
+}
+
+/* --- reviewer opinions: agree/disagree at a glance ----------------------- */
+
+.review-verdict {
+  list-style: none;
+  padding: 0.5rem 0.75rem;
+  border-radius: 8px;
+  border-left: 3px solid var(--border);
+}
+
+.review-verdict--support {
+  border-left-color: var(--success);
+}
+
+.review-verdict--support strong {
+  color: var(--success);
+}
+
+.review-verdict--reject {
+  border-left-color: var(--danger);
+}
+
+.review-verdict--reject strong {
+  color: var(--danger);
+}
+
+.review-verdict--voided {
+  border-left-color: var(--warn);
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* --- annotated evidence overlay ------------------------------------------ */
+
+.annotated-overlay {
+  list-style: none;
+}
+
+.annotated-overlay img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+/* --- submitted documents / downloads -------------------------------------- */
+
+.document-preview {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.9rem 1.1rem;
+  background: var(--bg);
+  margin-bottom: 0.5rem;
+  overflow-x: auto;
+}
+
+.document-downloads {
+  margin: 0 0 1rem;
+  font-size: 0.85rem;
+}
+
+.document-downloads a {
+  color: var(--accent);
+}

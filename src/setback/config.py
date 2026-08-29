@@ -58,8 +58,33 @@ literally named ``setback-app`` does not exist. Default to the real id so
 callers that don't set the env var still hit a live project.
 """
 
-GCS_BUCKET = os.environ.get("SETBACK_GCS_BUCKET", "setback-app-corpus")
-"""GCS bucket for the case corpus, overridable via SETBACK_GCS_BUCKET."""
+GCS_BUCKET = os.environ.get("SETBACK_GCS_BUCKET", "vexcourt-agent-setback-corpus")
+"""GCS bucket for the case corpus, overridable via SETBACK_GCS_BUCKET.
+
+Default follows the same ``<project-id>-setback-*`` naming convention as
+:data:`GCS_UPLOADS_BUCKET` (the previous ``setback-app-corpus`` default named
+a bucket that was never actually created under that name).
+"""
+
+REGION = os.environ.get("SETBACK_REGION", "australia-southeast1")
+"""Default GCP region for this wave's Sydney-region resources (Cloud Run,
+Firestore, GCS), overridable via SETBACK_REGION. Pre-wave-4 resources in
+``us-central1`` are unaffected by this default — they're addressed
+directly (e.g. the ``(default)`` Firestore database stays in
+us-central1; see :data:`FIRESTORE_DB`)."""
+
+FIRESTORE_DB = os.environ.get("SETBACK_FIRESTORE_DB", "(default)")
+"""Firestore database id, overridable via SETBACK_FIRESTORE_DB.
+
+Defaults to ``"(default)"`` — the original us-central1 database — so
+local development and any not-yet-migrated environment keep working
+unchanged. This wave's Sydney deployment sets this to ``"setback-au"``,
+the named australia-southeast1 database."""
+
+GCS_UPLOADS_BUCKET = os.environ.get("SETBACK_GCS_UPLOADS_BUCKET", "vexcourt-agent-setback-au")
+"""GCS bucket for resident-uploaded case evidence, overridable via
+SETBACK_GCS_UPLOADS_BUCKET. Defaults to this wave's australia-southeast1
+bucket (object layout: ``cases/{case_id}/uploads/{sha256}.{ext}``)."""
 
 # --- Budget ceilings ---------------------------------------------------------
 

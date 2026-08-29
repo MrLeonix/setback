@@ -5,26 +5,38 @@ name "Setback"). Stack: Python 3.12, `google-adk==2.8.0` (graph Workflow API),
 `google-genai==2.20.0` on Vertex AI (ADC, `location=global`). Models: `gemini-3.5-flash-lite`
 (thinking `MINIMAL`) as the default worker tier, `gemini-3.7-flash` (thinking `LOW`) as the
 adjudicator / escalation tier, `gemma-4-26b-a4b-it-maas` for non-legal prose polishing.
-Storage: Firestore. Compute: Cloud Run (service + job).
+Storage: Firestore, `setback-au` (`australia-southeast1`) as of this wave — see §3.
+Uploads: GCS (`evidence/storage.py`'s `GcsEvidenceStore`), replacing the earlier
+console-in-memory upload store. Compute: Cloud Run (service + job), `australia-southeast1`
+as of this wave (was `us-central1`; see §3 and `deploy.sh`).
 
 This document is the spec the build executes against and the judges read. Names below
 are the literal module/collection/field names the code uses — treat them as contracts,
-not suggestions.
+not suggestions. **Docs-truth note (wave 4):** the table and prose below were reconciled
+against the actual `src/setback/` tree as it stands this wave; a handful of narrower
+claims further down are known to still describe the original design intent rather than
+what shipped, and are called out inline as "**Docs-truth note**"/"**Docs-truth
+correction**" paragraphs (see §2, §4, §5, and §7) rather than silently asserted as true.
 
 ---
 
 ## 1. Component map
 
 Three deliberately separate deployables, plus a shared library of deterministic modules
-that both call into.
+that both call into. Everything lives under one Python package, `src/setback/` — there
+is no separate `shared/` tree; `console/` and `job/` are simply two entry points into it.
 
 | Component | Type | Repo path | Talks to |
 |---|---|---|---|
-| `setback-console` | Cloud Run **Service** (FastAPI, ASGI, scale-to-zero) | `console/` | Firestore (`cases`, `events`), Vertex AI (interview turns only), triggers `setback-tribunal` |
-| `setback-tribunal` | Cloud Run **Job** (one execution per case run) | `tribunal/` | Firestore (all collections), Vertex AI (review/adjudication/composition calls), OnlineDA / ePlanning / eTrack (via `ingest/`) |
-| `ingest/` | deterministic library, no LLM calls | `shared/ingest/` | OnlineDA API, ePlanning `layerintersect`, council eTrack `FileDownload.ashx` |
-| `evidence/` | deterministic library, no LLM calls | `shared/evidence/` | Firestore evidence anchors, bbox math, provenance grading |
-| `llm/` | shared single-call-site client | `shared/llm/` | Vertex AI (`google-genai`), breaker/ledger state in Firestore |
+| `setback-console` | Cloud Run **Service** (FastAPI, ASGI, scale-to-zero) | `src/setback/console/` | Firestore (`cases`, `events`), Vertex AI (interview turns only), triggers `setback-tribunal` |
+| `setback-tribunal` | Cloud Run **Job** (one execution per case run) | `src/setback/job/` (`main.py` entry point, `pipeline.py`'s `RealPipelineRunner` for the actual run) | Firestore (all collections), Vertex AI (review/adjudication/composition/grounding calls), OnlineDA / ePlanning / eTrack (via `ingest/`), GCS (uploaded evidence) |
+| `ingest/` | deterministic library, no LLM calls | `src/setback/ingest/` (`onlineda.py`, `spatial.py`, `tracker.py`) | OnlineDA API, ePlanning `layerintersect`, council eTrack `FileDownload.ashx` |
+| `evidence/` | mixed: `dossier.py`/`storage.py` are deterministic; `grounding.py` calls a model | `src/setback/evidence/` | GCS (`storage.py`'s `GcsEvidenceStore`), Firestore evidence anchors, bbox math, provenance grading, Vertex AI (grounding only) |
+| `court/` | the ADK graph (§2) | `src/setback/court/` (`graph.py`, `roles.py`, `bench.py`, `tally.py`) | Vertex AI directly, via ADK's own `Agent`/`genai.Client` transport — **not** `models/client.py` (see §7's docs-truth note) |
+| `gate/` | deterministic library, no LLM calls | `src/setback/gate/` (`s415.py`, `relevance.py`, `validator.py`) | Firestore (via the caller-supplied dossier), no I/O of its own |
+| `dispatch/` | output composition | `src/setback/dispatch/composer.py` | `models/client.py` (resident-facing prose polish only) |
+| `models/` | the sole call site for `ModelClient`-routed calls | `src/setback/models/client.py` | Vertex AI (`google-genai`, Gemini tiers), Vertex's OpenAI-compatible endpoint (Gemma MaaS tier) |
+| `state/` | Firestore/ledger/breaker persistence | `src/setback/state/` (`firestore.py`, `ledger.py`, `breakers.py`) | Firestore |
 
 **Why console and tribunal are decoupled (not one FastAPI app doing everything):**
 
@@ -37,7 +49,7 @@ that both call into.
    by Cloud Run Job's max execution time without taking the resident's chat session down
    with it. The console process is expected to be robust and long-lived per session;
    the job is expected to be disposable and retryable.
-2. **Least privilege.** The tribunal job's service account needs Vertex AI review/adjudication
+3. **Least privilege.** The tribunal job's service account needs Vertex AI review/adjudication
    scopes and outbound egress to three external NSW government hosts. The console's service
    account needs only Firestore read/write on `cases`/`events` and a narrow Vertex AI scope
    for interview chat, plus permission to start the job. Neither SA needs the other's full
@@ -56,8 +68,8 @@ globally) is what makes them independently unit-testable without a live GCP proj
 
 ## 2. The ADK court graph
 
-Defined in `tribunal/graph.py` using ADK 2.8.0's graph Workflow API. One case run = one
-graph execution.
+Defined in `src/setback/court/graph.py` using ADK 2.8.0's graph Workflow API. One case
+run = one graph execution.
 
 ### Nodes
 
@@ -113,11 +125,65 @@ from the submission rather than guessed at. The plain-English refusal output say
 explicitly. Setback never asserts a planning ground it isn't confident in — silence is
 always the safe failure direction here, never fabrication.
 
+### The court's stance is checked before the gate ever sees a citation
+
+A `CourtVerdict` carries a `stance` (`support`/`reject`) that is orthogonal to the s4.15
+gate's own concern (§6): the gate only ever asks "does this citation resolve", never "did
+the tribunal actually believe this ground". A planning-relevant ground the court rejected
+— unanimously, or on adjudication — could otherwise still ship purely because it happened
+to carry a citation that resolves. `job/pipeline.py` closes that gap explicitly: any
+statutorily relevant `CandidateGround` whose `CourtVerdict.stance` is `reject` is
+synthesized into a permanent `REFUSED_UNSUBSTANTIATED` decision *before* it is ever handed
+to `gate.validator.validate_ground` — the gate itself has no `stance` field on
+`CandidateGround` and cannot express this check on its own. An irrelevant ground (e.g.
+property value) still always keeps its specific, permanent s4.15 "not a listed matter"
+explanation regardless of the court's stance — irrelevance is categorical, "the tribunal
+didn't believe it" is a distinct and more specific reason, and the resident is shown
+whichever one actually applies rather than a merged, vaguer one.
+
+### Ledger truth: every model call in the graph is now metered
+
+`ClauseReviewerNode`/`EvidenceReviewerNode`/`AdjudicatorNode` are `google.adk.agents.Agent`
+instances, which call Vertex AI through ADK's own internal `genai.Client` — never through
+`models/client.py` (see §7's docs-truth note on the "single call site" claim). Earlier in
+this build that meant none of the court's token usage ever reached
+`state.ledger.Ledger`, silently understating a run's real cost. `court/graph.py` now
+extracts each stage's usage straight from the run's own ADK event stream — `Event` extends
+ADK's `LlmResponse`, which carries the same `usage_metadata` field a direct `ModelClient`
+call already reads — and books it against a caller-supplied `Ledger` (`run_court`/
+`run_court_verbose`'s `ledger=` parameter). Confirmed live (one real Vertex call): a real
+`Agent`-driven reviewer's event does populate `usage_metadata`, exactly like a direct
+`genai` call. When it genuinely doesn't (measured offline against the test suite's
+`BaseLlm` doubles, which report none), the booked usage falls back to a `len(text) // 4`
+character-count estimate and is recorded with `estimated=true` on the ledger entry — an
+honest, labelled guess, never a silent zero or a fabricated precise number.
+
 ---
 
 ## 3. Firestore schema
 
 Project: `vexcourt-agent`. All collection/field names below are literal.
+
+**Database and region (wave 4 change).** The project's `(default)` Firestore database
+is `us-central1` and — like every GCP project's default database — immutable once
+created; it cannot be moved. Rather than leave the whole system pinned to that region,
+this wave adds a second, **named** Firestore database, `setback-au`, in
+`australia-southeast1` (the region actually appropriate for an NSW-council-facing
+product), and both deployables' Firestore client construction (`state/firestore.py`)
+targets it by name. The `(default)` database is left in place, unused, rather than
+deleted (Firestore databases cannot be deleted while any Cloud Run revision still
+references them during a cutover, and there is no benefit to forcing that race under a
+deadline). `deploy.sh`'s region defaults move to `australia-southeast1` to match.
+
+**Uploads move out of Firestore/memory and into GCS.** A resident's uploaded
+photo/document bytes previously lived only in the console process's in-memory
+`ingest.tracker.UserUploadedDocumentSource` — invisible to a `setback-tribunal` Cloud Run
+Job execution, which runs in a separate container (this was flagged as a known gap in the
+wave-3 checkpoint's `SMOKE.md`). `evidence/storage.py`'s `GcsEvidenceStore` (implementing
+the same `ingest.tracker.DocumentSource` protocol) now backs uploads with a real,
+shared object at `cases/{case_id}/uploads/{sha256}.{ext}` in a GCS bucket
+(`config.GCS_BUCKET`), reachable by both deployables regardless of which container
+received the original upload.
 
 ```
 cases/{case_id}
@@ -182,18 +248,33 @@ re-trigger by case ID, not by run ID.
 
 ### Circuit breakers (per stage, per case)
 
-`cases/{case_id}/breakers/{clause_reviewer|evidence_reviewer|adjudicator}`. Three
-consecutive failures (HTTP 429/500, or a Pydantic schema-validation failure on the model's
-structured output) within a case opens the breaker for that stage:
+**Docs-truth note:** the schema below (`cases/{case_id}/breakers/{stage}`, one document
+per stage) is the original design intent and is what `state/breakers.py`'s
+`CircuitBreaker`/`DegradingBreaker` support generically. As actually wired in
+`court/graph.py`/`job/pipeline.py` today, only `AdjudicatorNode` has a real breaker behind
+it (`court.bench.AdjudicationBench`, backed by `cases/{case_id}/breakers/adjudicator`,
+persisted via `store.save_breaker`) — `ClauseReviewerNode`/`EvidenceReviewerNode` currently
+run at a fixed tier (`gemini-3.5-flash-lite`, from `RealPipelineRunner`'s constructor
+defaults) with no breaker wired at all, so a reviewer failure propagates as a hard error
+for that ground's run rather than degrading. This is a real gap against the original
+design below, not an intentional simplification, and is left for a future pass rather
+than silently claimed as built:
 
-- If the stage was calling `gemini-3.7-flash`, it **degrades** to `gemini-3.5-flash-lite`
-  and half-opens (retries once at the lower tier before re-opening).
-- If the stage was already on `gemini-3.5-flash-lite` (the default), the breaker opens
-  fully — the stage is forced to its conservative default (ground `gated_out`,
-  `refusal_reason=low_confidence_unadjudicated`) and the case proceeds without that ground
-  rather than retrying indefinitely.
-- `AdjudicatorNode` never degrades further (it's already the top tier) — an open breaker
-  there means every conflicted ground in that case falls to the conservative default.
+- If the adjudicator stage was calling `gemini-3.7-flash` and its breaker opens, it
+  **degrades** to skipping the call entirely (`AdjudicationBench.tier()` returns `None`)
+  rather than to a lower model tier — there is no lower tier than `gemini-3.7-flash` for
+  the adjudicator to fall back to (`court/bench.py`'s module docstring is explicit about
+  this). The ground then routes straight to the conservative default (`gated_out`,
+  `refusal_reason=low_confidence_unadjudicated`) rather than retrying indefinitely.
+- A reviewer stage's own per-stage breaker/degrade-to-cheaper-tier behaviour described
+  below for `clause_reviewer`/`evidence_reviewer` is **not yet built** (see the note
+  above) — treat it as the target design, not a current guarantee, until it lands:
+  - If the stage was calling `gemini-3.7-flash`, it **degrades** to `gemini-3.5-flash-lite`
+    and half-opens (retries once at the lower tier before re-opening).
+  - If the stage was already on `gemini-3.5-flash-lite` (the default), the breaker opens
+    fully — the stage is forced to its conservative default (ground `gated_out`,
+    `refusal_reason=low_confidence_unadjudicated`) and the case proceeds without that
+    ground rather than retrying indefinitely.
 
 ### Retry/backoff on 429 (Dynamic Shared Quota)
 
@@ -233,13 +314,22 @@ indefinitely waiting for an event that will never arrive.
 
 ### $2/run ledger abort
 
-Before every model call, the call site reads `cases/{case_id}.budget_used_usd` inside the
-same transaction that will increment it. If the *projected* cost of the call (estimated
-from tier + expected token count) would push `budget_used_usd` past the per-run ceiling of
-**$2.00** (tracked separately from the hackathon-wide $62 ceiling, which is a manual
-dashboard check across all cases, not an automated gate), the call is skipped, the stage
-forced to its conservative default, and `cases/{case_id}.status` set to `budget_exceeded`.
-This is a hard stop, not a warning — no stage can spend past it.
+`state.ledger.Ledger` accumulates cost for a run and self-aborts past its ceiling: booking
+a call whose cost would push the running total past **$2.00** (`DEMO_RUN_BUDGET_CEILING_USD`,
+tracked separately from the hackathon-wide $62 ceiling, which is a manual dashboard check
+across all cases, not an automated gate) raises `BudgetExceededError` *before* the call is
+counted, rather than discovering the overage after the fact. This is a hard stop, not a
+warning — no stage can book spend past it.
+
+**Docs-truth note:** as of this wave, every stage that can reach the ledger does —
+`models/client.py`-routed calls (interview, clerk extraction, grounding, composer polish)
+book directly; the ADK court stages (reviewers, adjudicator) book via `court/graph.py`'s
+event-stream extraction (§2). The one caller-side step still required for the court
+stages' bookings to actually land in a live run is `job/pipeline.py` passing its
+`Ledger` instance through to `run_court_verbose(..., ledger=...)` — `court/graph.py`
+added the parameter and the extraction logic this wave, but `job/pipeline.py` is a
+different work package's lane and had not yet been updated to pass it as of this
+checkpoint (see this doc's revision history / the integrator's notes for status).
 
 ---
 
@@ -263,14 +353,19 @@ This is a hard stop, not a warning — no stage can spend past it.
     scoped to exactly the Maps secret, if and when one exists (see below).
   - Neither SA is `roles/editor` or `roles/owner`. Neither SA can read the other's scope
     it doesn't need.
-- **The one API key that can exist (Maps):** if geocoding/mapping is added, the key is
-  created restricted (API-restricted to Maps, and IP/referrer-restricted to the Cloud Run
-  service), stored in Secret Manager on project `vexcourt-agent` under a secret named
-  `setback-maps-key`, and referenced by `setback-tribunal`/`setback-console` at deploy time
-  via `--set-secrets MAPS_API_KEY=setback-maps-key:latest` — never inlined in code, never
-  printed in logs, never committed. Nothing in this MVP currently requires it (zoning is
-  resolved via the ePlanning `layerintersect` API directly, not a rendered map — see §8),
-  so as of this design it does not exist yet.
+- **The one API key that exists (Maps → Street View fallback):** zoning itself is still
+  resolved via the ePlanning `layerintersect` API directly, never a rendered map (see §8) —
+  but `evidence/imagery.py`'s Street View fallback (the resident's "away from home" or
+  no-photo-available case) does call the Maps Platform Street View API, so this key is
+  real, not merely a documented contingency. It is Secret-Manager-referenced only (never a
+  literal in code, read at call time via an injectable `secret_accessor`, mirroring
+  `models/client.py`'s ADC token-provider pattern), under the secret's actual live name on
+  project `vexcourt-agent`: **`maps-api-key`** — not `setback-maps-key`, an earlier
+  placeholder name from before the secret was created, corrected in this pass.
+  `setback-tribunal` (the only deployable that calls it) receives it via
+  `--set-secrets MAPS_API_KEY=maps-api-key:latest` at deploy time; `setback-console` never
+  receives it (`--clear-secrets` is passed explicitly on every console deploy to guarantee
+  that stays true, since the console never calls Street View).
 
 ---
 
@@ -317,6 +412,13 @@ For every `cited_evidence_id`/`clause_ref` on a ground, the gate checks:
 Any failure here rejects the ground with `refusal_reason=unresolved_citation`, regardless
 of how confident or well-written the surrounding rationale text is.
 
+**Scope boundary, made explicit:** this gate is a citation/relevance filter only — it has
+no concept of whether the court (§2) actually found a ground well-founded. That check
+(a rejected ground must never ship purely because a citation resolves) happens one layer
+up, in `job/pipeline.py`, before a court-rejected-but-relevant ground is ever handed to
+`validate_ground` at all — see §2's "The court's stance is checked before the gate ever
+sees a citation".
+
 ### Refusal semantics
 
 A rejected ground is never silently dropped — it's written to Firestore with
@@ -332,31 +434,62 @@ just an internal log.
 
 Written so a judge scoring "clean, modularized, maintainable" finds the answer fast.
 
-- **Single model call site** (`shared/llm/client.py`, one function: `call(model, contents,
-  tier, case_id, stage) -> StructuredResponse`). Every one of the ~5 places in the graph
-  that talks to a model goes through this one function. Retry/backoff, ledger writes, and
-  breaker checks live here exactly once — there is no second place in the codebase that
-  could construct a genai request that skips metering or budget enforcement.
-- **Ports & adapters for output composition** (`shared/compose/`). `ComposerPort` is an
-  interface consumed by `ComposerNode`; `CouncilSubmissionAdapter` produces the formal
-  council-format document, `PlainEnglishRefusalAdapter` produces the resident-facing
+- **A sole call site for `ModelClient`-routed calls, plus one further call path this pass
+  reconciled the ledger against** (docs-truth correction — the original design intended
+  literally one call site, and this is the one substantive place reality now diverges from
+  it, tracked openly rather than left as a false claim). `models/client.py`'s
+  `ModelClient.generate(tier, prompt, response_model, ...)` is still the only place the
+  interview, `setback.clerk`'s extraction calls, `evidence/grounding.py`'s grounding calls,
+  and `dispatch/composer.py`'s resident-facing prose polish talk to a model — retry/
+  backoff and structured-output validation live here exactly once for all of those.
+  `court/graph.py`'s three `google.adk.agents.Agent` nodes (the two reviewers, the
+  adjudicator) are the exception: ADK constructs and owns its own `genai.Client`
+  internally, so those calls never pass through `ModelClient` at all — there is a second
+  place in the codebase a model request is actually constructed. This was invisible to the
+  budget ledger until this wave (§2's "Ledger truth" note): `court/graph.py` now closes
+  that gap by extracting usage straight from the ADK event stream and booking it against
+  the same `Ledger`, so the *accounting* is unified again even though the *transport* is
+  not. Unifying the transport itself (routing ADK's `Agent` through a `ModelClient`-backed
+  custom `BaseLlm`, so there is truly only one call site) is a natural follow-up, not
+  attempted this wave.
+- **Ports & adapters for output composition** (`dispatch/composer.py`). `ComposerPort` is
+  an interface consumed by the composition step; `CouncilSubmissionAdapter` produces the
+  formal council-format document, `PlainEnglishRefusalAdapter` produces the resident-facing
   refusal summary. Both consume the same gated `Ground`/`Evidence` domain objects with no
   duplicated logic. Adding a third output (e.g. a PDF export adapter) later is a new class
   implementing the port, not a graph change.
-- **Evidence provenance grading as a value object** (`ProvenanceGrade: Literal["A","B","C"]`
-  attached at ingest time, in `IngestNode`, and never re-derived downstream). "How much do
-  we trust this fact" has exactly one place it's decided — the deterministic ingest
-  boundary — and flows unchanged through reviewers, the gate, and the composer. No LLM
-  node ever re-grades evidence trust.
-- **Repository pattern for Firestore** (`CaseRepo`, `GroundRepo`, `EvidenceRepo` in
-  `shared/repo/`). Deterministic-ID generation and idempotent `merge=True` writes live in
-  one place per collection; node code never imports the Firestore SDK directly, it calls
-  `GroundRepo.upsert(ground)`. This is what makes the resume semantics (§3) testable
-  without a live Firestore emulator running for every node's unit tests.
-- **Strategy pattern for model tier selection** (`shared/llm/tier.py`:
-  `select_tier(stage, breaker_state) -> ModelTier`). Breaker state decides
-  `gemini-3.7-flash` vs `gemini-3.5-flash-lite` without any node's logic branching on it —
-  a node just calls `llm.call(...)` and the tier is resolved for it.
+- **Evidence provenance grading as a value object** (`evidence.dossier.ProvenanceGrade`, a
+  `StrEnum` with values `"A"`/`"B"`/`"C"`, attached once at dossier-build time and never
+  re-derived downstream). "How much do we trust this fact" has exactly one place it's
+  decided and flows unchanged through reviewers, the gate, and the composer — no LLM node
+  ever re-grades evidence trust. **Docs-truth note:** the *labels* backing those three
+  letter grades are `RESIDENT_PHOTO` / `STREET_VIEW_SOLAR_FALLBACK` / `DOCUMENTS_ONLY`, a
+  different taxonomy than this document's earlier "A = official council doc, B = verified
+  applicant plan, C = unverified resident photo" description (no "official council doc"
+  grade exists in the shipped enum at all) — the *pattern* (graded once, immutable
+  downstream) held up; the specific grade semantics changed during the build and this doc
+  had not been reconciled to the new labels until this pass. Confirm against
+  `evidence/dossier.py`'s `ProvenanceGrade` directly if the exact grading rationale matters
+  for judging, rather than trusting this paragraph's summary of it.
+- **A port for Firestore case state, not a per-collection repository layer**
+  (`state.firestore.CaseStore`, an abstract port with a `FirestoreCaseStore` production
+  implementation). Deterministic-ID generation and idempotent writes live behind this one
+  port; node/job code never imports the Firestore SDK directly. **Docs-truth correction:**
+  an earlier design considered separate `CaseRepo`/`GroundRepo`/`EvidenceRepo` classes
+  under a `shared/repo/` package — that specific shape was not built; the single
+  `CaseStore` port (covering cases, grounds, evidence anchors, events, breakers, and the
+  ledger together) is what actually ships, and is what makes the resume semantics (§3)
+  testable without a live Firestore emulator running for every unit test.
+- **Degrade-not-halt for the adjudication tier, not a general tier-selection strategy.**
+  `court.bench.AdjudicationBench` (wrapping `state.breakers.DegradingBreaker`) decides
+  whether `AdjudicatorNode` is called at `gemini-3.7-flash` or skipped straight to the
+  conservative default — a binary "call or skip" choice, since the adjudicator has no
+  lower tier to fall back to. **Docs-truth correction:** an earlier design (`select_tier(
+  stage, breaker_state) -> ModelTier` over a general `shared/llm/tier.py`) intended this
+  pattern to also degrade the two reviewers between `gemini-3.7-flash` and
+  `gemini-3.5-flash-lite`; as built, the reviewers run at a fixed tier with no breaker
+  behind them at all (see §4's docs-truth note on circuit breakers) — only the adjudicator
+  actually has degrade-not-halt wiring today.
 
 ---
 
@@ -367,7 +500,7 @@ Written so a judge scoring "clean, modularized, maintainable" finds the answer f
 | Multi-council genericization | One demo case (Georges River), 74h window — `ingest/` adapters are hardcoded to eTrack/ePlanning's actual response shapes, not a general council plugin system. |
 | User auth / multi-tenant login | Single-session-per-case-link is enough for a hackathon demo; no resident PII protection surface to build auth around yet. |
 | PDF rendering of the final submission | Output is formatted Markdown/HTML matching the council's submission fields — a PDF adds a rendering dependency with zero judging upside. |
-| Live map / Maps-key-backed UI | Zoning is already resolved via the ePlanning `layerintersect` API without needing a rendered map; the Maps key path in §5 exists as a documented contingency, not a built feature. |
+| Live map / rendered-map UI | Zoning is resolved via the ePlanning `layerintersect` API without needing a rendered map. (The Maps key itself *is* used — §5 — but only for the Street View fallback still-image fetch, not for any interactive map UI.) |
 | Cloud Run Job concurrency / autoscaling tuning | Demo processes one case at a time; not a cost or latency concern inside the hackathon window. |
 | Firestore security rules per resident user | No auth system to hang per-user rules off yet; service-level IAM is the only access boundary in MVP. |
 | Dead-letter queue / retry-forever infra | The sweeper (§4) plus per-stage breakers cover every failure mode the demo can hit without extra queueing infrastructure. |
@@ -457,4 +590,7 @@ flowchart TB
 ```
 
 Solid arrows are the main data path; dashed arrows are escalation/observability side
-channels (breaker upgrades, ledger writes).
+channels (breaker upgrades, ledger writes). The `FS` (Firestore) box is the named
+`setback-au` database in `australia-southeast1` as of this wave (§3), not the project's
+original `(default)` database; a GCS bucket for uploaded evidence (§3) sits alongside it
+and isn't drawn separately above.

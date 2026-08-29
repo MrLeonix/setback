@@ -39,6 +39,28 @@ Built from the proven construction in ``spike-adkCourt.md``, exactly:
        ▼               ▼                                    │
   conservative_    adjudicator ──> post_adjudicate ──────────┘
   default
+
+**Ledger truth.** Every `google.adk.agents.Agent` node this module builds
+calls Vertex AI directly through ADK's own internal transport, never
+through :class:`setback.models.client.ModelClient` — so, prior to this
+fix, none of the reviewers' or the adjudicator's token usage ever reached
+:class:`setback.state.ledger.Ledger`, silently understating a run's real
+cost (job/pipeline.py's own "known gap" docstring note flagged exactly
+this). `Event` extends ADK's `LlmResponse`, which carries the same
+`usage_metadata: types.GenerateContentResponseUsageMetadata | None` field
+`ModelClient._generate_gemini` already reads — verified both offline
+(`tests/court/test_graph.py`'s ledger-truth tests, via `FakeLlm`, which
+deliberately never sets it) and live (`tests/court/live_usage_check.py`,
+one real Vertex call: a real `Agent`-driven reviewer call *does* populate
+`event.usage_metadata`, exactly like a direct `genai` call does). Pass
+`ledger=` to :func:`run_court`/:func:`run_court_verbose` to book each
+stage's usage as it's extracted from that run's own event stream; omit it
+(the default) for exactly the prior, unledgered behaviour. When an event
+genuinely carries no usage (a transport that doesn't report it, or a
+`BaseLlm` test double), the booked :class:`~setback.models.client.TokenUsage`
+falls back to a `len(text) // 4` character-based estimate and is marked
+`estimated=True` on the record — an honest, labelled guess rather than a
+silent zero or a fabricated precise number.
 """
 
 from __future__ import annotations
@@ -89,6 +111,8 @@ from setback.court.roles import (
     ReviewOutput,
     ReviewStance,
 )
+from setback.models.client import TokenUsage
+from setback.state.ledger import Ledger
 
 CLAUSE_REVIEWER_NODE = "clause_reviewer"
 EVIDENCE_REVIEWER_NODE = "evidence_reviewer"
@@ -146,6 +170,110 @@ def node_name_for_event(event: Event) -> str | None:
 def _dedupe(anchor_ids: tuple[str, ...]) -> tuple[str, ...]:
     """Order-preserving de-duplication of cited anchor ids from both reviewers."""
     return tuple(dict.fromkeys(anchor_ids))
+
+
+def _model_response_event(events: Sequence[Event], node_name: str) -> Event | None:
+    """The terminal model-response event `node_name` produced -- the one
+    carrying (or, per the module docstring, genuinely lacking) its
+    `usage_metadata` -- never a partial chunk or a function-call turn."""
+    for event in events:
+        if node_name_for_event(event) != node_name:
+            continue
+        if event.content is None or event.content.role != "model":
+            continue
+        if event.partial or event.get_function_calls():
+            continue
+        return event
+    return None
+
+
+def _event_text(event: Event | None) -> str:
+    """Every text part of `event`'s content, concatenated -- the raw
+    response text used for the character-based fallback estimate."""
+    if event is None or event.content is None or not event.content.parts:
+        return ""
+    return "".join(part.text for part in event.content.parts if part.text)
+
+
+def _estimate_tokens(text: str) -> int:
+    """A deliberately rough, ~4-characters-per-token estimate (the common
+    heuristic for English prose) used only when `event.usage_metadata` is
+    genuinely absent -- see the module docstring's ledger-truth note."""
+    return max(1, len(text) // 4)
+
+
+def _usage_for_event(event: Event | None, *, prompt_text: str) -> TokenUsage:
+    """The real, model-reported usage from `event.usage_metadata` when ADK
+    provided one; otherwise a marked `estimated=True` character-count guess
+    from `prompt_text` and the event's own response text."""
+    metadata = event.usage_metadata if event is not None else None
+    if metadata is not None:
+        return TokenUsage(
+            prompt_tokens=metadata.prompt_token_count or 0,
+            output_tokens=metadata.candidates_token_count or 0,
+            thinking_tokens=metadata.thoughts_token_count or 0,
+            estimated=False,
+        )
+    return TokenUsage(
+        prompt_tokens=_estimate_tokens(prompt_text),
+        output_tokens=_estimate_tokens(_event_text(event)),
+        estimated=True,
+    )
+
+
+def _model_name(model: str | BaseLlm) -> str:
+    """The pricing-table model id for `model`, whether it's a bare string or
+    a `BaseLlm` (real or test double) -- every `BaseLlm` carries its own
+    `.model` field (see `tests/court/_fakes.py:FakeLlm`)."""
+    return model if isinstance(model, str) else model.model
+
+
+def _book_stage_usage(
+    ledger: Ledger,
+    events: Sequence[Event],
+    *,
+    clause_slice: ClauseSlice,
+    evidence_slice: EvidenceSlice,
+    clause_model: str | BaseLlm,
+    evidence_model: str | BaseLlm,
+    adjudicator_model: str | BaseLlm | None,
+) -> None:
+    """Book every stage this run actually executed against `ledger`,
+    extracted straight from `events` -- the ledger-truth fix described in
+    the module docstring. Raises :class:`~setback.state.ledger.
+    BudgetExceededError` (propagated from `Ledger.record`) exactly like any
+    other ledgered call, per ARCHITECTURE.md §4's hard-stop semantics."""
+    ledger.record(
+        stage=CLAUSE_REVIEWER_NODE,
+        model=_model_name(clause_model),
+        usage=_usage_for_event(
+            _model_response_event(events, CLAUSE_REVIEWER_NODE),
+            prompt_text=roles.render_clause_slice(clause_slice),
+        ),
+    )
+    ledger.record(
+        stage=EVIDENCE_REVIEWER_NODE,
+        model=_model_name(evidence_model),
+        usage=_usage_for_event(
+            _model_response_event(events, EVIDENCE_REVIEWER_NODE),
+            prompt_text=roles.render_evidence_slice(evidence_slice),
+        ),
+    )
+    if adjudicator_model is None:
+        return
+    adjudicator_event = _model_response_event(events, ADJUDICATOR_NODE)
+    if adjudicator_event is None:
+        return  # CLEAR path (or bench-open) -- the adjudicator never ran.
+    clause_review, evidence_review = _extract_reviews(events)
+    adjudicator_prompt = (
+        f"clause_review: {clause_review.model_dump_json() if clause_review else 'voided'}\n"
+        f"evidence_review: {evidence_review.model_dump_json() if evidence_review else 'voided'}"
+    )
+    ledger.record(
+        stage=ADJUDICATOR_NODE,
+        model=_model_name(adjudicator_model),
+        usage=_usage_for_event(adjudicator_event, prompt_text=adjudicator_prompt),
+    )
 
 
 def _make_tally_node(known_anchor_ids: frozenset[str]) -> FunctionNode:
@@ -371,6 +499,7 @@ async def _run_court_events(
     bench: AdjudicationBench | None,
     contested_citation_grounder: ContestedCitationGrounder | None,
     session_service: BaseSessionService | None,
+    ledger: Ledger | None,
 ) -> tuple[CourtVerdict, list[Event]]:
     """Run the court graph end-to-end for one ground, returning both its
     final verdict and the full raw event list -- the shared implementation
@@ -421,6 +550,18 @@ async def _run_court_events(
             f"{[node_name_for_event(e) for e in events]}"
         )
     verdict = CourtVerdict.model_validate(terminal_events[0].output)
+
+    if ledger is not None:
+        _book_stage_usage(
+            ledger,
+            events,
+            clause_slice=clause_slice,
+            evidence_slice=evidence_slice,
+            clause_model=clause_model,
+            evidence_model=evidence_model,
+            adjudicator_model=adjudicator_model,
+        )
+
     return verdict, events
 
 
@@ -456,6 +597,7 @@ async def run_court(
     bench: AdjudicationBench | None = None,
     contested_citation_grounder: ContestedCitationGrounder | None = None,
     session_service: BaseSessionService | None = None,
+    ledger: Ledger | None = None,
 ) -> CourtVerdict:
     """Run the court graph end-to-end for one ground and return its verdict.
 
@@ -472,6 +614,12 @@ async def run_court(
             `None` to skip that check.
         session_service: Injectable ADK session service; defaults to a
             fresh in-memory one (fine for a single one-shot run).
+        ledger: When given, every stage this run actually executes
+            (clause/evidence reviewers, and the adjudicator on a SPLIT ground)
+            has its token usage extracted from the run's own ADK event
+            stream and booked against it -- see the module docstring's
+            ledger-truth note. `None` (the default) preserves the prior,
+            unledgered behaviour exactly.
 
     Returns:
         The graph's single `CourtVerdict` for this ground.
@@ -479,6 +627,8 @@ async def run_court(
     Raises:
         RuntimeError: The graph did not produce exactly one terminal event
             (a bug in the graph construction, not a normal outcome).
+        setback.state.ledger.BudgetExceededError: `ledger` was given and
+            booking a stage's usage would exceed its ceiling.
     """
     verdict, _events = await _run_court_events(
         clause_slice,
@@ -489,6 +639,7 @@ async def run_court(
         bench=bench,
         contested_citation_grounder=contested_citation_grounder,
         session_service=session_service,
+        ledger=ledger,
     )
     return verdict
 
@@ -503,15 +654,17 @@ async def run_court_verbose(
     bench: AdjudicationBench | None = None,
     contested_citation_grounder: ContestedCitationGrounder | None = None,
     session_service: BaseSessionService | None = None,
+    ledger: Ledger | None = None,
 ) -> CourtRunResult:
     """Run the court graph exactly like :func:`run_court`, but also return
     the two reviewers' raw opinions -- for a caller (the tribunal job) that
     needs to show both reviewer opinions to the resident, not just the
     final decision.
 
-    Same arguments, same graph execution, same failure/breaker semantics as
-    `run_court` (both share `_run_court_events`); this is purely an additive
-    view over the same run, not a second execution.
+    Same arguments (including `ledger` -- see `run_court`'s docstring for
+    the ledger-truth behaviour), same graph execution, same failure/breaker
+    semantics as `run_court` (both share `_run_court_events`); this is
+    purely an additive view over the same run, not a second execution.
     """
     verdict, events = await _run_court_events(
         clause_slice,
@@ -522,6 +675,7 @@ async def run_court_verbose(
         bench=bench,
         contested_citation_grounder=contested_citation_grounder,
         session_service=session_service,
+        ledger=ledger,
     )
     clause_review, evidence_review = _extract_reviews(events)
     return CourtRunResult(

@@ -54,6 +54,13 @@ class ExhibitedDocument:
     title: str
     source: str
     size_bytes: int | None = None
+    case_id: str | None = None
+    """Which case this document belongs to, when the source needs it to
+    locate the document again (`evidence.storage.GcsEvidenceStore`, whose
+    objects live at ``cases/{case_id}/uploads/{document_id}.{ext}``).
+    `None` for sources that don't need it (`EtrackDocumentSource`, and
+    `UserUploadedDocumentSource`'s own id-only lookup) -- always safely
+    ignorable by a source that doesn't need it."""
 
 
 @runtime_checkable
@@ -69,6 +76,30 @@ class DocumentSource(Protocol):
 
     async def download_document(self, document: ExhibitedDocument) -> bytes:
         """Download the full bytes of a previously listed `document`."""
+        ...
+
+
+@runtime_checkable
+class EvidenceUploadStore(DocumentSource, Protocol):
+    """The write side of a `DocumentSource`: where `console.app`'s upload
+    endpoint durably writes a resident's photo/document.
+
+    `UserUploadedDocumentSource` (below) is the in-memory, offline-test
+    double behind this port; `evidence.storage.GcsEvidenceStore` is the
+    production adapter that survives the container boundary between
+    `setback-console` and a `setback-tribunal` Cloud Run Job execution.
+    Extending `DocumentSource` means anything satisfying this port is also,
+    for free, usable anywhere a plain read-only `DocumentSource` is
+    expected (e.g. `job.pipeline.RealPipelineRunner`'s `document_source`).
+    """
+
+    async def add_evidence_document(
+        self, case_id: str, document_id: str, content: bytes, *, content_type: str | None = None
+    ) -> None:
+        """Durably write `content` under `case_id`/`document_id`, so a
+        `download_document` call for the same `document_id` (with
+        `ExhibitedDocument.case_id` set for a store that needs it) returns
+        it again -- from any process, for `GcsEvidenceStore`."""
         ...
 
 
@@ -203,6 +234,18 @@ class UserUploadedDocumentSource:
     def add_document(self, da_number: str, document_id: str, content: bytes) -> None:
         """Register an uploaded document's bytes under `da_number`."""
         self._documents_by_da.setdefault(da_number, {})[document_id] = content
+
+    async def add_evidence_document(
+        self, case_id: str, document_id: str, content: bytes, *, content_type: str | None = None
+    ) -> None:
+        """Async `EvidenceUploadStore` adapter over `add_document`, so this
+        in-memory double is usable anywhere `GcsEvidenceStore` is, behind
+        the same port. `case_id` is stored under the same key `add_document`
+        calls `da_number` -- this store never actually needs to distinguish
+        the two (`download_document` below searches every registered
+        upload regardless of key). `content_type` is accepted for
+        signature parity only; irrelevant to an in-memory store."""
+        self.add_document(case_id, document_id, content)
 
     async def list_documents(self, da_number: str) -> list[ExhibitedDocument]:
         """List the documents a resident has uploaded for `da_number`."""

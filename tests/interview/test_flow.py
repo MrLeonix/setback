@@ -9,16 +9,22 @@ the STATE MACHINE decides to ask/do, not about model output quality.
 
 from __future__ import annotations
 
+import httpx
 import pytest
+import respx
 
+from setback.clerk import NormalisedConcern
 from setback.interview.flow import (
     ConcernType,
     InterviewFlow,
     InterviewStage,
+    KeywordConcernNormaliser,
+    ModelConcernNormaliser,
     ResidentFeedback,
     capture_refusal_feedback,
     classify_concern,
 )
+from setback.models.client import ModelClient, RetryPolicy, _maas_base_url
 from setback.state.firestore import EventType, InMemoryCaseStore
 
 
@@ -165,6 +171,118 @@ async def test_record_evidence_upload_before_requesting_stage_is_a_noop_append()
     turn = await flow.record_evidence_upload("early-upload")
     assert flow.stage is InterviewStage.OPENING
     assert turn.stage is InterviewStage.OPENING
+
+
+# --- redacted_text: persisted, PII-stripped, default normaliser -------------
+
+
+async def test_confirmed_concern_carries_redacted_text_with_pii_stripped() -> None:
+    flow = InterviewFlow(composer=_FakeComposer())
+    await flow.start()
+    await flow.submit("My name is Jane Smith, email jane@example.com -- this is way too noisy.")
+    await flow.submit("Jackhammering starts at 6am, call me on 0412 345 678 to discuss.")
+    await flow.submit("no photos")
+    await flow.submit("yes that's right")
+
+    assert len(flow.concerns) == 1
+    concern = flow.concerns[0]
+    assert "Jane Smith" not in concern.redacted_text
+    assert "jane@example.com" not in concern.redacted_text
+    assert "0412 345 678" not in concern.redacted_text
+    assert "[NAME]" in concern.redacted_text
+    assert "[EMAIL]" in concern.redacted_text
+    assert "[PHONE]" in concern.redacted_text
+    # the raw fields are untouched -- redaction is additive, not destructive
+    assert "Jane Smith" in concern.initial_statement
+
+
+async def test_default_normaliser_is_the_offline_keyword_test_double() -> None:
+    flow = InterviewFlow(composer=_FakeComposer())
+    assert isinstance(flow._concern_normaliser, KeywordConcernNormaliser)  # noqa: SLF001
+
+
+# --- ConcernNormaliser wiring: a model-backed normaliser drives category ----
+
+
+class _FakeConcernNormaliser:
+    """A `ConcernNormaliser` test double that returns a canned category,
+    proving the state machine actually consults the injected normaliser
+    rather than always falling back to `classify_concern`."""
+
+    def __init__(self, concerns: list[NormalisedConcern]) -> None:
+        self._concerns = concerns
+        self.calls: list[str] = []
+
+    async def normalise(self, text: str) -> list[NormalisedConcern]:
+        self.calls.append(text)
+        return self._concerns
+
+
+async def test_injected_normaliser_overrides_the_keyword_classification() -> None:
+    # Keyword classification would call this OTHER (no recognised keyword);
+    # the injected normaliser insists it's actually about heritage.
+    normaliser = _FakeConcernNormaliser(
+        [
+            NormalisedConcern(
+                category=ConcernType.HERITAGE_CHARACTER,
+                target="the front facade",
+                qualifiers=[],
+                redacted_text="It just doesn't feel right for this street.",
+            )
+        ]
+    )
+    flow = InterviewFlow(composer=_FakeComposer(), concern_normaliser=normaliser)
+
+    await flow.start()
+    turn = await flow.submit("It just doesn't feel right for this street.")
+
+    assert normaliser.calls == ["It just doesn't feel right for this street."]
+    assert flow._current is not None  # noqa: SLF001
+    assert flow._current.concern_type is ConcernType.HERITAGE_CHARACTER  # noqa: SLF001
+    assert flow._current.redacted_text == "It just doesn't feel right for this street."  # noqa: SLF001
+    assert turn.stage is InterviewStage.CLARIFYING
+
+
+async def test_model_concern_normaliser_wires_the_real_clerk_call_offline() -> None:
+    """End-to-end wiring proof, fully offline (respx, no live model): a
+    `ModelConcernNormaliser` backed by a real `ModelClient` drives both the
+    concern's category and its redacted text."""
+    url = _maas_base_url("test-project", "global") + "/chat/completions"
+    with respx.mock:
+        respx.post(url).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"concerns": [{"category": "overshadowing", '
+                                    '"target": null, "qualifiers": [], '
+                                    '"redacted_text": "It overshadows my garden."}]}'
+                                )
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                },
+            )
+        )
+        client = ModelClient(
+            project="test-project",
+            location="global",
+            token_provider=lambda: "fake-token",
+            retry_policy=RetryPolicy(max_attempts=1),
+        )
+        flow = InterviewFlow(
+            composer=_FakeComposer(), concern_normaliser=ModelConcernNormaliser(client)
+        )
+        await flow.start()
+        await flow.submit("It overshadows my garden, my name is Jane Smith by the way.")
+
+    assert flow._current is not None  # noqa: SLF001
+    assert flow._current.concern_type is ConcernType.OVERSHADOWING  # noqa: SLF001
+    assert flow._current.redacted_text == "It overshadows my garden."  # noqa: SLF001
 
 
 # --- capture_refusal_feedback: durable pushback capture ----------------------

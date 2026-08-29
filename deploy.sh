@@ -38,7 +38,7 @@
 set -euo pipefail
 
 PROJECT_ID="${SETBACK_GCP_PROJECT:-vexcourt-agent}"
-REGION="${SETBACK_REGION:-us-central1}"
+REGION="${SETBACK_REGION:-australia-southeast1}"
 REPO="${SETBACK_AR_REPO:-setback}"
 IMAGE_NAME="setback"
 CONSOLE_SERVICE="setback-console"
@@ -46,6 +46,8 @@ TRIBUNAL_JOB="setback-tribunal"
 CONSOLE_SA="sa-console@${PROJECT_ID}.iam.gserviceaccount.com"
 TRIBUNAL_SA="sa-orchestrator@${PROJECT_ID}.iam.gserviceaccount.com"
 MAPS_SECRET="maps-api-key"
+FIRESTORE_DB="${SETBACK_FIRESTORE_DB:-setback-au}"
+GCS_UPLOADS_BUCKET="${SETBACK_GCS_UPLOADS_BUCKET:-vexcourt-agent-setback-au}"
 
 TAG="$(date -u +%Y%m%dt%H%M%Sz)"
 AR_HOST="${REGION}-docker.pkg.dev"
@@ -120,7 +122,7 @@ gcloud run deploy "${CONSOLE_SERVICE}" \
   --max-instances=3 \
   --cpu-throttling \
   --port=8080 \
-  --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID}" \
+  --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID},SETBACK_FIRESTORE_DB=${FIRESTORE_DB},SETBACK_GCS_UPLOADS_BUCKET=${GCS_UPLOADS_BUCKET}" \
   --clear-secrets \
   --allow-unauthenticated \
   --quiet
@@ -150,7 +152,7 @@ gcloud run jobs deploy "${TRIBUNAL_JOB}" \
   --memory=2Gi \
   --task-timeout=1800s \
   --max-retries=1 \
-  --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID}" \
+  --set-env-vars="SETBACK_GCP_PROJECT=${PROJECT_ID},SETBACK_FIRESTORE_DB=${FIRESTORE_DB},SETBACK_GCS_UPLOADS_BUCKET=${GCS_UPLOADS_BUCKET}" \
   --set-secrets="MAPS_API_KEY=${MAPS_SECRET}:latest" \
   --quiet
 

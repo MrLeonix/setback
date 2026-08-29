@@ -75,6 +75,44 @@ class _FakeCollectionRef:
             if len(key) == prefix_len and key[:-1] == self._path:
                 yield _FakeSnapshot(key[-1], self._root.docs[key])
 
+    def order_by(self, field: str, direction: str = "ASCENDING") -> _FakeQuery:
+        return _FakeQuery(self._root, self._path, field, direction)
+
+
+class _FakeQuery:
+    """Minimal stand-in for the chained `order_by().limit().stream()` surface
+    `FirestoreCaseStore.list_cases` uses against the root `cases` collection."""
+
+    def __init__(
+        self,
+        root: _FakeFirestore,
+        path: tuple[str, ...],
+        field: str,
+        direction: str,
+        limit: int | None = None,
+    ) -> None:
+        self._root = root
+        self._path = path
+        self._field = field
+        self._direction = direction
+        self._limit = limit
+
+    def limit(self, count: int) -> _FakeQuery:
+        return _FakeQuery(self._root, self._path, self._field, self._direction, count)
+
+    async def stream(self) -> AsyncIterator[_FakeSnapshot]:
+        prefix_len = len(self._path) + 1
+        matches = [
+            (key[-1], self._root.docs[key])
+            for key in list(self._root.docs)
+            if len(key) == prefix_len and key[:-1] == self._path
+        ]
+        matches.sort(key=lambda kv: kv[1][self._field], reverse=self._direction == "DESCENDING")
+        if self._limit is not None:
+            matches = matches[: self._limit]
+        for doc_id, data in matches:
+            yield _FakeSnapshot(doc_id, data)
+
 
 class _FakeDocumentRef:
     def __init__(self, root: _FakeFirestore, path: tuple[str, ...]) -> None:
@@ -179,6 +217,33 @@ async def test_create_case_is_idempotent(store: CaseStore) -> None:
 
 async def test_get_case_returns_none_for_unknown_case(store: CaseStore) -> None:
     assert await store.get_case("does-not-exist") is None
+
+
+# --- list_cases ------------------------------------------------------------
+
+
+async def test_list_cases_orders_newest_first(store: CaseStore) -> None:
+    first = await store.create_case(application_number="PAN-1", resident_session="s1")
+    second = await store.create_case(application_number="PAN-2", resident_session="s2")
+    third = await store.create_case(application_number="PAN-3", resident_session="s3")
+
+    cases = await store.list_cases()
+
+    assert [c.case_id for c in cases] == [third.case_id, second.case_id, first.case_id]
+
+
+async def test_list_cases_respects_limit(store: CaseStore) -> None:
+    await store.create_case(application_number="PAN-1", resident_session="s1")
+    await store.create_case(application_number="PAN-2", resident_session="s2")
+    await store.create_case(application_number="PAN-3", resident_session="s3")
+
+    cases = await store.list_cases(limit=2)
+
+    assert len(cases) == 2
+
+
+async def test_list_cases_empty_store_returns_empty(store: CaseStore) -> None:
+    assert await store.list_cases() == ()
 
 
 # --- propose_ground ------------------------------------------------------------

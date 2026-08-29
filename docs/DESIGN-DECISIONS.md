@@ -132,9 +132,10 @@ rather than a comforting illusion of one.
 
 ---
 
-## D7. Single model call site (`llm/client.py`) rather than per-node client construction
+## D7. One model call site (`models/client.py`) as the design intent — reconciled against
+what actually shipped
 
-**Decision:** every model call in the codebase goes through one function
+**Decision:** every model call in the codebase was designed to go through one function
 (ARCHITECTURE.md §7).
 
 **Why:** the budget ledger, the circuit breaker, and the retry/backoff logic all need to
@@ -146,10 +147,29 @@ everything through one function makes the enforcement structural: there is no co
 a model that doesn't pass through the budget check, because there is no second way to call
 a model at all.
 
-**Cost:** every new node type has to fit the call site's interface
-(`call(model, contents, tier, case_id, stage) -> StructuredResponse`) rather than doing
-anything bespoke with the genai SDK — judged an acceptable constraint for a hackathon-scale
-codebase where "every call is metered" is worth more than "every node is fully free-form."
+**Docs-truth correction (wave 4):** this is the one place the "single call site" claim
+didn't hold up against the shipped code, and it's recorded honestly here rather than left
+as a quiet overstatement. `court/graph.py`'s three `google.adk.agents.Agent` nodes (the
+Clause/Evidence Reviewers, the Adjudicator) call Vertex AI through ADK's own internal
+`genai.Client`, constructed and owned by ADK itself — they never pass through
+`models.client.ModelClient.generate(...)`. This was invisible to the ledger for most of
+the build (`job/pipeline.py`'s own docstring flagged it as a "known gap, not silently
+swept under the rug"). This wave closes the *accounting* gap without changing the
+*transport*: `court/graph.py` now reads `usage_metadata` straight off each stage's ADK
+event (the same field a direct `ModelClient` call already reads, confirmed live) and books
+it against the same `Ledger`, so every call is metered again even though it isn't all
+funneled through one function. The originally-intended single-call-site property could
+still be recovered later by wrapping ADK's `Agent` around a `ModelClient`-backed custom
+`BaseLlm` instead of a bare model-id string — not attempted this wave, since the
+accounting fix was the higher-priority half of the gap (a metered-but-two-path system is
+honest; an unmetered court graph was the actual risk).
+
+**Cost:** every new node type going through `ModelClient` has to fit its interface
+(`generate(tier, prompt, response_model, *, system_instruction=None, temperature=None) ->
+ModelResult`) rather than doing anything bespoke with the genai SDK — judged an acceptable
+constraint for a hackathon-scale codebase where "every call is metered" is worth more than
+"every node is fully free-form." ADK's own agents are the one place that constraint wasn't
+actually enforced, for the reason above.
 
 ---
 

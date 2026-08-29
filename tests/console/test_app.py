@@ -16,8 +16,8 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from setback.console.app import create_app
-from setback.ingest.tracker import UserUploadedDocumentSource
+from setback.console.app import RealJobTrigger, create_app
+from setback.ingest.tracker import ExhibitedDocument, UserUploadedDocumentSource
 from setback.state.firestore import InMemoryCaseStore, case_id_for
 
 
@@ -256,6 +256,44 @@ def test_upload_document_unknown_case_is_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
+class _RecordingEvidenceStore:
+    """A fake `EvidenceUploadStore` recording exactly what it is called
+    with, to prove the upload route writes through the port keyed by
+    `case_id` (not `application_number`) with the upload's content type."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, bytes, str | None]] = []
+
+    async def add_evidence_document(
+        self, case_id: str, document_id: str, content: bytes, *, content_type: str | None = None
+    ) -> None:
+        self.calls.append((case_id, document_id, content, content_type))
+
+    async def list_documents(self, da_number: str) -> list[ExhibitedDocument]:
+        return []
+
+    async def download_document(self, document: ExhibitedDocument) -> bytes:
+        raise AssertionError("not exercised by this test")
+
+
+def test_upload_document_writes_through_the_evidence_store_keyed_by_case_id(
+    store: InMemoryCaseStore, composer: _FakeComposer
+) -> None:
+    evidence_store = _RecordingEvidenceStore()
+    app = create_app(store, composer=composer, document_source=evidence_store)
+    client = TestClient(app)
+    case_id = _create_case(client, application_number="PAN-9", session="s9")
+
+    response = client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("garden.jpg", io.BytesIO(b"photo bytes"), "image/jpeg")},
+    )
+    assert response.status_code == 200, response.text
+    document_id = response.json()["document_id"]
+
+    assert evidence_store.calls == [(case_id, document_id, b"photo bytes", "image/jpeg")]
+
+
 # --- tribunal trigger ---------------------------------------------------------
 
 
@@ -271,6 +309,45 @@ def test_trigger_tribunal_records_event_and_calls_job_trigger(
 def test_trigger_tribunal_unknown_case_is_404(client: TestClient) -> None:
     response = client.post("/api/cases/does-not-exist/tribunal")
     assert response.status_code == 404
+
+
+def test_start_tribunal_refused_once_the_concurrency_cap_is_reached(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """`console.guards.enforce_concurrent_tribunal_cap` (default cap: 2) is
+    wired ahead of `JobTrigger.trigger` -- two cases with a running (no
+    terminal event yet) tribunal must block a third case's request."""
+    running_case_ids = [
+        _create_case(client, application_number=f"PAN-{i}", session=f"s{i}") for i in range(2)
+    ]
+    for running_case_id in running_case_ids:
+        response = client.post(f"/api/cases/{running_case_id}/tribunal")
+        assert response.status_code == 202, response.text
+
+    third_case_id = _create_case(client, application_number="PAN-third", session="s-third")
+    response = client.post(f"/api/cases/{third_case_id}/tribunal")
+
+    assert response.status_code == 429, response.text
+
+
+# --- abuse guards (rate limiting) --------------------------------------------
+
+
+def test_case_creation_is_rate_limited_per_ip(client: TestClient) -> None:
+    """`console.guards.per_ip_case_creation_guard` (default: 5/hour) is
+    wired on `POST /api/cases` -- the 6th request from the same client must
+    be refused."""
+    for i in range(5):
+        response = client.post(
+            "/api/cases", json={"application_number": f"PAN-limit-{i}", "resident_session": "s"}
+        )
+        assert response.status_code == 201, response.text
+
+    response = client.post(
+        "/api/cases", json={"application_number": "PAN-limit-6", "resident_session": "s"}
+    )
+    assert response.status_code == 429
+    assert "Retry-After" in response.headers
 
 
 # --- SSE event stream ----------------------------------------------------------
@@ -361,6 +438,22 @@ def test_docket_board_lists_created_cases(client: TestClient) -> None:
     assert "PAN-2" in response.text
 
 
+def test_docket_board_survives_a_fresh_app_instance_over_the_same_store(
+    store: InMemoryCaseStore, composer: _FakeComposer
+) -> None:
+    """The board renders `CaseStore.list_cases`, not an in-process registry
+    -- a brand-new app built over the same store (modelling a console
+    restart/redeploy, or a second replica) must still show every case."""
+    first_app = create_app(store, composer=composer, document_source=UserUploadedDocumentSource())
+    _create_case(TestClient(first_app), application_number="PAN-1", session="s1")
+
+    second_app = create_app(store, composer=composer, document_source=UserUploadedDocumentSource())
+    response = TestClient(second_app).get("/")
+
+    assert response.status_code == 200
+    assert "PAN-1" in response.text
+
+
 def test_case_page_renders_known_sections(client: TestClient) -> None:
     case_id = _create_case(client)
     response = client.get(f"/cases/{case_id}")
@@ -438,3 +531,57 @@ def test_static_assets_are_served(client: TestClient) -> None:
     css = client.get("/static/style.css")
     assert js.status_code == 200
     assert css.status_code == 200
+
+
+# --- RealJobTrigger ----------------------------------------------------------
+
+
+class _FakeRunJobsClient:
+    """Fake `google.cloud.run_v2.JobsClient`: `RealJobTrigger` never
+    actually imports the real `google-cloud-run` package when a client is
+    injected -- these tests exercise the real request-building logic
+    fully offline, with zero dependency on that (not yet installed)
+    package."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict[str, object]] = []
+
+    def run_job(self, request: dict[str, object]) -> None:
+        self.requests.append(request)
+
+
+def test_real_job_trigger_builds_the_job_path_from_project_and_region() -> None:
+    trigger = RealJobTrigger(project="vexcourt-agent", region="australia-southeast1")
+    assert trigger._job_path() == (  # noqa: SLF001 -- white-box assertion
+        "projects/vexcourt-agent/locations/australia-southeast1/jobs/setback-tribunal"
+    )
+
+
+async def test_real_job_trigger_calls_run_job_with_a_case_id_override() -> None:
+    client = _FakeRunJobsClient()
+    trigger = RealJobTrigger(project="vexcourt-agent", region="australia-southeast1", client=client)
+
+    await trigger.trigger("case-123")
+
+    assert len(client.requests) == 1
+    request = client.requests[0]
+    assert request["name"] == (
+        "projects/vexcourt-agent/locations/australia-southeast1/jobs/setback-tribunal"
+    )
+    overrides = request["overrides"]
+    assert isinstance(overrides, dict)
+    container_overrides = overrides["container_overrides"]
+    assert container_overrides == [{"env": [{"name": "CASE_ID", "value": "case-123"}]}]
+
+
+async def test_real_job_trigger_defaults_project_and_region_from_config() -> None:
+    from setback import config
+
+    client = _FakeRunJobsClient()
+    trigger = RealJobTrigger(client=client)
+
+    await trigger.trigger("case-1")
+
+    assert client.requests[0]["name"] == (
+        f"projects/{config.GCP_PROJECT}/locations/{config.REGION}/jobs/setback-tribunal"
+    )

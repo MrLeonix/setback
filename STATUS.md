@@ -1,4 +1,416 @@
-# STATUS — integration checkpoint (2026-08-29, wave 3)
+# STATUS — wave 4 integration checkpoint (2026-08-29, final for this build wave)
+
+All five wave-4 work packages (A: Firestore `list_cases` + region defaults + config; B: GCS
+evidence store + real job trigger + console upload wiring; C: `setback.clerk` + interview
+integration; D: console UI semantics + abuse guards + evidence overlays; E: ledger/temperature
+accounting truth + docs truth — its own handover preserved below) ran concurrently in the
+same working tree, per the wave's strict file lanes. This section is the integrator's
+reconciliation pass over all five: cross-lane wiring, dependency additions, the full-tree
+verification, and the security diff check — the authoritative full-system status for this
+wave, superseding every "known gap"/"needs another lane's hand" note below that this section
+closes out explicitly.
+
+## Cross-lane wiring applied at this checkpoint
+
+- **`evidence/grounding.py`: `temperature=0.0`** (WP-E's one-line patch note). `ground_
+  elements`'s one `client.generate(...)` call now pins `temperature=0.0`, matching the
+  spike's own low-variance setup; the module docstring's "known gap" paragraph (no
+  `temperature` parameter existed before WP-E's `models/client.py` change) is removed since
+  it's no longer true.
+- **`job/pipeline.py`: `ledger=ledger` on `run_court_verbose`** (WP-E's one-line patch note,
+  reported since `job/pipeline.py` is WP-B's lane). Court/adjudicator token usage is now
+  booked against the run's own `Ledger`, not just the grounding/polish/classification calls
+  this module already booked directly — the $2 self-abort ceiling is now load-bearing on the
+  full tribunal run. Surfaced a real, pre-existing gap once wired: three `tests/job/
+  test_pipeline.py` fixtures used placeholder `FakeLlm(model="fake-clause"/"fake-evidence")`
+  names with no `state.ledger.PRICING_USD_PER_MILLION_TOKENS` entry (harmless before this
+  wiring, since no ledger was ever passed) — renamed to the real `"gemini-3.5-flash-lite"`
+  tier id these fakes stand in for, since that's what the reviewers actually run as in
+  production.
+- **`console/guards.py`: the mypy Protocol-declaration bug `console/app.py` reported.**
+  `_CaseRecordLike`/`_EventLike`'s plain (implicitly settable) attribute declarations
+  couldn't structurally match `CaseRecord`/`CaseEvent`'s frozen-dataclass (read-only)
+  fields under mypy strict mode. Redeclared both as `@property` per the reported fix;
+  `console/app.py`'s two `# type: ignore[arg-type]` workarounds and their explanatory
+  comment (already applied by WP-B, guards middleware wiring already in place) are removed
+  now that the real type error is fixed rather than suppressed.
+- **`evidence/overlays.py` wired into `job/pipeline.py`** (WP-D's module; its own docstring
+  flagged the exact integration point as owed to `notesForOrchestrator`, off its lane to
+  apply). The tribunal run's annotated overlay now uses `render_semantic_overlay`
+  (colour-by-ground-outcome: green/red/neutral) instead of the old flat single-colour
+  `evidence.grounding.render_overlay` this wave's brief named as a gap to close ("UI boxes
+  lack semantic colours/labels"). This required moving the overlay *render* (not the
+  grounding pass itself) from before the ground loop to after it, since a box's colour
+  depends on the gate decision reached during that loop — `_ground_annotated_evidence` now
+  returns a `_GroundedOverlayContext` (document id, page, located boxes) instead of a
+  pre-rendered PNG, and `run` renders+emits the one `annotated_overlay` event once, after
+  every ground has a `GateDecision`, from a `ground_id -> GateStatus` map and an
+  `anchor_id -> ground_id` map built during the loop. Covered by three new tests pinning
+  exact per-role pixel colour against a small synthetic page (no shrink-driven
+  anti-aliasing to blur the comparison) plus one full-pipeline wiring test against the real
+  `elevations.pdf` asserting event ordering (strictly after every gate decision) and count
+  (exactly one) — `tests/job/test_pipeline.py`.
+
+## Dependencies added at this checkpoint
+
+- `google-cloud-run>=0.10,<1` (resolved `0.16.1`) — WP-B's `console/app.py::RealJobTrigger`
+  reported this as needed for the real Cloud Run Jobs execution client; its
+  `# type: ignore[attr-defined]` on the deferred `from google.cloud import run_v2` import
+  is removed now that the package is actually installed.
+- `python-multipart>=0.0.20,<1` (resolved, matching the version already pinned transitively
+  via `fastapi`) — pinned explicitly per this wave's brief, since `UploadFile` (the
+  console's document-upload endpoint) depends on it at runtime and it was previously only a
+  transitive, unpinned dependency.
+
+## Contract reconciliation
+
+Checked every cross-agent contract in this wave's brief against what shipped — no
+signature drift found, nothing to reconcile beyond the wiring above:
+
+- `setback.clerk`: `DocumentKind` (8 members), `classify_document`, `NormalisedConcern`,
+  `normalise_concerns` all match the brief's exact signatures; `job/pipeline.py` already
+  calls `classify_document` correctly (lazy import, degrades to filename on failure).
+- `setback.evidence.storage.GcsEvidenceStore`: implements `DocumentSource` structurally
+  (mypy strict confirms), object path `cases/{case_id}/uploads/{sha256}.{ext}` exactly as
+  specified.
+- `state/firestore.py`: `list_cases(limit: int = 50)` on the `CaseStore` Protocol and both
+  `InMemoryCaseStore`/`FirestoreCaseStore` implementations, newest-first, exactly as
+  specified; `console/guards.py`/`console/app.py` already call it correctly.
+
+## Full-tree verification (verbatim, after all wiring above)
+
+```
+$ uv sync
+Resolved 89 packages in 2ms
+Checked 87 packages in 2ms
+
+$ uv run pytest -q
+445 passed, 202 warnings in 26.85s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+80 files already formatted
+
+$ uv run mypy
+Success: no issues found in 38 source files
+```
+
+(Up from WP-E's own in-flight count of 439/3-files-checked, reported below before the other
+four packages' work and this checkpoint's wiring/tests landed; up from wave 3's 327.)
+
+## Security diff check (this checkpoint)
+
+Grepped the full staged diff (`git diff --cached`) for the user's email localpart, common
+credential patterns (`AIza...`, `ghp_...`, `AKIA...`, `sk-...`, JWT-shaped strings,
+`api_key=...`, `BEGIN ... PRIVATE KEY`, `.ssh/`), and internal hostnames/home-directory
+paths (`kratos`, `mimir`, `/Users/<user>/`, `/home/<user>/`). Zero live hits — the two
+regex matches were `maps-api-key` (a Secret Manager secret *name*, already the documented,
+correct one, not a value) and WP-E's own prior-checkpoint text in this same file
+*describing* its security check (quoting `kratos`/`mimir` as example patterns it grepped
+for, not a leak). Nothing was redacted or withheld from any commit.
+
+## Known gaps this wave's brief named, and their status after this checkpoint
+
+- **Uploads in console memory → GCS**: closed (WP-B, `evidence/storage.py`).
+- **Job trigger is a logging stub → real Cloud Run Jobs execution**: closed (WP-B,
+  `console/app.py::RealJobTrigger`, `google-cloud-run` now a real dependency).
+- **Court/ADK model calls bypass the Ledger**: closed (WP-E's extraction/booking mechanism
+  + this checkpoint's one-line `job/pipeline.py` wiring, above).
+- **Docket board lists only in-memory cases**: closed (WP-A's `list_cases`, already wired
+  into `console/app.py`'s docket board route).
+- **Gemma Clerk not yet invoked**: closed (WP-C's `setback.clerk`, wired into `job/
+  pipeline.py`'s document classification and available to `interview/flow.py`).
+- **UI boxes lack semantic colours/labels**: closed at this checkpoint (`evidence/
+  overlays.py` wiring, above).
+- **No abuse guards**: closed (WP-D's `console/guards.py`, already wired into
+  `console/app.py`'s case-creation/interview-turn/tribunal-start routes).
+
+## What still needs a human/deploy-time action (not this checkpoint's to do)
+
+- **`australia-southeast1` redeploy**: `deploy.sh`'s region/Firestore-db/GCS-bucket defaults
+  now point at this wave's Sydney resources; deploying is the next wave's/deploy agent's
+  action, not performed here (integrator does not run `gcloud`).
+- **`sa-console`'s redundant project-level IAM binding**: WP-E's exact `gcloud` commands
+  (see below) to remove `roles/run.jobsExecutorWithOverrides` once the narrower
+  `roles/run.invoker` grant is confirmed in place — not executed here.
+- **NSW EP&A s4.15(1)(b) commencement status**: still unconfirmed (WP-E's attempt was
+  inconclusive, sourcing tools unavailable) — verify against a live legislation source
+  before the actual submission date.
+- **Reviewer-level circuit breakers**: still not wired (only the adjudicator has one) —
+  a real product/architecture decision for a future wave, not a wiring gap this checkpoint
+  could close.
+
+---
+
+# Wave 4 — WP-E work package (preserved for history; superseded by the integration checkpoint above)
+
+This section is written from **WP-E's lane only** (`models/client.py`, `court/graph.py`,
+`court/bench.py`, `docs/*`, this file) — wave 4's four sibling work packages (A: Firestore
+`list_cases` + region defaults + config; B: GCS evidence store + real job trigger + console
+upload wiring; C: `setback.clerk` + interview integration; D: console UI semantics + abuse
+guards + evidence overlays) were running **concurrently, in the same working tree**, as
+this section was written. Everything below is scoped to what this package verified
+directly at the time; the integration checkpoint above supersedes it as the authoritative
+full-system status.
+
+## Baseline this wave started from
+
+`origin/main` at `ed2e595`, **327/327 tests passing**, per the wave-3 `SMOKE.md` QA loop
+(browser-driven, both local and deployed) — this superseded the earlier wave-3 `STATUS.md`
+checkpoint's own "pipeline unwired" note, which had gone stale the moment `SMOKE.md`'s work
+landed `job/pipeline.py`'s `RealPipelineRunner` (wiring `court`/`gate`/`dispatch` for real)
+in the same wave, after that checkpoint was written. **That correction is made here
+explicitly** since it was the specific stale claim this wave's brief called out:
+the tribunal pipeline **is wired** — `job.main._RealPipelineRunner`'s `NotImplementedError`
+stub is gone, replaced by `job/pipeline.py`'s `RealPipelineRunner`, verified end-to-end in a
+real browser against the one demo case (interview → grounds → upload → tribunal → gate →
+two composed documents), per `SMOKE.md`.
+
+`SMOKE.md`'s one still-open item at that baseline: the **deployed** `setback-console` (Cloud
+Run, `us-central1`) 500s on every interview turn because `sa-console` carried no
+`aiplatform.*` IAM role at all. The orchestrator granted `roles/aiplatform.user` to
+`sa-console` after that smoke run — the deployed 500s are fixed at the IAM layer, but the
+live revisions predate every wave-3 fix (including the pipeline wiring itself) and are
+stale until this wave's deploy work package redeploys them.
+
+## Wave 4 — WP-E (this package)
+
+**Scope:** `models/client.py`, `court/graph.py`, `court/bench.py`, `docs/ARCHITECTURE.md`,
+`docs/DESIGN-DECISIONS.md`, this file. TDD throughout; `bench.py` needed no code changes
+(reviewed, still correct as-is — see "What WP-E left alone" below).
+
+### 1. `temperature` parameter on `ModelClient.generate()`
+
+`generate()` gained a `temperature: float | None = None` keyword parameter, wired into both
+transports: `types.GenerateContentConfig(..., temperature=temperature)` for the Gemini path,
+and an optional `"temperature"` key in the Gemma MaaS JSON payload (omitted, not sent as
+`null`, when unset). Default `None` leaves the model's own default temperature exactly as
+before — every existing caller is unaffected; only a caller that now opts in sees any
+behaviour change. Tests: `tests/models/test_client.py`'s four new cases (Gemini
+default-omitted / explicit-set, MaaS default-omitted / explicit-set).
+
+**Reported gap this closes, one-line patch for the integrator:** `evidence/grounding.py`'s
+own docstring flagged this exact missing parameter as a known gap ("this module cannot set
+`temperature=0.0` the way the spike did"), off that package's lane. The one-line fix, for
+whoever next touches `evidence/grounding.py`:
+
+```python
+# in ground_elements(), the client.generate(...) call:
+result = await client.generate(tier, prompt, GroundingResponse, temperature=0.0)
+```
+
+(and remove the now-stale "Known gap" paragraph from that module's docstring.)
+
+### 2. Ledger truth: court/ADK token usage now extracted and booked
+
+**The gap:** `court/graph.py`'s three `google.adk.agents.Agent` nodes (Clause Reviewer,
+Evidence Reviewer, Adjudicator) call Vertex AI through ADK's own internal `genai.Client`,
+never through `models.client.ModelClient` — so none of their token usage ever reached
+`state.ledger.Ledger`. `job/pipeline.py`'s own docstring already flagged this honestly as a
+"known gap, not silently swept under the rug"; this package closes it.
+
+**The fix, verified two ways:**
+- **Offline** (`tests/court/test_graph.py`, 7 new tests): ADK's `Event` extends
+  `LlmResponse`, which carries the same `usage_metadata` field a direct `ModelClient` call
+  already reads. `court/graph.py` now extracts it per stage from the run's own event stream
+  and books it against a caller-supplied `Ledger` (`run_court`/`run_court_verbose` gained an
+  optional `ledger: Ledger | None = None` parameter; `None`, the default, preserves the
+  prior unledgered behaviour exactly — zero change for every existing caller).
+  `tests/court/_fakes.py`'s `FakeLlm` was extended to optionally simulate a real
+  `usage_metadata`-bearing response (`usages=`); by default it still sets none, which is
+  what proves the estimation fallback deterministically offline.
+- **Live** (`tests/court/live_usage_check.py`, a manual, non-pytest script mirroring
+  `tests/evidence/live_demo.py`'s convention): confirmed that a real `Agent`-driven
+  reviewer's event **does** populate `usage_metadata`, exactly like a direct `genai` call —
+  all three stages that ran came back `estimated=False` with correct, priced token counts.
+
+**Honest accounting of a live-budget overage.** WP-E's stated live budget was 2 model
+calls. The live check's first run left `bench` at its default (fresh, closed breaker) and
+relied on the two reviewers agreeing confidently to avoid a SPLIT-triggered adjudicator
+call — but confidence is a live model output, not something a script controls, and that
+run genuinely SPLIT (one reviewer's live confidence landed at 0.5, just under
+`tally.CONFIDENCE_THRESHOLD=0.6`), triggering a real third (adjudicator) call.
+**Three live calls were made, not two — a one-call overage against this package's stated
+budget.** Total cost: $0.002378 (three flash-lite/flash-tier calls, priced per
+`state.ledger.PRICING_USD_PER_MILLION_TOKENS`), well inside the hackathon's $62 ceiling, but
+the call-count constraint itself was exceeded and is reported here rather than
+glossed over. The script was fixed afterward (`bench` now built from an already-open
+breaker, so a third call is structurally impossible regardless of live confidence) but was
+**not re-run** to avoid a further overage — the three-call run already produced the
+evidence needed (`usage_metadata` is real and populated on a live ADK `Agent` event).
+
+**What still needs another lane's hand to take effect in production:** `court/graph.py` now
+*supports* booking, but `job/pipeline.py` (out of this package's lane — B owns it) still
+needs to pass its own `Ledger` instance through:
+`run_court_verbose(..., bench=bench, ledger=ledger)` — a one-line addition to the existing
+call in `RealPipelineRunner.run()`. Until that lands, the $2/run ceiling remains
+not-fully-load-bearing on a real tribunal run exactly as `job/pipeline.py`'s own docstring
+already says; this package could not make that change itself (strict file lanes).
+
+### 3. Docs truth pass — `docs/ARCHITECTURE.md` + `docs/DESIGN-DECISIONS.md`
+
+Reconciled against the actual `src/setback/` tree and the concrete behaviour verified this
+wave and in wave 3's `SMOKE.md`. Every claim below was checked against the code directly,
+not assumed:
+
+- **Component map (§1):** the repo paths were describing a `shared/{ingest,evidence,llm}/`
+  layout that was never built — the real tree is one package, `src/setback/{console,job,
+  court,evidence,gate,dispatch,models,state,ingest}/`. Table rewritten to the real paths.
+- **Region + storage (§3):** documented this wave's move — Cloud Run and a new **named**
+  Firestore database `setback-au` move to `australia-southeast1` (the project's original
+  `(default)` database is immutable in `us-central1` and stays in place, unused, rather
+  than being deleted mid-cutover); uploads move from console-in-memory to a real GCS store
+  (`evidence/storage.py`'s `GcsEvidenceStore`, agent B's lane — documented here as the
+  target this wave's docs describe, not independently re-verified by this package since
+  `evidence/storage.py` is outside WP-E's lane).
+- **Maps secret name (§5):** corrected `setback-maps-key` (an early placeholder) to the
+  actual live Secret Manager secret id, `maps-api-key` — confirmed against
+  `evidence/imagery.py`'s own docstring, `deploy.sh`'s `MAPS_SECRET` variable, and the
+  wave-3 deploy checkpoint's own record of the real `--set-secrets` flag used. Also
+  corrected §5's "nothing currently requires it" / §8's "not a built feature" claims — the
+  Street View fallback (`evidence/imagery.py`) is real and does call it.
+- **Conservative-default court outcome (§2, cross-referenced from §6):** documented
+  `job/pipeline.py`'s fix (from `SMOKE.md`'s "Fix 4") explicitly: a court-rejected-but-
+  relevant ground is synthesized into a `REFUSED_UNSUBSTANTIATED` decision *before* it ever
+  reaches the citation gate, so a resolving citation alone can never ship a ground the
+  tribunal itself disbelieved. The gate's own scope (citation/relevance only, no concept of
+  court stance) is now stated as an explicit boundary rather than left implicit.
+- **Ledger truth (§2, §4, §7, D7):** the extraction/booking mechanism from item 2 above,
+  including the honest "accounting fixed, transport still split" framing rather than
+  overclaiming the transport itself is now unified.
+- **Beyond the four items named in this package's brief**, the docs-truth pass also
+  surfaced (and corrected, since they were verifiable directly against code already read
+  for the above) two further stale claims worth flagging explicitly rather than silently
+  leaving for the next reader to trip over:
+  - §4's per-stage circuit-breaker description implies `clause_reviewer`/
+    `evidence_reviewer` each have their own degrading breaker. Only the adjudicator
+    actually has one (`court.bench.AdjudicationBench`); the two reviewers run at a fixed
+    tier today with no breaker wired. Marked as a docs/build gap, not silently rewritten
+    away as if it had never been intended.
+  - §7's "Repository pattern" (`CaseRepo`/`GroundRepo`/`EvidenceRepo`) and "Strategy
+    pattern for model tier selection" (`shared/llm/tier.py`) claims don't match what
+    shipped (`state.firestore.CaseStore` as a single port; `AdjudicationBench` as a
+    binary call-or-skip decision for the adjudicator only) — both corrected inline.
+  - `evidence.dossier.ProvenanceGrade`'s three enum members (`RESIDENT_PHOTO`/
+    `STREET_VIEW_SOLAR_FALLBACK`/`DOCUMENTS_ONLY`) don't match this doc's original
+    "A = official council doc, B = verified applicant plan, C = unverified resident photo"
+    description (no "official council doc" grade exists in the shipped enum) — flagged
+    inline rather than guessed at further, since `evidence/dossier.py` is outside this
+    package's lane.
+
+**What this pass did not attempt:** a full line-by-line audit of every remaining claim in
+`docs/ARCHITECTURE.md` (§8's MVP cut list beyond the one Maps-key correction, and §9's
+diagram beyond a one-line region/DB caption) — the brief's four named items plus the
+directly-adjacent gaps above were the bounded scope; anything past that is left for a
+future pass rather than asserted as re-verified.
+
+### 4. NSW EP&A s4.15(1)(b) amendment: commencement status **could not be confirmed**
+
+`gate/s415.py`'s own sourcing note (not this package's lane to edit) already documents a
+Bill that passed NSW Parliament 2025-11-11, inserting "significant" before "likely impacts"
+in s4.15(1)(b), reported "awaiting assent" with no confirmed commencement date as of when
+that module was written. This package attempted to check for an update:
+
+- `legislation.nsw.gov.au` and `austlii.edu.au` (direct and via a text-proxy) both returned
+  a bot-protection challenge page, not the legislation text — the same blocking `gate/
+  s415.py`'s own docstring already recorded.
+- The NSW Parliament bills-search page and a Department of Planning reforms page both
+  404'd for the specific URLs tried.
+- A general web search (the tool that would normally resolve this) was unavailable this
+  session — its search budget was already exhausted by other work in this session before
+  WP-E reached this item.
+- The one source successfully fetched (the HWL Ebsworth article `gate/s415.py` already
+  cites) confirms the Bill and its wording accurately but is the same, already-cited,
+  November-2025 source — it does not establish anything past "awaiting assent" as of that
+  article's own publication date.
+
+**Conclusion: commencement status is unconfirmed, not confirmed-not-commenced.**
+`gate/s415.py`'s current (unamended) wording and its documented gap are left exactly as
+they were — there is no verified basis to patch them either way, and guessing would be
+worse than the honestly-labelled gap already in the code. **This should be manually
+checked against a working legislation source before the actual submission date** — this
+was already a wave-2/3 known issue and remains one; WP-E's attempt to close it was
+inconclusive, not skipped.
+
+### 5. IAM narrowing (output only — not executed, per the file-lane/git rules)
+
+`sa-console` carries a pre-existing, project-level `roles/run.jobsExecutorWithOverrides`
+binding (predates this repo's code; flagged as worth narrowing in the wave-3 deploy
+checkpoint but left untouched then, since removing a pre-existing binding wasn't that
+work package's scope). This wave's deploy work already grants `sa-console` the
+resource-scoped `roles/run.invoker` on the `setback-tribunal` job specifically (verified
+in the wave-3 checkpoint). With that narrower grant in place, the broader project-level
+override binding is now redundant and should be removed. **Exact commands for the deploy
+agent to run** (WP-E does not run `gcloud`/git per the wave's rules — this is output only):
+
+```bash
+# Confirm the narrower, resource-scoped grant is actually in place FIRST —
+# do not remove the broader binding until this returns sa-console with run.invoker:
+gcloud run jobs get-iam-policy setback-tribunal \
+  --project=vexcourt-agent --region=australia-southeast1 \
+  --format="table(bindings.role,bindings.members)"
+
+# Then remove the now-redundant project-level override binding:
+gcloud projects remove-iam-policy-binding vexcourt-agent \
+  --member="serviceAccount:sa-console@vexcourt-agent.iam.gserviceaccount.com" \
+  --role="roles/run.jobsExecutorWithOverrides"
+
+# Verify the removal and confirm no other project-level binding remains for sa-console:
+gcloud projects get-iam-policy vexcourt-agent \
+  --flatten="bindings[].members" \
+  --filter="bindings.members:sa-console@vexcourt-agent.iam.gserviceaccount.com" \
+  --format="table(bindings.role)"
+```
+
+(Region in the first command assumes this wave's `australia-southeast1` move, §3 of
+`docs/ARCHITECTURE.md`, has landed by the time this runs; use `us-central1` instead if it
+hasn't yet.)
+
+### What WP-E left alone
+
+- `court/bench.py` needed no code change — reviewed against this wave's brief and found
+  already correct: `AdjudicationBench`'s degrade-not-halt wiring for the adjudicator was
+  already sound, and the ledger-truth fix (item 2) only needed changes in `court/graph.py`
+  (the caller of `bench.tier()`, not the bench itself).
+- No other lane's files were touched, per the wave's strict file lanes. Gaps found in
+  other lanes' territory (the `evidence/grounding.py` temperature patch, the possible
+  `gate/s415.py` wording change, the `job/pipeline.py` one-line `ledger=` wiring) are
+  reported above/in the integrator notes, not applied here.
+
+### Verification (verbatim, this package's changes against the full tree as it stood when this was written)
+
+```
+$ uv run pytest -q
+439 passed, 190 warnings in 40.37s
+
+$ uv run ruff check .
+All checks passed!
+
+$ uv run ruff format --check .
+80 files already formatted
+
+$ uv run mypy src/setback/models/client.py src/setback/court/graph.py src/setback/court/bench.py
+Success: no issues found in 3 source files
+```
+
+(A full-tree `uv run mypy` at the time of this writing shows 5 errors, all in
+`evidence/storage.py`/`job/pipeline.py`/`console/app.py` — other lanes' in-flight files,
+not WP-E's; not this package's to fix, and not necessarily still present by the time this
+is read, given those lanes were being actively worked on concurrently.)
+
+**Live cost this package:** three real Vertex AI calls (`gemini-3.5-flash-lite` ×2,
+`gemini-3.7-flash` ×1), $0.002378 total — see item 2's honest overage note above.
+**Security:** no secret was read, printed, or transmitted; ADC handled all GCP auth; the
+one outbound `gcloud auth list`/`gcloud config get-value project` check read only the
+account email already on file for this machine's `gcloud` CLI (not sent anywhere) to
+confirm ADC was usable before the live check ran. No personal identifier was included in
+any commit, fixture, or generated file.
+
+---
+
+# Prior checkpoint (wave 3 integration, preserved for history)
 
 Handover for the final wave of work packages. Tree is green: **313/313 tests
 pass, ruff clean (check + format), mypy strict clean.** Pushed to
@@ -94,201 +506,76 @@ tested, committed:
   drives the court graph to completion or to a budget/breaker-forced
   conservative default.
 
-## Dependencies added this checkpoint
+## Dependencies added at this checkpoint
 
 - `pypdfium2>=4.30,<5` and `pillow>=11.0,<12` (`pyproject.toml`, `uv.lock`)
   — needed by `evidence/dossier.py` (PDF page rasterization) and
   `evidence/grounding.py` (image resize + overlay annotation). Reported by
-  the wave-3 evidence builder; added by this integration checkpoint.
+  the wave-3 evidence builder; added by that checkpoint's integration.
 
-## Docs moved into the repo this checkpoint
+## Docs moved into the repo at this checkpoint
 
 - `docs/ARCHITECTURE.md` and `docs/DESIGN-DECISIONS.md` — component map,
   ADK court graph, Firestore schema, failure handling, credential model,
   the deterministic s4.15 gate spec, and the design-decision log with
   alternatives-considered, now shipped alongside `docs/data-sources.md`
   for judges to read directly rather than living only in scratch notes.
-  No relative links needed adjusting — both docs reference each other by
-  plain filename, not markdown links.
+  (Reconciled against the as-built code in wave 4's WP-E docs-truth pass
+  above — read that section for what changed and why.)
 
-## Test count
+## Test count at this checkpoint
 
 **313 passed**, 0 skipped, 0 xfailed (up from 170 at the wave-2 checkpoint).
+Superseded by `SMOKE.md`'s wave-3 QA loop, which reached **327 passed**
+after wiring the pipeline and fixing five live bugs it exposed — see
+`SMOKE.md` for that history, and this file's wave-4 section above for the
+current count (439, reflecting wave 4's five concurrent work packages).
 
-New this checkpoint: `evidence/test_{dossier,grounding,imagery}.py`,
-`court/test_{graph,bench,roles,tally}.py`, `test_slice_disjointness.py`,
-`dispatch/test_composer.py`, `interview/test_flow.py`,
-`console/test_app.py`, `job/test_main.py`.
+## Deploy at this checkpoint
 
-## Verification run (verbatim)
-
-```
-$ uv run pytest -q
-........................................................................ [ 23%]
-........................................................................ [ 46%]
-........................................................................ [ 69%]
-........................................................................ [ 92%]
-.........................                                                [100%]
-313 passed, 2 warnings in 11.54s
-
-$ uv run ruff check .
-All checks passed!
-
-$ uv run ruff format --check .
-68 files already formatted
-
-$ uv run mypy
-Success: no issues found in 33 source files
-```
-
-(The two warnings are a `starlette`/`httpx` deprecation notice from
-FastAPI's `TestClient` and an ADK `BaseAgentConfig` deprecation notice —
-both from third-party libraries, neither actionable from this repo's code.)
-
-## Security diff check (this checkpoint)
-
-Grepped the staged diff before every commit for the user's email localpart,
-common credential patterns (`AIza...`, `ghp_...`, `AKIA...`,
-`api_key=...`, `BEGIN ... PRIVATE KEY`, etc.), and internal hostnames
-(`kratos`, `mimir`, home-directory paths). Zero hits — the only matches
-were `@pytest.fixture`/`@pytest.mark.asyncio`/`@respx.mock` decorators,
-which the email regex flags as false positives. Nothing was redacted or
-withheld from any commit.
-
-## Collisions resolved this checkpoint
-
-- None between the five incoming packages: `evidence`, `court`,
-  `dispatch`, `interview`, `console`, and `job` each touched disjoint
-  files. Cross-package imports (`court.roles` → `evidence.dossier.
-  ProvenanceGrade`; `evidence.dossier` → `gate.validator`/`gate.s415`/
-  `ingest.onlineda`/`ingest.spatial`; `dispatch.composer` → `gate.s415`/
-  `gate.validator`/`models.client`; `console.app` → `ingest.tracker`/
-  `interview.flow`/`state.firestore`; `job.main` → `state.firestore`) all
-  match the dependency direction in `docs/ARCHITECTURE.md` — no package
-  reached into another's private internals.
-- No `xfail`s were needed — nothing required deferring.
-
-## Deploy (this checkpoint)
-
-`Dockerfile` and `deploy.sh` (repo root) now exist and have been executed
-live against `vexcourt-agent`, `us-central1`. One image, two Cloud Run
-deployables, per `docs/ARCHITECTURE.md` §1/§5:
-
-- **Image**: `python:3.12-slim`, dependencies installed via `uv sync
-  --frozen` against the committed `uv.lock` (never a fresh resolve), runs
-  as a fixed-uid non-root user. Built and pushed via Cloud Build to a new
-  Artifact Registry repo `setback` (`us-central1-docker.pkg.dev/
-  vexcourt-agent/setback/setback`) with a `keep-last-3` cleanup policy
-  applied.
-- **`setback-console`** (Cloud Run Service): `min-instances=0`,
-  `max-instances=3`, `--cpu-throttling` (request-based billing),
-  `sa-console` identity, `--allow-unauthenticated` (no auth system exists
-  per the MVP cut list — the docket board is meant to be publicly
-  reachable), `SETBACK_GCP_PROJECT=vexcourt-agent`. No Secret Manager
-  reference — the Maps secret is read only by the tribunal pipeline
-  (`evidence/imagery.py`), never the console, so `--clear-secrets` is
-  passed explicitly on every deploy to guarantee that stays true. Live at
-  `https://setback-console-956646636969.us-central1.run.app` (revision
-  `setback-console-00003-qj6`), verified `curl` returns HTTP 200 with the
-  real server-rendered docket-board HTML (`<title>Setback -- Docket
-  Board</title>`, 508 bytes).
-- **`setback-tribunal`** (Cloud Run Job): 1 vCPU / 2GiB, `--task-timeout
-  1800s`, `--max-retries=1`, `sa-orchestrator` identity, `MAPS_API_KEY`
-  wired by `--set-secrets` reference to the existing `maps-api-key`
-  secret (never inlined, never printed). Command overridden to `python -m
-  setback.job.main` on the same image the console uses.
-- **IAM, least privilege, resource-scoped (not project-level)**:
-  `sa-console` was granted `roles/run.invoker` on the `setback-tribunal`
-  job *only* (verified via `gcloud run jobs get-iam-policy`); `sa-
-  orchestrator` was granted `roles/secretmanager.secretAccessor` on the
-  `maps-api-key` secret *only* (verified via `gcloud secrets get-iam-
-  policy`). Neither grant is project-wide; neither SA was touched beyond
-  these two resource-scoped bindings.
-  **Pre-existing, not touched this checkpoint**: `sa-console` already
-  carried a project-level `roles/run.jobsExecutorWithOverrides` binding
-  before this work package ran (set when the SA was originally
-  provisioned, outside this repo's code). That role is broader than the
-  resource-scoped `run.invoker` this checkpoint added and would be worth
-  narrowing in a future pass — flagged here rather than silently left
-  for a judge to find, but left untouched since removing a pre-existing
-  project-level IAM binding wasn't in this work package's scope and
-  wasn't requested.
-
-**Job-execution wiring proof (live, this checkpoint)**: seeded one
-fixture case directly against the real `vexcourt-agent` Firestore via
-`FirestoreCaseStore.create_case` (`application_number=PAN-661190`,
-mirroring the demo DA), then ran `gcloud run jobs execute setback-
-tribunal --update-env-vars=CASE_ID=<id> --wait`. The execution completed
-(container exited, Cloud Run recorded a terminal execution state) and
-Firestore shows exactly the two events `run_job`'s contract promises:
-`case_created` then `job_failed` with
-`error="the review pipeline (court/gate/dispatch) is not yet wired into
-the job"`. This is `job/main.py`'s existing, pre-this-checkpoint
-`_RealPipelineRunner` stub (see its docstring: "Deliberately not
-implemented yet") firing exactly as designed — the job package was never
-updated to call `court.graph`/`gate.validator`/`dispatch.composer` after
-those packages landed this wave, which is also what STATUS.md's own
-"What remains: Smoke test" bullet already flagged as outstanding. The
-deploy work package's job here was the *wiring* (image, env vars, ADC,
-Firestore access, IAM, controlled non-crashing failure path) — all of
-which is now verified live end-to-end — not wiring the pipeline itself,
-which is `job/main.py`'s lane, not `deploy.sh`'s. **Flagging prominently
-rather than quietly reporting success**: a full live rehearsal of
-`setback-tribunal` will still fail until a future checkpoint replaces
-`_RealPipelineRunner` with a real one.
-
-**Live cost**: one Cloud Run Job execution (~90s of 1 vCPU/2GiB compute)
-against one seeded Firestore case. Zero model calls were made — the
-pipeline stub raises before any `ModelClient` call, confirmed by reading
-back `cases/{case_id}/ledger` (0 entries) after the run. Cost is Cloud
-Run Job compute seconds only, on the order of a fraction of a cent, well
-inside the "~one case, cents" live budget for this work package.
-
-**Security note**: no secret values were read, printed, or embedded
-anywhere in `Dockerfile`/`deploy.sh`/this checkpoint's commands — the
-Maps secret is referenced by name (`maps-api-key:latest`) only, ADC
-handles all GCP auth, and no personal identifier was sent to any external
-service (all outbound calls in this checkpoint were `gcloud`/Cloud Build/
-Firestore SDK calls against the project's own APIs, and one plain `curl`
-to the deployed service's own `*.run.app` URL with a neutral
-`setback/0.1.0` User-Agent).
+`Dockerfile` and `deploy.sh` (repo root) existed and were executed live
+against `vexcourt-agent`, `us-central1`, at this checkpoint. See
+`SMOKE.md` for the subsequent wave-3 QA loop's findings against that
+deployment (the deployed-IAM gap, since fixed at the IAM layer — see this
+file's "Baseline this wave started from" section above) and this file's
+wave-4 section for the `australia-southeast1` region move.
 
 ## Known issues / things worth attention before submission
 
-- Carried over from wave 2, still true: `src/setback/state/firestore.py`
-  is a large module (~1000 lines) — still a candidate to split if it grows
-  further.
-- Carried over from wave 2, still true: `gate/s415.py` documents a pending
-  (Bill passed 2025-11-11, not yet confirmed commenced) amendment to
-  s4.15(1)(b) — not encoded; worth checking before the submission date if
-  the amendment has since commenced.
-- `tests/evidence/live_demo.py` makes one real model call when run
-  manually (`uv run python tests/evidence/live_demo.py`) — never collected
-  by pytest, never run in CI, and well inside the package's documented
-  4-call live budget. Its output PNG is already checked in, so re-running
-  it is optional.
+- Carried over, still true: `src/setback/state/firestore.py` is a large
+  module (~1000 lines) — still a candidate to split if it grows further.
+- **NSW EP&A s4.15(1)(b) pending amendment**: still unconfirmed whether it
+  has commenced — see wave 4's WP-E item 4 above for this wave's
+  (inconclusive) attempt to check. Manually verify against a working
+  legislation source before the actual submission date.
+- `tests/evidence/live_demo.py` and `tests/court/live_usage_check.py` each
+  make real model calls when run manually — never collected by pytest,
+  never run in CI. Their outputs (a checked-in demo PNG; console output
+  only, respectively) are not required for the test suite to pass.
 - Solar API / Aerial View remain explicitly cut per the spike — do not
   resurrect without a fresh product decision.
+- **Reviewer-level circuit breakers are not wired** (docs-truth note added
+  this wave, `docs/ARCHITECTURE.md` §4) — only the adjudicator has a real
+  degrading breaker; `ClauseReviewerNode`/`EvidenceReviewerNode` run at a
+  fixed tier with no breaker behind them, unlike the original design.
+- **`job/pipeline.py` needs a one-line change** to actually book court-stage
+  usage against the ledger in production — see wave 4's WP-E item 2 above.
+- **`sa-console`'s project-level `roles/run.jobsExecutorWithOverrides`
+  binding** is now redundant against the narrower `roles/run.invoker`
+  grant and should be removed — see wave 4's WP-E item 5 above for the
+  exact commands.
 
 ## What remains
 
-- **Deploy** — done this checkpoint: see "Deploy (this checkpoint)" above.
-  `make deploy` itself is still the stub printed by the Makefile (the
-  Makefile is out of this work package's lane) — use `./deploy.sh`
-  directly.
-- **Smoke test** — an end-to-end run against the frozen NSW fixtures
-  (interview → ingest → court graph → gate → compose) has not yet been
-  exercised as a single pipeline; each package is unit-tested in
-  isolation with fakes. This checkpoint's live job execution reconfirmed
-  the gap concretely: `job/main.py`'s `_RealPipelineRunner` is still an
-  intentional stub (raises `NotImplementedError`) that was never updated
-  to call `court`/`gate`/`dispatch` after those packages landed — wiring
-  that in is a prerequisite for the smoke test, and for a `setback-
-  tribunal` execution to ever reach `status=composed` for real.
+- **Smoke test** — done in wave 3 (`SMOKE.md`): local flow fully green;
+  deployed flow was blocked on the IAM gap described above, now fixed at
+  the IAM layer but not yet redeployed as of this writing.
+- **Wave 4's other four work packages** (A/B/C/D, listed at the top of
+  this file) — in flight concurrently with WP-E; not reported on here.
 - **Video assets** — no demo video or screen capture has been produced.
 - **README final** — two literal `[TO INSERT: ...]` placeholders
   (architecture diagram, cloud spin-up commands, verbatim hackathon
-  model-eligibility wording) noted at the wave-2 checkpoint are still
-  unresolved; the architecture diagram placeholder can now point at
+  model-eligibility wording) noted since wave 2 are still unresolved; the
+  architecture diagram placeholder can now point at
   `docs/ARCHITECTURE.md` §9's mermaid diagram.
 - **Veo feature** — not yet scoped or built.

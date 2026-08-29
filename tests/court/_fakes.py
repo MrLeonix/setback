@@ -26,16 +26,33 @@ class FakeLlm(BaseLlm):
     The last queued text repeats for any call beyond the queue's length,
     so a test that doesn't care how many times a node runs doesn't need to
     guess an exact count.
+
+    By default no `usage_metadata` is attached to the yielded `LlmResponse`
+    (`None`, exactly like an ADK response that never surfaced usage) --
+    this is what lets `tests/court/test_graph.py` prove the ledger-truth
+    estimation fallback deterministically offline. Pass `usages` (parallel
+    to `bodies`, same repeat-last-entry semantics) to instead simulate a
+    real usage-reporting call.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     _texts: list[str] = PrivateAttr(default_factory=list)
+    _usages: list[types.GenerateContentResponseUsageMetadata | None] = PrivateAttr(
+        default_factory=list
+    )
     _calls: int = PrivateAttr(default=0)
 
-    def __init__(self, *, model: str, bodies: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        *,
+        model: str,
+        bodies: list[dict[str, Any]],
+        usages: list[types.GenerateContentResponseUsageMetadata | None] | None = None,
+    ) -> None:
         super().__init__(model=model)
         self._texts = [json.dumps(body) for body in bodies]
+        self._usages = usages or []
         self._calls = 0
 
     @property
@@ -47,9 +64,14 @@ class FakeLlm(BaseLlm):
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
         index = min(self._calls, len(self._texts) - 1) if self._texts else -1
+        usage_index = min(self._calls, len(self._usages) - 1) if self._usages else -1
         self._calls += 1
         text = self._texts[index] if index >= 0 else "{}"
-        yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text=text)]))
+        usage = self._usages[usage_index] if usage_index >= 0 else None
+        yield LlmResponse(
+            content=types.Content(role="model", parts=[types.Part(text=text)]),
+            usage_metadata=usage,
+        )
 
 
 def review_body(

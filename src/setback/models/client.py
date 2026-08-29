@@ -68,6 +68,13 @@ class TokenUsage:
     prompt_tokens: int
     output_tokens: int
     thinking_tokens: int = 0
+    estimated: bool = False
+    """True when these figures are a text-length estimate rather than a
+    model-reported count -- set by a caller (e.g. `court.graph`, when the
+    ADK event stream carries no `usage_metadata` for a stage) that had no
+    real usage figure to fall back on. `ModelClient` itself always reports
+    real, non-estimated usage; this flag exists for callers layered on top
+    of a transport that doesn't always expose it."""
 
     @property
     def billable_output_tokens(self) -> int:
@@ -182,18 +189,32 @@ class ModelClient:
         response_model: type[T],
         *,
         system_instruction: str | None = None,
+        temperature: float | None = None,
     ) -> ModelResult[T]:
         """Call `tier` with `prompt`, validating the reply as `response_model`.
 
         Routes to the Gemma MaaS OpenAI-compatible endpoint when `tier.model`
         ends in ``-maas``, otherwise to the Gemini Vertex SDK.
+
+        `temperature` is left unset (the model's own default) unless a
+        caller passes one explicitly -- e.g. `evidence/grounding.py`'s
+        documented need for `temperature=0.0`, matching the proven
+        grounding spike's direct `google-genai` call.
         """
         if tier.model.endswith(_MAAS_MODEL_SUFFIX):
             return await self._generate_maas(
-                tier, prompt, response_model, system_instruction=system_instruction
+                tier,
+                prompt,
+                response_model,
+                system_instruction=system_instruction,
+                temperature=temperature,
             )
         return await self._generate_gemini(
-            tier, prompt, response_model, system_instruction=system_instruction
+            tier,
+            prompt,
+            response_model,
+            system_instruction=system_instruction,
+            temperature=temperature,
         )
 
     async def _generate_gemini(
@@ -203,12 +224,14 @@ class ModelClient:
         response_model: type[T],
         *,
         system_instruction: str | None,
+        temperature: float | None,
     ) -> ModelResult[T]:
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             response_mime_type="application/json",
             response_schema=response_model,
             thinking_config=types.ThinkingConfig(thinking_level=tier.thinking_level),
+            temperature=temperature,
         )
 
         async def call() -> types.GenerateContentResponse:
@@ -239,6 +262,7 @@ class ModelClient:
         response_model: type[T],
         *,
         system_instruction: str | None,
+        temperature: float | None,
     ) -> ModelResult[T]:
         messages: list[dict[str, str]] = []
         if system_instruction:
@@ -249,11 +273,13 @@ class ModelClient:
         )
         messages.append({"role": "user", "content": f"{prompt}\n\n{schema_hint}"})
 
-        payload = {
+        payload: dict[str, object] = {
             "model": tier.model,
             "messages": messages,
             "response_format": {"type": "json_object"},
         }
+        if temperature is not None:
+            payload["temperature"] = temperature
         headers = {"Authorization": f"Bearer {self._token_provider()}"}
 
         async def call() -> httpx.Response:

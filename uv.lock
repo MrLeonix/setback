@@ -434,6 +434,23 @@ wheels = [
 ]
 
 [[package]]
+name = "google-cloud-run"
+version = "0.16.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "google-api-core", extra = ["grpc"] },
+    { name = "google-auth" },
+    { name = "grpc-google-iam-v1" },
+    { name = "grpcio" },
+    { name = "proto-plus" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/27/3f/d2887a46446311c10871dde73e97bc9c07b08963ff92cb0a78a564d87a45/google_cloud_run-0.16.1.tar.gz", hash = "sha256:568bf7fceba8f844a39b69858a8e642f6cca27eab7246c621d9d341c289b1158", size = 513602, upload-time = "2026-06-22T23:22:30.849Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/37/27/aed6476e16083dfe4da93633331b0561e0160249d44e81d96077185afe27/google_cloud_run-0.16.1-py3-none-any.whl", hash = "sha256:8b7b91b20270cff5514a0af7ac2009572b3d3501a075868cf956a1f8cc6e61f2", size = 459007, upload-time = "2026-06-22T23:20:29.456Z" },
+]
+
+[[package]]
 name = "google-cloud-secret-manager"
 version = "2.30.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1197,6 +1214,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "google-adk" },
     { name = "google-cloud-firestore" },
+    { name = "google-cloud-run" },
     { name = "google-cloud-secret-manager" },
     { name = "google-cloud-storage" },
     { name = "google-cloud-tasks" },
@@ -1207,6 +1225,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pypdfium2" },
     { name = "python-dotenv" },
+    { name = "python-multipart" },
     { name = "pyyaml" },
     { name = "uvicorn" },
 ]
@@ -1226,6 +1245,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "google-adk", specifier = "==2.8.0" },
     { name = "google-cloud-firestore", specifier = ">=2.19,<3" },
+    { name = "google-cloud-run", specifier = ">=0.10,<1" },
     { name = "google-cloud-secret-manager", specifier = ">=2.21,<3" },
     { name = "google-cloud-storage", specifier = ">=2.18,<3" },
     { name = "google-cloud-tasks", specifier = ">=2.17,<3" },
@@ -1236,6 +1256,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.9,<3" },
     { name = "pypdfium2", specifier = ">=4.30,<5" },
     { name = "python-dotenv", specifier = ">=1.0,<2" },
+    { name = "python-multipart", specifier = ">=0.0.20,<1" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "uvicorn", specifier = ">=0.32,<1" },
 ]

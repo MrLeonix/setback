@@ -29,7 +29,9 @@ from setback.court.graph import (
     run_court_verbose,
 )
 from setback.court.roles import ClauseSlice, EvidenceSlice, ReviewStance
+from setback.models.client import TokenUsage
 from setback.state.breakers import CircuitBreaker, CircuitState, DegradingBreaker
+from setback.state.ledger import BudgetExceededError, Ledger
 from tests.court._fakes import FakeLlm, adjudicator_body, review_body
 
 _GROUND_ID = "g1"
@@ -524,6 +526,212 @@ async def test_run_court_verbose_reports_voided_opinion_as_none() -> None:
     assert result.clause_review is None
     assert result.evidence_review is not None
     assert result.verdict.outcome is CourtOutcome.UNRESOLVED_FLAGGED
+
+
+# --- ledger truth: usage extracted from the ADK event stream, per stage ---------
+#
+# Court/ADK `Agent` calls used to bypass `ModelClient` (and therefore the
+# ledger) entirely -- these prove the fix both ways: `FakeLlm` never sets
+# `usage_metadata` (see its docstring), so it deterministically exercises the
+# "ADK genuinely exposes no usage" estimation fallback offline; the
+# `usages=` variant proves real usage is booked verbatim when ADK does
+# report it (confirmed live in `tests/court/live_usage_check.py`).
+
+
+async def test_run_court_books_estimated_usage_when_events_carry_no_usage_metadata() -> None:
+    ledger = Ledger()
+
+    await run_court(
+        _CLAUSE_SLICE,
+        _EVIDENCE_SLICE,
+        known_anchor_ids=_KNOWN_ANCHOR_IDS,
+        clause_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="support", confidence=0.95)],
+        ),
+        evidence_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="support", confidence=0.9)],
+        ),
+        bench=AdjudicationBench.default(),
+        ledger=ledger,
+    )
+
+    by_stage = {r.stage: r for r in ledger.records}
+    assert set(by_stage) == {CLAUSE_REVIEWER_NODE, EVIDENCE_REVIEWER_NODE}
+    for record in by_stage.values():
+        assert record.model == "gemini-3.5-flash-lite"
+        assert record.usage.estimated is True
+        assert record.usage.prompt_tokens > 0
+        assert record.usage.output_tokens > 0
+    assert ledger.total_cost_usd > 0.0
+
+
+async def test_run_court_books_real_usage_when_events_carry_usage_metadata() -> None:
+    ledger = Ledger()
+    clause_usage = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=120, candidates_token_count=40, thoughts_token_count=0
+    )
+    evidence_usage = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=80, candidates_token_count=20, thoughts_token_count=5
+    )
+
+    await run_court(
+        _CLAUSE_SLICE,
+        _EVIDENCE_SLICE,
+        known_anchor_ids=_KNOWN_ANCHOR_IDS,
+        clause_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="support", confidence=0.95)],
+            usages=[clause_usage],
+        ),
+        evidence_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="support", confidence=0.9)],
+            usages=[evidence_usage],
+        ),
+        bench=AdjudicationBench.default(),
+        ledger=ledger,
+    )
+
+    by_stage = {r.stage: r for r in ledger.records}
+    assert by_stage[CLAUSE_REVIEWER_NODE].usage == TokenUsage(
+        prompt_tokens=120, output_tokens=40, thinking_tokens=0, estimated=False
+    )
+    assert by_stage[EVIDENCE_REVIEWER_NODE].usage == TokenUsage(
+        prompt_tokens=80, output_tokens=20, thinking_tokens=5, estimated=False
+    )
+
+
+async def test_run_court_books_adjudicator_usage_on_the_split_path() -> None:
+    ledger = Ledger()
+    adjudicator_usage = types.GenerateContentResponseUsageMetadata(
+        prompt_token_count=200, candidates_token_count=50, thoughts_token_count=10
+    )
+    bench = _fake_adjudicator_bench(
+        CircuitBreaker(name="adjudicator", failure_threshold=3),
+        FakeLlm(
+            model="gemini-3.7-flash",
+            bodies=[adjudicator_body(ground_id=_GROUND_ID, stance="support", confidence=0.9)],
+            usages=[adjudicator_usage],
+        ),
+    )
+
+    await run_court(
+        _CLAUSE_SLICE,
+        _EVIDENCE_SLICE,
+        known_anchor_ids=_KNOWN_ANCHOR_IDS,
+        clause_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="support")],
+        ),
+        evidence_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="reject")],
+        ),
+        bench=bench,
+        ledger=ledger,
+    )
+
+    by_stage = {r.stage: r for r in ledger.records}
+    assert set(by_stage) == {CLAUSE_REVIEWER_NODE, EVIDENCE_REVIEWER_NODE, ADJUDICATOR_NODE}
+    assert by_stage[ADJUDICATOR_NODE].model == "gemini-3.7-flash"
+    assert by_stage[ADJUDICATOR_NODE].usage.estimated is False
+    assert by_stage[ADJUDICATOR_NODE].usage.prompt_tokens == 200
+
+
+async def test_run_court_never_books_adjudicator_usage_on_the_clear_path() -> None:
+    """No adjudicator call happened (`adjudicator_model=None`, the bench-open
+    signal) -- the ledger must show exactly the two reviewer stages, never a
+    phantom adjudicator entry."""
+    ledger = Ledger()
+
+    await run_court(
+        _CLAUSE_SLICE,
+        _EVIDENCE_SLICE,
+        known_anchor_ids=_KNOWN_ANCHOR_IDS,
+        clause_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="support")],
+        ),
+        evidence_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="reject")],
+        ),
+        bench=AdjudicationBench.default(breaker=_open_breaker()),
+        ledger=ledger,
+    )
+
+    assert {r.stage for r in ledger.records} == {CLAUSE_REVIEWER_NODE, EVIDENCE_REVIEWER_NODE}
+
+
+async def test_run_court_verbose_also_books_ledger_usage() -> None:
+    """`run_court_verbose` shares `_run_court_events` with `run_court` --
+    this pins that the ledger wiring isn't accidentally only reachable from
+    one of the two public entry points."""
+    ledger = Ledger()
+
+    await run_court_verbose(
+        _CLAUSE_SLICE,
+        _EVIDENCE_SLICE,
+        known_anchor_ids=_KNOWN_ANCHOR_IDS,
+        clause_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="support")],
+        ),
+        evidence_model=FakeLlm(
+            model="gemini-3.5-flash-lite",
+            bodies=[review_body(ground_id=_GROUND_ID, stance="support")],
+        ),
+        bench=AdjudicationBench.default(),
+        ledger=ledger,
+    )
+
+    assert {r.stage for r in ledger.records} == {CLAUSE_REVIEWER_NODE, EVIDENCE_REVIEWER_NODE}
+
+
+async def test_run_court_propagates_budget_exceeded_from_the_ledger() -> None:
+    """The ledger's own hard-stop ceiling (ARCHITECTURE.md §4) applies to
+    court-stage bookings exactly like any other ledgered call -- a run that
+    would push spend past the ceiling raises rather than silently booking
+    past it."""
+    ledger = Ledger(ceiling_usd=0.0)
+
+    with pytest.raises(BudgetExceededError):
+        await run_court(
+            _CLAUSE_SLICE,
+            _EVIDENCE_SLICE,
+            known_anchor_ids=_KNOWN_ANCHOR_IDS,
+            clause_model=FakeLlm(
+                model="gemini-3.5-flash-lite",
+                bodies=[review_body(ground_id=_GROUND_ID, stance="support")],
+            ),
+            evidence_model=FakeLlm(
+                model="gemini-3.5-flash-lite",
+                bodies=[review_body(ground_id=_GROUND_ID, stance="support")],
+            ),
+            bench=AdjudicationBench.default(),
+            ledger=ledger,
+        )
+
+
+async def test_run_court_without_a_ledger_is_unaffected() -> None:
+    """The default (`ledger=None`, every pre-existing caller) must behave
+    exactly as before -- ledger booking is strictly additive."""
+    verdict = await run_court(
+        _CLAUSE_SLICE,
+        _EVIDENCE_SLICE,
+        known_anchor_ids=_KNOWN_ANCHOR_IDS,
+        clause_model=FakeLlm(
+            model="fake-clause", bodies=[review_body(ground_id=_GROUND_ID, stance="support")]
+        ),
+        evidence_model=FakeLlm(
+            model="fake-evidence", bodies=[review_body(ground_id=_GROUND_ID, stance="support")]
+        ),
+        bench=AdjudicationBench.default(),
+    )
+
+    assert verdict.outcome is CourtOutcome.RESOLVED
 
 
 async def test_build_court_workflow_rejects_mismatched_ground_ids() -> None:

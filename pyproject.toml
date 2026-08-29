@@ -23,6 +23,8 @@ dependencies = [
     "packaging>=24.0,<26",
     "pypdfium2>=4.30,<5",
     "pillow>=11.0,<12",
+    "python-multipart>=0.0.20,<1",
+    "google-cloud-run>=0.10,<1",
 ]
 
 [dependency-groups]

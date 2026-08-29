@@ -26,11 +26,9 @@ malformed rate (wrong key name, reversed min/max) — a resolvable citation
 must never be wrongly refused, or worse, silently mis-boxed, because of a
 parseable-but-malformed model reply.
 
-**Known gap**: :meth:`ModelClient.generate` has no `temperature` parameter,
-so this module cannot set `temperature=0.0` the way the spike did calling
-`google-genai` directly. Reported to the integrator; `models/client.py` is
-off this package's lane. `ThinkingLevel.MINIMAL`/`LOW` plus a low-variance
-prompt is the mitigation available without that change.
+Every call pins `temperature=0.0` (`ModelClient.generate`'s optional
+`temperature` parameter, wave 4), matching the spike's own low-variance
+setup exactly rather than relying on `ThinkingLevel.MINIMAL`/`LOW` alone.
 """
 
 from __future__ import annotations
@@ -204,7 +202,7 @@ async def ground_elements(
         points), plus the call's token usage for ledger booking.
     """
     prompt = f"{_GROUNDING_INSTRUCTION}\n\nElements to locate: {', '.join(labels)}"
-    result = await client.generate(tier, prompt, GroundingResponse)
+    result = await client.generate(tier, prompt, GroundingResponse, temperature=0.0)
 
     boxes: list[GroundedBox] = []
     for element in result.output.elements:
