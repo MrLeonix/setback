@@ -1650,3 +1650,94 @@ case selection, not silently shipped. Remaining work is film-day/founder-only:
 picking the final film case(s) from the recommendation above, the timed
 rehearsal, and everything `STATUS.md`'s own "what remains" sections already
 list. Pushed to `main` after this file and `STATUS.md` were updated.
+
+---
+
+# SMOKE.md v9 — wave 9.5 SHIP pass: redeploy + Blocker-1-fix proof run (2026-08-29)
+
+Ship-phase pass following a fixer's Blocker-1 fix (commit `833e6fd`, already
+on `main` and green — 619 tests — when this pass started; no source change
+made by this pass). Redeployed, verified the deployed console's basic
+routes, ran the one budgeted proof-run tribunal execution against the real
+on-exhibition DA, and read the live results directly. Full detail (the
+before/after document comparison, the new case's exact numbers, and the
+Case-A comparison table) is in `CASES.md`'s "Wave 9.5" section; this entry
+is the SMOKE-loop pointer plus the headline items.
+
+## Redeploy
+
+`./deploy.sh` (`australia-southeast1`), one run, idempotent: new image
+`...setback:20260829t135935z`, console revision `setback-console-00017-s25`
+serving 100% traffic, tribunal job generation 16. Confirmed serving before
+the proof run: `GET /` → `200`; `GET /docket` (no key) → `401`; `GET
+/docket?key=<fetched from Secret Manager into a shell var, unset
+immediately>` → `200`; `GET
+/cases/cc9bfc59084fd7cac527c479f0e71996` (the wave-9 flagship film case) →
+`200`.
+
+## Proof run — one fresh real case, no photo upload
+
+Case `5e791203b4b538ec8b4de27b981e7ab6`, created through the real deployed
+resident-facing API (`scratchpad/proof_run.py`, adapted from the populate
+pass's own reusable `populate_cases.py`), `PAN-661190` (`DA2026/0359`, real
+ingest — `used_demo_fixture: false`), overshadowing + property-value mix,
+zero documents uploaded by the (synthetic) resident:
+
+- **Overshadowing: SHIPPED** (s4.15(1)(b), both reviewers support,
+  0.85/0.9 confidence).
+- **Property value: REFUSED — unsubstantiated** (both reviewers reject,
+  0.95/0.95 confidence) — see `CASES.md`'s caveat: the live clerk
+  classified this run's property-value sentence as `OVERSHADOWING`, not
+  `PROPERTY_VALUE` (the pre-existing ITEM 3 soft finding recurring, not a
+  new defect; the category-based refusal-wording logic itself is
+  unaffected and still pinned green by its own regression test).
+- **Blocker 1 confirmed fixed**: the annotated overlay is grounded on
+  `etrack-5197136`, the real "Site Plan" drawing (correct letterhead,
+  correct address, correct drawing number) — not the Resident Notification
+  Letter every one of this repo's prior real-DA cases was stuck on. Full
+  resolution click-through confirmed: `200`, `image/png`, `4962×3508`,
+  `5457291` bytes. Boxes/chips legible, correctly warm-brown/orange
+  ("cited by a refused ground" — expected, since the property-value
+  ground's own reviewers cited "site plans" by name).
+- **Street View grade-B fallback confirmed rendering**: "Archival Street
+  View" card, grade-B tag, `(c) Google Street View, 2024-06` attribution,
+  clickable — the exact resident-visible requirement Blocker 2 (wave-9
+  populate pass) originally found missing, now present on a fresh real
+  case with the wave-9 fix in place.
+- Real ledger cost: `$0.003048`. **1 of the 3 allowed tribunal runs used
+  this pass.**
+
+## Docket filter re-check (with key, silently fetched)
+
+`GET /docket?key=...` lists `DA2026/0359`, `DA2026/0359-DEMO`,
+`DA2026/0359-PROOF`, `DA2026/0412-FILM`, `DA2026/0412-FILM2`,
+`DA2026/3975`, and the new proof case (now the latest of a collapsed
+`PAN-661190` group, "+5 earlier cases") — **zero** `DEPLOY-QA` or
+`SV-TEST` rows, confirming commit `833e6fd`'s docket-hygiene extension
+works live, not just in its own unit test.
+
+## Second-council item — no change, nothing run
+
+Re-confirmed live: no independent, currently-exhibited second DA exists at
+any nearby eTrack-shaped council today (same result as the original
+populate pass's own check). No second-council case was in scope to run
+this pass.
+
+## Security
+
+No secret value was read, printed, or transmitted. `docket-key` was
+fetched into a shell variable exactly once, used inside one `curl` query
+string, and `unset` immediately after — only the HTTP status code was ever
+recorded. All outbound HTTP used `User-Agent: setback/0.1`. The one case
+created this pass used a synthetic `uuid4` `resident_session` and a
+synthetic resident narrative referencing only the DA's own already-public
+address and council — no real personal identifier anywhere in this pass's
+commands, files, or the case itself.
+
+## Status
+
+**Blocker 1: CLOSED, verified live** (already fixed in the tree before
+this pass started; this pass supplied the first live, post-fix proof
+against a real DA). Deployed, redeployed cleanly, docket filter reconfirmed
+live. Remaining work is film-day/founder-only, per `STATUS.md`'s wave-9.5
+entry.

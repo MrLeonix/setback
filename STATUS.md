@@ -1,3 +1,55 @@
+# STATUS — wave 9.5 complete: Blocker 1 closed, redeployed, proof run verified (2026-08-29)
+
+Ship-phase pass over a fixer's Blocker-1 fix (`833e6fd`, already on `main`
+and green — 619 passed — when this pass started): ran full quality gates
+verbatim, redeployed (`setback-console-00017-s25`, tribunal generation 16),
+and ran the one budgeted proof-run tribunal against the real on-exhibition
+DA to verify the fix live. Full detail in `SMOKE.md`'s "SMOKE.md v9"
+section and `CASES.md`'s "Wave 9.5" section; headline items only here.
+
+- **Blocker 1 (real-DA overlay grounds on the wrong document) — CONFIRMED
+  CLOSED live.** New case `5e791203b4b538ec8b4de27b981e7ab6` (real ingest,
+  `PAN-661190`/`DA2026/0359`, no photo upload) grounds its overlay on the
+  real "Site Plan" drawing (correct letterhead/address/drawing number),
+  not the Resident Notification Letter every prior real-DA case was stuck
+  on. Full-resolution click-through confirmed (`200`, `4962×3508` PNG).
+- **Street View grade-B fallback confirmed rendering** on this same fresh
+  real case (attribution + badge + clickable) — the wave-9 fix holds up on
+  a brand-new case, not just the one it was originally verified against.
+- **New recommended film case for the real-DA beat**:
+  `5e791203b4b538ec8b4de27b981e7ab6` — beats the populate pass's
+  `9f9a6a087f851db107be765391ba48ad` (Case A) by combining a real DA, a
+  clean SHIPPED overshadowing ground, a presentable overlay, and a working
+  Street View card in one run, all of which Case A lacks at least one of.
+  One honest caveat: this case's property-value ground was refused as
+  *unsubstantiated* rather than *not a listed matter* — a recurrence of
+  the already-documented ITEM 3 live-model-classification soft finding,
+  not a new or different code defect. If the exact "not a listed matter"
+  wording matters more than the overlay/Street-View combination, Case A
+  remains available and correctly categorised on that one point.
+- **Item 5 (second council)**: re-confirmed no change — no independent,
+  currently-exhibited second DA exists at any nearby eTrack-shaped council
+  today. Nothing shipped, nothing run, per the item's own standing STOP.
+- **Docket filter re-confirmed live** (with the Secret-Manager-fetched
+  key): the wave-9.5 fix's exclusion list still hides every `DEPLOY-QA`/
+  `SV-TEST` row; the new proof case now heads its `PAN-661190` group
+  ("+5 earlier cases").
+
+Quality gates verbatim: `619 passed`; `ruff check`/`ruff format --check`
+clean; `mypy` clean (38 source files) — unchanged from the fixer's own
+count, since this pass made no source edits. Security diff check on the
+fixer's commit: clean. **1 of 3 allowed tribunal runs used, $0.003048 of
+the ≤USD 1.5 budget spent.** Pushed (this file + `SMOKE.md` +
+`CASES.md`) to `origin/main`.
+
+**Remaining work is film-day/founder-only** from here — unchanged in kind
+from wave 9's own closing note below: pick the final film case(s) (now
+including the new real-DA recommendation above), one timed rehearsal, and
+the Devpost/DISCLOSURE.md narrative items. No further build-or-QA-wave
+agent pass is expected before Sunday's freeze.
+
+---
+
 # STATUS — wave 9 complete: full QA loop closed, deployed, verified (2026-08-29)
 
 Final wave-9 pass: drove the deployed app through every item in
