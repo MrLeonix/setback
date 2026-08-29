@@ -833,6 +833,7 @@ button:hover {
 .ground-card {
   display: flex;
   border: 1px solid var(--border);
+  border-left: 5px solid var(--status-pending-border);
   border-radius: var(--radius);
   overflow: hidden;
   background: var(--surface);
@@ -841,19 +842,22 @@ button:hover {
   list-style: none;
 }
 
-.ground-card__stripe {
-  width: 5px;
-  flex: none;
+/* Wave 9: the accordion (`.ground-card__accordion`) is the card's one
+   flexed child now -- the status colour that used to live on a separate
+   `.ground-card__stripe` div moves to the card's own left border instead,
+   keeping the same "colour = meaning" cue with one fewer DOM node. */
+.ground-card--shipped { border-left-color: var(--status-shipped-border); }
+.ground-card--refused { border-left-color: var(--status-refused-border); }
+.ground-card--flagged { border-left-color: var(--status-flagged-border); }
+.ground-card--pending { border-left-color: var(--status-pending-border); }
+
+.ground-card__accordion {
+  flex: 1;
+  min-width: 0;
 }
 
-.ground-card--shipped .ground-card__stripe { background: var(--status-shipped-border); }
-.ground-card--refused .ground-card__stripe { background: var(--status-refused-border); }
-.ground-card--flagged .ground-card__stripe { background: var(--status-flagged-border); }
-.ground-card--pending .ground-card__stripe { background: var(--status-pending-border); }
-
 .ground-card__body {
-  padding: var(--space-3) var(--space-4);
-  flex: 1;
+  padding: 0 var(--space-4) var(--space-3);
   min-width: 0;
 }
 
@@ -1435,4 +1439,458 @@ button:hover {
   font-size: var(--text-xs);
   color: var(--text-muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.docket-card__earlier {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* =============================================================================
+   Wave 9 (LEO-FEEDBACK-UIUX.md) -- founder feedback round.
+   Landing page, two-pane case layout, ground accordion, theme toggle,
+   typing indicator, copy-link/copy-text actions, and a lightbox for the
+   annotated overlay. Extends every token/component above; nothing here
+   redefines an existing selector's meaning. */
+
+/* --- shared small utilities ------------------------------------------------ */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.button--secondary {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.button--secondary:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* --- landing page (§1): public, minimal, one DA-number input -------------- */
+
+.landing {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.landing__theme-toggle {
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--space-4) var(--space-5) 0;
+}
+
+.landing__main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: var(--space-3);
+  padding: var(--space-6) var(--space-4);
+}
+
+.landing__title {
+  margin: 0;
+  font-size: 3rem;
+  letter-spacing: -0.02em;
+}
+
+.landing__tagline {
+  margin: 0 0 var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-lg);
+}
+
+.landing__form {
+  display: flex;
+  gap: var(--space-2);
+  width: 100%;
+  max-width: 440px;
+}
+
+.landing__form input[type="text"] {
+  flex: 1;
+  padding: var(--space-3) var(--space-4);
+  border: 2px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--text-base);
+}
+
+.landing__form input[type="text"]:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.landing__form button {
+  white-space: nowrap;
+}
+
+.landing__error {
+  color: var(--error);
+  font-size: var(--text-sm);
+  max-width: 440px;
+}
+
+.previous-cases {
+  margin-top: var(--space-6);
+  width: 100%;
+  max-width: 440px;
+}
+
+.previous-cases h2 {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.previous-cases__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.previous-cases__list a {
+  display: block;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.previous-cases__list a:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* --- header actions shared by all three pages ------------------------------ */
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.topbar h1 a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.topbar__actions,
+.case-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.case-actions__qr {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+/* --- two-pane case layout (§2/§9): chat fixed left, sections scroll right - */
+
+.case-layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 38%) 1fr;
+  align-items: start;
+  gap: var(--space-5);
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: var(--space-5) var(--space-5) var(--space-8);
+}
+
+.case-layout__chat {
+  position: sticky;
+  top: var(--space-5);
+  max-height: calc(100vh - var(--space-8));
+  display: flex;
+}
+
+.case-layout__chat .chat-card {
+  width: 100%;
+  max-height: 100%;
+}
+
+.case-layout__chat .chat-transcript {
+  flex: 1;
+  max-height: none;
+  min-height: 220px;
+}
+
+.case-layout__sections {
+  min-width: 0;
+}
+
+.chat-card__export {
+  align-self: flex-start;
+  font-size: var(--text-sm);
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.chat-card__export:hover {
+  text-decoration: underline;
+}
+
+@media (max-width: 860px) {
+  .case-layout {
+    display: block;
+    padding: var(--space-4);
+  }
+
+  .case-layout__chat {
+    position: static;
+    max-height: none;
+    margin-bottom: var(--space-5);
+  }
+}
+
+/* --- sticky in-page section nav (§9): reduces scroll fatigue -------------- */
+
+.section-nav {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) 0 var(--space-3);
+  margin-bottom: var(--space-2);
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.section-nav a {
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-pill);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-decoration: none;
+  border: 1px solid transparent;
+}
+
+.section-nav a:hover {
+  color: var(--accent);
+  border-color: var(--border-strong);
+}
+
+/* --- typing indicator (§2): "I don't know if the chat is broken" fix ------ */
+
+.typing-indicator {
+  align-self: flex-start;
+  display: flex;
+  gap: 4px;
+  padding: var(--space-2) 0;
+}
+
+/* Found live (wave-9 browser smoke check): an author `display: flex` on
+   the base selector always beats the UA stylesheet's `[hidden] { display:
+   none }`, so the dots stayed visible even while `app.js` correctly set
+   the `hidden` attribute -- the resident would see a permanent "thinking"
+   animation regardless of the real pending state. */
+.typing-indicator[hidden] {
+  display: none;
+}
+
+.typing-indicator span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  animation: setback-typing-bounce 1.2s infinite ease-in-out;
+}
+
+.typing-indicator span:nth-child(2) { animation-delay: 0.15s; }
+.typing-indicator span:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes setback-typing-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .typing-indicator span {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+#interview-input:disabled,
+#interview-form button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* --- ground accordion (§3): clamped one-liner + status pill, merged
+   reviewer opinions + gate decision inside the expansion ------------------ */
+
+.ground-card__accordion {
+  width: 100%;
+}
+
+.ground-card__summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  cursor: pointer;
+  list-style: none;
+  padding: var(--space-3) var(--space-4);
+}
+
+.ground-card__summary::-webkit-details-marker {
+  display: none;
+}
+
+.ground-card__summary::before {
+  content: "\25B8"; /* ▸ */
+  color: var(--text-muted);
+  margin-right: var(--space-2);
+  transition: transform 150ms ease;
+  flex: none;
+}
+
+.ground-card__accordion[open] > .ground-card__summary::before {
+  transform: rotate(90deg);
+}
+
+.ground-card__claim {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-lg);
+}
+
+.ground-card__body {
+  padding-top: var(--space-3);
+}
+
+.ground-card__opinions {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.ground-card__opinions h5 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+/* --- document actions (§6): Copy text + Email this primary, HTML
+   download secondary; Markdown removed from the UI entirely ----------------*/
+
+.document-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 var(--space-4);
+}
+
+.document-downloads__html {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  text-decoration: underline;
+}
+
+.document-downloads__html:hover {
+  color: var(--accent);
+}
+
+/* --- clickable evidence cards (§4) ----------------------------------------*/
+
+.doc-card--clickable {
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.doc-card--clickable:hover {
+  border-color: var(--accent);
+}
+
+/* --- lightbox (§5): click the annotated overlay to see it at full size --- */
+
+.doc-viewer__stage-image--clickable {
+  cursor: zoom-in;
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 9, 7, 0.85);
+  padding: var(--space-6);
+}
+
+/* Same author-vs-UA-stylesheet bug as `.typing-indicator[hidden]` above,
+   found in the same browser smoke pass: `display: flex` on the base
+   selector otherwise beats `[hidden] { display: none }` regardless of the
+   `hidden` property JS sets, leaving the scrim visibly stuck on screen. */
+.lightbox[hidden] {
+  display: none;
+}
+
+.lightbox__image {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg);
+}
+
+.lightbox__close {
+  position: absolute;
+  top: var(--space-4);
+  right: var(--space-5);
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 2rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: var(--space-2);
 }

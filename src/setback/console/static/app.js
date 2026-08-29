@@ -51,6 +51,49 @@
 (function () {
   "use strict";
 
+  // ===========================================================================
+  // Wave 9 (LEO-FEEDBACK-UIUX.md): theme toggle, present in every page's
+  // header (`_THEME_TOGGLE_BUTTON`, console/app.py). Runs unconditionally,
+  // before the case-page-only early return below, since the landing page
+  // and docket board have no `data-case-id`.
+  // ===========================================================================
+
+  (function initThemeToggle() {
+    const THEME_KEY = "setback:theme";
+
+    // An explicit `?theme=` on THIS load always wins (filming consistency,
+    // console/app.py's `force_theme`) -- only fall back to a remembered
+    // preference when the server didn't already stamp one on `<html>`.
+    try {
+      if (!document.documentElement.getAttribute("data-theme")) {
+        const stored = window.localStorage.getItem(THEME_KEY);
+        if (stored === "light" || stored === "dark") {
+          document.documentElement.setAttribute("data-theme", stored);
+        }
+      }
+    } catch (err) {
+      // localStorage unavailable (private browsing, locked-down browser):
+      // the system/query default stands, exactly as if nothing were stored.
+    }
+
+    const toggleBtn = document.getElementById("theme-toggle");
+    if (!toggleBtn) return;
+    toggleBtn.addEventListener("click", () => {
+      const current = document.documentElement.getAttribute("data-theme");
+      const systemPrefersDark =
+        window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const isDark = current ? current === "dark" : systemPrefersDark;
+      const next = isDark ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", next);
+      try {
+        window.localStorage.setItem(THEME_KEY, next);
+      } catch (err) {
+        // Preference just won't survive a reload -- the toggle still works
+        // for this page view, which is the important part.
+      }
+    });
+  })();
+
   const RESIDENT_SESSION_KEY = "setback:resident-session";
 
   // A stable per-browser identifier so revisiting the same DA number from
@@ -154,10 +197,135 @@
 
   initCreateCaseForm();
 
+  // ===========================================================================
+  // Wave 9: the public landing page (`/`) -- one DA-number input that starts
+  // a new objection, plus a "your previous cases" list read entirely from
+  // this browser's own localStorage (LEO-FEEDBACK-UIUX.md §1). Nothing
+  // server-side: a different browser/profile simply sees an empty list.
+  // ===========================================================================
+
+  const PREVIOUS_CASES_KEY = "setback:previous-cases";
+  const MAX_REMEMBERED_CASES = 20;
+
+  function getPreviousCases() {
+    try {
+      const raw = window.localStorage.getItem(PREVIOUS_CASES_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (err) {
+      return [];
+    }
+  }
+
+  function recordPreviousCase(caseId, applicationNumber) {
+    try {
+      const withoutThisCase = getPreviousCases().filter((entry) => entry.case_id !== caseId);
+      withoutThisCase.unshift({
+        case_id: caseId,
+        application_number: applicationNumber,
+        created_at: Date.now(),
+      });
+      window.localStorage.setItem(
+        PREVIOUS_CASES_KEY,
+        JSON.stringify(withoutThisCase.slice(0, MAX_REMEMBERED_CASES))
+      );
+    } catch (err) {
+      // A remembered-cases convenience only -- never block case creation.
+    }
+  }
+
+  function renderPreviousCases() {
+    const section = document.getElementById("previous-cases");
+    const list = document.getElementById("previous-cases-list");
+    if (!section || !list) return;
+    const previous = getPreviousCases();
+    if (previous.length === 0) return;
+    list.innerHTML = "";
+    for (const entry of previous) {
+      const item = document.createElement("li");
+      const link = document.createElement("a");
+      link.href = `/cases/${entry.case_id}`;
+      link.textContent = entry.application_number || entry.case_id;
+      item.appendChild(link);
+      list.appendChild(item);
+    }
+    section.hidden = false;
+  }
+
+  function initLandingPage() {
+    const form = document.getElementById("start-case-form");
+    const input = document.getElementById("application-number-input");
+    const errorEl = document.getElementById("start-case-error");
+    if (!form || !input) return; // not the landing page
+
+    renderPreviousCases();
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const applicationNumber = input.value.trim();
+      if (!applicationNumber) return;
+      if (errorEl) {
+        errorEl.hidden = true;
+        errorEl.textContent = "";
+      }
+      const submitButton = form.querySelector("button");
+      const originalLabel = submitButton ? submitButton.textContent : "";
+      if (submitButton) {
+        submitButton.disabled = true;
+        submitButton.textContent = "Starting...";
+      }
+      try {
+        const response = await fetch("/api/cases", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            application_number: applicationNumber,
+            resident_session: getResidentSessionId(),
+          }),
+        });
+        if (response.ok) {
+          const body = await response.json();
+          recordPreviousCase(body.case_id, body.application_number || applicationNumber);
+          window.location.href = `/cases/${body.case_id}`;
+          return;
+        }
+        let detail = "Could not start a case for that application number. Please try again.";
+        try {
+          const errorBody = await response.json();
+          if (errorBody && errorBody.detail) detail = errorBody.detail;
+        } catch (err) {
+          // Non-JSON error body: keep the generic message above.
+        }
+        if (errorEl) {
+          errorEl.textContent = detail;
+          errorEl.hidden = false;
+        }
+      } catch (err) {
+        if (errorEl) {
+          errorEl.textContent =
+            "Could not reach the server. Please check your connection and try again.";
+          errorEl.hidden = false;
+        }
+      } finally {
+        if (submitButton) {
+          submitButton.disabled = false;
+          submitButton.textContent = originalLabel;
+        }
+      }
+    });
+  }
+
+  initLandingPage();
+
   const caseId = document.body.getAttribute("data-case-id");
   if (!caseId) {
     return;
   }
+
+  // Record this case in "your previous cases" if it was reached directly
+  // (e.g. a bookmarked/shared link) rather than via the landing-page form
+  // above, so the localStorage list stays complete either way.
+  recordPreviousCase(caseId, document.title.replace(/^Setback -- /, ""));
 
   // ===========================================================================
   // Shared helpers
@@ -189,6 +357,18 @@
   const uploadForm = document.getElementById("upload-form");
   const uploadInput = document.getElementById("upload-input");
   const startTribunalBtn = document.getElementById("start-tribunal");
+  const typingIndicatorEl = document.getElementById("typing-indicator");
+  const interviewSendBtn = interviewForm ? interviewForm.querySelector("button[type=submit]") : null;
+
+  // LEO-FEEDBACK-UIUX.md §2: "I had no visual cue the model was thinking...
+  // I don't know if the chat is broken." An animated ellipsis while a reply
+  // is pending, input+send disabled meanwhile so a resident can't fire a
+  // second answer into an already-in-flight turn.
+  function setInterviewPending(pending) {
+    if (typingIndicatorEl) typingIndicatorEl.hidden = !pending;
+    if (interviewInput) interviewInput.disabled = pending;
+    if (interviewSendBtn) interviewSendBtn.disabled = pending;
+  }
 
   const STAGE_LABELS = {
     opening: "Starting",
@@ -334,6 +514,7 @@
   // duplicate resident bubble for the same answer.
 
   async function postAnswer(answer) {
+    setInterviewPending(true);
     try {
       const response = await fetch(`/api/cases/${caseId}/interview`, {
         method: "POST",
@@ -350,6 +531,8 @@
       renderQuickReplies(body.suggested_replies);
     } catch (err) {
       renderTranscriptError("We couldn't reach the server just now.", () => postAnswer(answer));
+    } finally {
+      setInterviewPending(false);
     }
   }
 
@@ -363,6 +546,7 @@
   }
 
   async function loadInterview() {
+    setInterviewPending(true);
     try {
       const response = await fetch(`/api/cases/${caseId}/interview`);
       if (!response.ok) return;
@@ -374,6 +558,8 @@
       // A failed initial load leaves the transcript empty -- the resident
       // can still type once the form is visible; nothing to recover here
       // beyond letting the next real interaction retry naturally.
+    } finally {
+      setInterviewPending(false);
     }
   }
 
@@ -390,6 +576,12 @@
       event.preventDefault();
       const file = uploadInput.files[0];
       if (!file) return;
+      const uploadBtn = uploadForm.querySelector("button[type=submit]");
+      const originalLabel = uploadBtn ? uploadBtn.textContent : "";
+      if (uploadBtn) {
+        uploadBtn.disabled = true;
+        uploadBtn.textContent = "Uploading...";
+      }
       const formData = new FormData();
       formData.append("file", file);
       try {
@@ -408,12 +600,18 @@
         }
       } catch (err) {
         renderTranscriptError("We couldn't reach the server just now.", null);
+      } finally {
+        if (uploadBtn) {
+          uploadBtn.disabled = false;
+          uploadBtn.textContent = originalLabel;
+        }
       }
       uploadInput.value = "";
     });
   }
 
   if (startTribunalBtn) {
+    const idleLabel = startTribunalBtn.getAttribute("data-idle-label") || "Start tribunal";
     startTribunalBtn.addEventListener("click", async () => {
       startTribunalBtn.disabled = true;
       startTribunalBtn.textContent = "Tribunal running...";
@@ -440,7 +638,7 @@
           errorEl.textContent = detail;
           startTribunalBtn.insertAdjacentElement("afterend", errorEl);
           startTribunalBtn.disabled = false;
-          startTribunalBtn.textContent = "Start tribunal";
+          startTribunalBtn.textContent = idleLabel;
         }
       } catch (err) {
         // Network failure: same recovery as an HTTP error above.
@@ -450,10 +648,135 @@
         errorEl.textContent = "Could not reach the server. Please check your connection and try again.";
         startTribunalBtn.insertAdjacentElement("afterend", errorEl);
         startTribunalBtn.disabled = false;
-        startTribunalBtn.textContent = "Start tribunal";
+        startTribunalBtn.textContent = idleLabel;
       }
     });
   }
+
+  // ===========================================================================
+  // Wave 9 (LEO-FEEDBACK-UIUX.md §1/§2/§6): copy-link + copy-text, both via
+  // the same small clipboard helper with a manual-select fallback for a
+  // context where the async Clipboard API isn't available.
+  // ===========================================================================
+
+  async function copyTextToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    document.execCommand("copy");
+    textarea.remove();
+  }
+
+  function flashButtonFeedback(button, message) {
+    const original = button.textContent;
+    button.textContent = message;
+    window.setTimeout(() => {
+      button.textContent = original;
+    }, 2000);
+  }
+
+  const copyLinkBtn = document.getElementById("copy-link-button");
+  if (copyLinkBtn) {
+    copyLinkBtn.addEventListener("click", async () => {
+      const path = copyLinkBtn.getAttribute("data-case-path") || window.location.pathname;
+      try {
+        await copyTextToClipboard(`${window.location.origin}${path}`);
+        flashButtonFeedback(copyLinkBtn, "Copied!");
+      } catch (err) {
+        flashButtonFeedback(copyLinkBtn, "Could not copy");
+      }
+    });
+  }
+
+  // One delegated handler covers every "Copy text" button the submission
+  // section renders (one per document) without needing to know how many
+  // there are up front.
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest(".copy-text-button");
+    if (!button) return;
+    const sourceId = button.getAttribute("data-copy-source");
+    const sourceEl = sourceId && document.getElementById(sourceId);
+    if (!sourceEl) return;
+    try {
+      await copyTextToClipboard(sourceEl.value);
+      flashButtonFeedback(button, "Copied!");
+    } catch (err) {
+      flashButtonFeedback(button, "Could not copy");
+    }
+  });
+
+  // ===========================================================================
+  // Wave 9 (LEO-FEEDBACK-UIUX.md §5): a lightbox for the annotated overlay
+  // image -- previously inert, now clickable to see it at full resolution
+  // instead of squeezed into the doc-viewer's fixed-height stage.
+  // ===========================================================================
+
+  function ensureLightbox() {
+    let lightbox = document.getElementById("setback-lightbox");
+    if (lightbox) return lightbox;
+    lightbox = document.createElement("div");
+    lightbox.id = "setback-lightbox";
+    lightbox.className = "lightbox";
+    lightbox.hidden = true;
+    lightbox.innerHTML =
+      '<button type="button" class="lightbox__close" aria-label="Close full-size image">' +
+      "&times;</button>" +
+      '<img class="lightbox__image" alt="">';
+    lightbox.addEventListener("click", (event) => {
+      if (event.target === lightbox || event.target.classList.contains("lightbox__close")) {
+        closeLightbox();
+      }
+    });
+    document.body.appendChild(lightbox);
+    return lightbox;
+  }
+
+  function openLightbox(src, alt) {
+    const lightbox = ensureLightbox();
+    const img = lightbox.querySelector(".lightbox__image");
+    img.src = src;
+    img.alt = alt || "";
+    lightbox.hidden = false;
+  }
+
+  function closeLightbox() {
+    const lightbox = document.getElementById("setback-lightbox");
+    if (lightbox) lightbox.hidden = true;
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeLightbox();
+  });
+
+  function wireOverlayLightbox(img) {
+    if (!img || img.dataset.lightboxWired) return;
+    img.dataset.lightboxWired = "1";
+    img.classList.add("doc-viewer__stage-image--clickable");
+    // Wave 9 (LEO-FEEDBACK-UIUX.md §5): prefer the genuinely
+    // full-resolution image (`data-full-res-src`, wired by
+    // `console/app.py`'s `_render_annotated_overlay_item` /
+    // `handleAnnotatedOverlay` below when `job.pipeline` stored one) over
+    // `img.src`, which is only the shrunk copy embedded directly in the
+    // event -- clicking used to just re-display that same downscaled
+    // image bigger, not the real full-resolution render.
+    img.addEventListener("click", () =>
+      openLightbox(img.dataset.fullResSrc || img.src, img.alt)
+    );
+  }
+
+  // The server-rendered overlay (a page reload/reopen after the run already
+  // finished) needs wiring on load too, not just the live SSE-driven one.
+  document
+    .querySelectorAll(".doc-viewer__stage img")
+    .forEach((img) => wireOverlayLightbox(img));
 
   // ===========================================================================
   // Sec 3.8 -- check-answers "Change" links: graceful degrade
@@ -714,7 +1037,7 @@
 
   function ensureTribunalRun() {
     if (tribunalRunEl) return tribunalRunEl;
-    const anchor = document.querySelector(".case-page");
+    const anchor = document.querySelector(".case-layout__sections");
     if (!anchor) return null;
     tribunalRunEl = document.createElement("section");
     tribunalRunEl.className = "card tribunal-run";
@@ -738,14 +1061,14 @@
 
   function hideFlatSectionsOnce() {
     if (flatSectionsHidden) return;
-    const titles = [
-      "Reviewer opinions",
-      "Adjudication",
-      "Gate decisions",
-      "Annotated evidence overlay",
-      "Tribunal",
-    ];
-    document.querySelectorAll("main.case-page section.card").forEach((section) => {
+    // Wave 9 (LEO-FEEDBACK-UIUX.md §3): "Reviewer opinions"/"Adjudication"/
+    // "Gate decisions" no longer exist as standalone sections at all (they
+    // render inside each ground's own accordion server-side now) -- only
+    // "Annotated evidence overlay" and "Tribunal" still have a flat,
+    // server-rendered fallback worth hiding once this richer live view has
+    // its own data to show in their place.
+    const titles = ["Annotated evidence overlay", "Tribunal"];
+    document.querySelectorAll(".case-layout__sections section.card").forEach((section) => {
       const heading = section.querySelector("h3");
       if (heading && titles.includes(heading.textContent.trim())) {
         section.style.display = "none";
@@ -938,7 +1261,7 @@
     // legend entry explaining it at all, reported live as "empty floating
     // boxes" with no visible meaning.
     hideFlatSectionsOnce();
-    const anchor = document.querySelector(".case-page");
+    const anchor = document.querySelector(".case-layout__sections");
     if (!anchor) return;
     let viewer = document.querySelector(".doc-viewer");
     if (!viewer) {
@@ -961,8 +1284,15 @@
     img.src = `data:${payload.mime_type || "image/png"};base64,${payload.image_base64 || ""}`;
     img.alt = "Annotated evidence overlay";
     if (payload.document_id) img.setAttribute("data-doc-id", payload.document_id);
+    // Wave 9 (LEO-FEEDBACK-UIUX.md §5): mirrors `console/app.py`'s
+    // `_render_annotated_overlay_item` -- see `wireOverlayLightbox` for
+    // why the lightbox prefers this over `img.src`.
+    if (payload.full_res_document_id) {
+      img.dataset.fullResSrc = `/api/cases/${caseId}/documents/${payload.full_res_document_id}`;
+    }
     stage.innerHTML = "";
     stage.appendChild(img);
+    wireOverlayLightbox(img);
   }
 
   // ===========================================================================

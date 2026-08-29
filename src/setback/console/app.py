@@ -39,11 +39,14 @@ import os
 import re
 import secrets
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Final, Protocol
+from urllib.parse import quote as _urlquote
+from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+import segno
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
@@ -55,7 +58,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from setback import config
-from setback.clerk import DocumentKind
+from setback.clerk import DocumentKind, classify_concern, redact_personal_information
 from setback.clerk import _classify_document_by_keywords as _classify_document_kind_offline
 from setback.console.guards import (
     enforce_concurrent_tribunal_cap,
@@ -375,6 +378,153 @@ async def _propose_ground_for_confirmed_concern(
     )
 
 
+_IN_PROGRESS_INTERVIEW_STAGES: Final[frozenset[InterviewStage]] = frozenset(
+    {InterviewStage.CLARIFYING, InterviewStage.REQUESTING_EVIDENCE, InterviewStage.CONFIRMING}
+)
+
+
+def _reconstruct_confirmed_concerns(
+    grounds: Sequence[GroundRecord], events: Sequence[CaseEvent]
+) -> list[RaisedConcern]:
+    """Best-effort `RaisedConcern`s for every already-confirmed ground, from
+    this case's own `ground_category_assigned` events (the concern's
+    original `concern_type`/`evidence_document_ids`) plus the ground's own
+    stored `claim` (already redacted -- see `_propose_ground_for_confirmed_
+    concern`) as both `initial_statement` and `redacted_text`. Only
+    `disputed_confirmations`/the separate raw `clarification` text are not
+    recoverable this way; neither is read by anything downstream of a
+    *confirmed* concern (`InterviewFlow._handle_ask_more` never revisits an
+    already-appended `self.concerns` entry), so this approximation is safe."""
+    category_by_ground: dict[str, Mapping[str, Any]] = {
+        str(e.payload.get("ground_id", "")): e.payload
+        for e in events
+        if e.event_type == "ground_category_assigned"
+    }
+    confirmed: list[RaisedConcern] = []
+    for ground in grounds:
+        payload = category_by_ground.get(ground.ground_id)
+        if payload is not None and payload.get("concern_type"):
+            concern_type = ConcernType(str(payload["concern_type"]))
+            evidence_ids = tuple(str(d) for d in payload.get("evidence_document_ids", ()))
+        else:
+            concern_type = classify_concern(ground.claim)
+            evidence_ids = ()
+        confirmed.append(
+            RaisedConcern(
+                concern_type=concern_type,
+                initial_statement=ground.claim,
+                confirmed=True,
+                evidence_document_ids=evidence_ids,
+                redacted_text=ground.claim,
+            )
+        )
+    return confirmed
+
+
+def _reconstruct_in_progress_concern(turn_events: Sequence[CaseEvent]) -> RaisedConcern | None:
+    """Best-effort `RaisedConcern` for a concern the resident is still
+    mid-way through (stage `CLARIFYING`/`REQUESTING_EVIDENCE`/`CONFIRMING`),
+    rebuilt from this case's own persisted `interview_turn` events rather
+    than from any in-memory state -- so a resumed flow's next `submit()`
+    call has a real, usable `_current` instead of crashing on the state
+    machine's `assert self._current is not None`.
+
+    `turn_events` must be every `interview_turn` event for this case,
+    sorted oldest-first. Approximation, documented rather than hidden: the
+    resident's own `disputed_confirmations` history is not reconstructed
+    (empty on resume) since nothing reads it except to compose the next
+    clarifying question's wording, a cosmetic degrade at worst -- the state
+    machine's own transitions are unaffected either way.
+    """
+    if not turn_events:
+        return None
+    last_stage_value = turn_events[-1].payload.get("stage")
+    try:
+        last_stage = InterviewStage(str(last_stage_value))
+    except ValueError:
+        return None
+    if last_stage not in _IN_PROGRESS_INTERVIEW_STAGES:
+        return None
+
+    # A confirmed concern's own last turn is a system ASK_MORE prompt --
+    # everything after the most recent one belongs to the concern still in
+    # progress; everything before it belongs to already-confirmed concerns.
+    block_start = 0
+    for i, e in enumerate(turn_events):
+        if (
+            e.payload.get("stage") == InterviewStage.ASK_MORE.value
+            and e.payload.get("role") == "system"
+        ):
+            block_start = i + 1
+    block = turn_events[block_start:]
+
+    initial_statement: str | None = None
+    clarification_parts: list[str] = []
+    for e in block:
+        if e.payload.get("role") != "resident":
+            continue
+        stage = e.payload.get("stage")
+        message = str(e.payload.get("message", ""))
+        if stage == InterviewStage.OPENING.value and initial_statement is None:
+            initial_statement = message
+        elif stage in (InterviewStage.CLARIFYING.value, InterviewStage.REQUESTING_EVIDENCE.value):
+            clarification_parts.append(message)
+    if initial_statement is None:
+        return None
+
+    concern_type = classify_concern(initial_statement)
+    redacted = redact_personal_information(initial_statement)
+    clarification = "\n".join(clarification_parts) if clarification_parts else None
+    if clarification:
+        redacted = f"{redacted} {redact_personal_information(clarification)}".strip()
+    return RaisedConcern(
+        concern_type=concern_type,
+        initial_statement=initial_statement,
+        clarification=clarification,
+        redacted_text=redacted,
+    )
+
+
+async def _rehydrate_flow_from_store(
+    store: CaseStore,
+    case_id: str,
+    *,
+    composer: QuestionComposer,
+    concern_normaliser: ConcernNormaliser | None,
+) -> InterviewFlow | None:
+    """Rebuild an `InterviewFlow` from a case's own persisted event log
+    instead of starting fresh -- the fix for the documented cold-start bug
+    (LEO-FEEDBACK-UIUX.md §2): a fresh process (no in-memory `InterviewFlow`
+    for this case -- a redeploy, a scale-to-zero cold start, a second
+    instance) used to call `.start()` unconditionally, appending a second,
+    differently-worded "opening" turn on top of what the case already had
+    durably stored, and rendering only that one new turn rather than the
+    full transcript. Returns `None` (caller then does the normal fresh-
+    start path) exactly when this case has no persisted `interview_turn`
+    events yet -- a genuinely new interview must still greet once."""
+    events = await store.list_events(case_id)
+    turn_events = sorted(
+        (e for e in events if e.event_type == "interview_turn"), key=lambda e: e.sequence
+    )
+    if not turn_events:
+        return None
+    transcript = [
+        InterviewTurn(
+            stage=InterviewStage(str(e.payload.get("stage", InterviewStage.OPENING.value))),
+            prompt=str(e.payload.get("message", "")),
+        )
+        for e in turn_events
+    ]
+    grounds = await store.list_grounds(case_id)
+    return InterviewFlow.resume(
+        composer=composer,
+        concern_normaliser=concern_normaliser,
+        transcript=transcript,
+        concerns=_reconstruct_confirmed_concerns(grounds, events),
+        current=_reconstruct_in_progress_concern(turn_events),
+    )
+
+
 async def _sse_event_stream(
     store: CaseStore,
     case_id: str,
@@ -497,10 +647,14 @@ def create_app(
         await _require_case(case_id)
         flow = interview_flows.get(case_id)
         if flow is None:
-            flow = InterviewFlow(composer=composer, concern_normaliser=concern_normaliser)
+            flow = await _rehydrate_flow_from_store(
+                store, case_id, composer=composer, concern_normaliser=concern_normaliser
+            )
+            if flow is None:
+                flow = InterviewFlow(composer=composer, concern_normaliser=concern_normaliser)
+                turn = await flow.start()
+                await _persist_system_turn(store, case_id, turn)
             interview_flows[case_id] = flow
-            turn = await flow.start()
-            await _persist_system_turn(store, case_id, turn)
         return _turn_to_json(flow.transcript[-1], flow.transcript)
 
     @app.post("/api/cases/{case_id}/interview", dependencies=[Depends(_interview_turn_guard)])
@@ -567,7 +721,14 @@ def create_app(
         `content_type`/`filename` aren't tracked by `EvidenceUploadStore`
         itself (`download_document` returns bytes only), so they're read
         back from this same case's own `document_uploaded` event -- the
-        one place that already recorded them at upload time."""
+        one place that already recorded them at upload time. A wave-9
+        full-resolution overlay document (`job.pipeline._store_full_res_
+        overlay`) was never uploaded through that endpoint, so it also
+        checks this case's `annotated_overlay` events for a matching
+        `full_res_document_id`, using that event's own `mime_type` --
+        without this, the browser would receive `application/octet-stream`
+        for a real PNG and download it instead of displaying it inline in
+        the lightbox."""
         await _require_case(case_id)
         content_type = "application/octet-stream"
         for event in await store.list_events(case_id):
@@ -576,6 +737,12 @@ def create_app(
                 and event.payload.get("document_id") == document_id
             ):
                 content_type = str(event.payload.get("content_type") or content_type)
+                break
+            if (
+                event.event_type == "annotated_overlay"
+                and event.payload.get("full_res_document_id") == document_id
+            ):
+                content_type = str(event.payload.get("mime_type") or content_type)
                 break
         try:
             content = await documents.download_document(
@@ -589,6 +756,17 @@ def create_app(
         except DocumentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return Response(content=content, media_type=content_type)
+
+    @app.get("/api/cases/{case_id}/qr.png")
+    async def case_qr_code(case_id: str, request: Request) -> Response:
+        """A QR code encoding this case's own page URL (LEO-FEEDBACK-
+        UIUX.md §1) -- account-free re-access: a resident scans it (e.g.
+        from a printed copy or a second device) to get straight back to
+        their case, no login and nothing server-side beyond the case's own
+        already-unguessable URL."""
+        await _require_case(case_id)
+        case_url = str(request.url_for("case_page", case_id=case_id))
+        return Response(content=_render_qr_png(case_url), media_type="image/png")
 
     @app.post("/api/cases/{case_id}/tribunal", status_code=202)
     async def start_tribunal(case_id: str) -> dict[str, Any]:
@@ -678,6 +856,15 @@ def create_app(
         payload = await _latest_submission_payload(case_id)
         return str(payload.get("refusals_html", ""))
 
+    @app.get("/api/cases/{case_id}/transcript.txt", response_class=PlainTextResponse)
+    async def download_transcript(case_id: str) -> str:
+        """Plain-text export of the full interview transcript (LEO-FEEDBACK-
+        UIUX.md §2) with absolute Australia/Sydney timestamps -- a resident
+        can keep a copy independent of the app."""
+        await _require_case(case_id)
+        events = await store.list_events(case_id)
+        return _render_transcript_text(events)
+
     @app.post("/api/cases/{case_id}/grounds/{ground_id}/feedback")
     async def refusal_feedback(
         case_id: str, ground_id: str, body: RefusalFeedbackRequest
@@ -700,11 +887,21 @@ def create_app(
         }
 
     @app.get("/", response_class=HTMLResponse)
+    async def landing_page(theme: str | None = None) -> str:
+        """The public, unauthenticated home page (LEO-FEEDBACK-UIUX.md §1):
+        no key, no docket content -- a resident starts a new objection here
+        with one DA-number input. `key`/other stray query params are simply
+        ignored rather than gating anything; this route must never 401."""
+        return render_landing_page(force_theme=theme)
+
+    @app.get("/docket", response_class=HTMLResponse)
     async def docket_board(theme: str | None = None, key: str | None = None) -> str:
         if not _docket_key_accepted(key):
             raise HTTPException(
                 status_code=401,
-                detail="This docket board requires a passphrase: GET /?key=<SETBACK_DOCKET_KEY>.",
+                detail=(
+                    "This docket board requires a passphrase: GET /docket?key=<SETBACK_DOCKET_KEY>."
+                ),
             )
         cases: list[tuple[CaseRecord, tuple[GroundRecord, ...]]] = []
         for case in await store.list_cases():
@@ -886,6 +1083,16 @@ def _render_docket_card(
         """
 
 
+_THEME_TOGGLE_BUTTON: Final[str] = (
+    '<button type="button" id="theme-toggle" class="button--secondary" '
+    'aria-label="Toggle light/dark theme">&#9788;/&#9789;</button>'
+)
+"""One shared toggle markup (LEO-FEEDBACK-UIUX.md §8), present in every
+page's header -- `app.js` persists the viewer's choice to `localStorage`,
+overriding system preference, while an explicit `?theme=` query param
+(this page's own `force_theme`) still wins for a single filmed load."""
+
+
 _VALID_FORCE_THEMES: Final[frozenset[str]] = frozenset({"light", "dark"})
 
 
@@ -966,8 +1173,9 @@ def render_docket_board(
 </head>
 <body>
   <header class="topbar">
-    <h1>Setback</h1>
+    <h1><a href="/">Setback</a></h1>
     <p class="tagline">A Collaborative Partner for planning objections</p>
+    <div class="topbar__actions">{_THEME_TOGGLE_BUTTON}</div>
   </header>
   <main class="container">
     <h2>Docket board</h2>
@@ -982,16 +1190,74 @@ def render_docket_board(
 """
 
 
+def _render_qr_png(data: str) -> bytes:
+    """A PNG QR code encoding `data`, via the pure-Python `segno` library
+    (no native deps, no network) -- LEO-FEEDBACK-UIUX.md §1's "server-
+    generated PNG is fine" suggestion."""
+    import io
+
+    buf = io.BytesIO()
+    segno.make(data, error="m").save(buf, kind="png", scale=6, border=2)
+    return buf.getvalue()
+
+
+def render_landing_page(*, force_theme: str | None = None) -> str:
+    """The public, Google/Claude-style home page (LEO-FEEDBACK-UIUX.md §1):
+    product name, caption, ONE highlighted DA-number input that starts a new
+    objection, and the persistent disclaimer footer -- no docket content, no
+    key gate. `app.js`'s `initLandingPage()` (client-side) submits the form
+    via `POST /api/cases`, then redirects to the new case page, and renders
+    a "your previous cases" list read from this browser's own localStorage
+    (nothing server-side -- no cases are listed here by the server)."""
+    return f"""
+<!doctype html>
+{_html_tag(force_theme)}
+<head>
+  <meta charset="utf-8">
+  <title>Setback</title>
+  {_PAGE_STYLE}
+</head>
+<body class="landing">
+  <div class="landing__theme-toggle">{_THEME_TOGGLE_BUTTON}</div>
+  <main class="landing__main">
+    <h1 class="landing__title">Setback</h1>
+    <p class="landing__tagline">A Collaborative Partner for planning objections</p>
+    <form id="start-case-form" class="landing__form">
+      <input id="application-number-input" name="application_number" type="text"
+             placeholder="DA number, e.g. DA2026/0359" autocomplete="off" autofocus
+             aria-label="Development application number">
+      <button type="submit">Start my objection</button>
+    </form>
+    <p id="start-case-error" class="landing__error" role="alert" hidden></p>
+    <section id="previous-cases" class="previous-cases" hidden>
+      <h2>Your previous cases</h2>
+      <ul id="previous-cases-list" class="previous-cases__list"></ul>
+    </section>
+  </main>
+{_DISCLAIMER_FOOTER}
+  <script src="/static/app.js"></script>
+</body>
+</html>
+"""
+
+
 _EVENT_SECTION_TITLES: Mapping[str, str] = {
-    "interview_turn": "Interview transcript",
+    # `interview_turn` (LEO-FEEDBACK-UIUX.md §2), `review_verdict` and
+    # `gate_decision`/`adjudication_decision` (§3) are deliberately absent
+    # here: the interview transcript lives ONLY in the chat pane now (the
+    # standalone "Interview transcript" section was redundant with it), and
+    # a ground's reviewer opinions + gate decision render INSIDE that
+    # ground's own accordion (`_render_ground_card`) instead of three
+    # separate, unlinked flat lists -- see `render_case_page`.
     "document_uploaded": "Evidence",
-    "review_verdict": "Reviewer opinions",
-    "adjudication_decision": "Adjudication",
-    "gate_decision": "Gate decisions",
     "annotated_overlay": "Annotated evidence overlay",
     "resident_refusal_feedback": "Resident feedback on refusals",
     "submission_composed": "Submission documents",
-    "tribunal_requested": "Tribunal",
+    # `tribunal_requested`/`ingest_resolved`/`tribunal_rerun_ignored` are
+    # deliberately absent here (wave 9): they render together as one
+    # merged, chronological "Tribunal" card via `_render_tribunal_section`,
+    # called explicitly from `render_case_page` -- not through this
+    # generic one-type-per-card dispatch (see that function's docstring).
 }
 
 
@@ -1012,49 +1278,54 @@ def _render_review_verdict_item(event: CaseEvent) -> str:
     )
 
 
-def _render_refusal_card_item(
-    event: CaseEvent, grounds_by_id: Mapping[str, GroundRecord], total_grounds: int
-) -> str:
-    """A statutory-gate refusal, framed as rigor rather than apology
-    (UI-SPEC.md §2.9 / copy tone guide §4 rules 4-5): `role="region"`
-    (informational, non-interrupting), warm brown (`--status-refused`) --
-    never `--error`/`role="alert"`, which is reserved for true system
-    failures (founder requirement #4)."""
-    payload = event.payload
-    ground_id = str(payload.get("ground_id", ""))
-    ground = grounds_by_id.get(ground_id)
-    claim = ground.claim if ground is not None else "this ground"
-    explanation = str(payload.get("explanation", ""))
+def _refusal_reassurance(total_grounds: int) -> str:
+    """ "Your other N grounds are unaffected." -- copy tone guide §4 rule 5:
+    a stressed resident's first fear on seeing "Refused" is "did I lose
+    everything," answered in the same sentence."""
     other_count = max(total_grounds - 1, 0)
-    reassurance = ""
-    if other_count > 0:
-        noun = "ground" if other_count == 1 else "grounds"
-        verb = "is" if other_count == 1 else "are"
-        reassurance = f" Your other {other_count} {noun} {verb} unaffected."
-    return (
-        '<li><div class="refusal-card" role="region" aria-label="A ground that was not included">'
-        '<span class="refusal-card__icon" aria-hidden="true">&#9432;</span>'
-        "<div>"
-        '<p class="refusal-card__heading">We didn&rsquo;t include this ground</p>'
-        f'<p class="refusal-card__claim">&ldquo;{_esc(claim)}&rdquo;</p>'
-        f'<p class="refusal-card__reason">{_esc(explanation)}{reassurance}</p>'
-        "</div></div></li>"
-    )
+    if other_count <= 0:
+        return ""
+    noun = "ground" if other_count == 1 else "grounds"
+    verb = "is" if other_count == 1 else "are"
+    return f" Your other {other_count} {noun} {verb} unaffected."
 
 
-def _render_gate_decision_item(
-    event: CaseEvent, grounds_by_id: Mapping[str, GroundRecord], total_grounds: int
+def _render_gate_detail(
+    ground: GroundRecord, gate_decision: Mapping[str, Any], total_grounds: int
 ) -> str:
-    payload = event.payload
-    status = str(payload.get("status", ""))
+    """The gate's ruling on `ground`, rendered INSIDE that ground's own
+    accordion (LEO-FEEDBACK-UIUX.md §3) rather than a separate, unlinked
+    "Gate decisions" list -- and, for a refusal, naming the ground in the
+    heading itself ("We didn't include: <claim>") instead of a generic
+    "We didn't include this ground" a resident would have to cross-reference
+    against a claim shown somewhere else on the page.
+
+    Framed as rigor rather than apology (copy tone guide §4 rules 4-5):
+    `role="region"` (informational, non-interrupting), warm brown
+    (`--status-refused`) -- never `--error`/`role="alert"`, reserved for
+    true system failures (founder requirement #4)."""
+    status = str(gate_decision.get("status", ""))
+    explanation = str(gate_decision.get("explanation") or "")
     if status.startswith("refused"):
-        return _render_refusal_card_item(event, grounds_by_id, total_grounds)
-    return (
-        f'<li class="gate-decision gate-decision--{_esc(status)}">'
-        f"<strong>{_esc(status)}</strong> "
-        f"({_esc(payload.get('statutory_basis', ''))})<br>"
-        f"{_esc(payload.get('explanation', ''))}</li>"
-    )
+        return (
+            '<div class="refusal-card" role="region" aria-label="A ground that was not included">'
+            '<span class="refusal-card__icon" aria-hidden="true">&#9432;</span>'
+            "<div>"
+            f'<p class="refusal-card__heading">We didn&rsquo;t include: {_esc(ground.claim)}</p>'
+            f'<p class="refusal-card__reason">'
+            f"{_esc(explanation)}{_refusal_reassurance(total_grounds)}</p>"
+            "</div></div>"
+        )
+    basis = str(gate_decision.get("statutory_basis") or "")
+    parts: list[str] = []
+    if basis:
+        parts.append(
+            '<p class="ground-card__basis">Statutory basis: '
+            f'<span class="citation-chip citation-chip--clause">{_esc(basis)}</span></p>'
+        )
+    if explanation:
+        parts.append(f'<p class="ground-card__explanation">{_esc(explanation)}</p>')
+    return "".join(parts)
 
 
 def _render_doc_viewer_legend() -> str:
@@ -1078,40 +1349,102 @@ def _render_doc_viewer_legend() -> str:
     return f'<div class="doc-viewer__legend">{items}</div>'
 
 
-def _render_annotated_overlay_item(event: CaseEvent) -> str:
+def _render_annotated_overlay_item(case_id: str, event: CaseEvent) -> str:
+    """Wave 9 (LEO-FEEDBACK-UIUX.md §5): when `job.pipeline` recorded a
+    `full_res_document_id` (the pre-shrink image, durably stored via
+    `EvidenceUploadStore` -- see that module's `_store_full_res_overlay`),
+    the `<img>` carries a `data-full-res-src` pointing at this case's own
+    `GET /api/cases/{case_id}/documents/{document_id}` route, which
+    `app.js`'s lightbox (`wireOverlayLightbox`) opens instead of
+    re-displaying the shrunk, embedded copy bigger. Absent for an overlay
+    event recorded before this fix landed (an append-only log is never
+    rewritten) -- degrades to the shrunk copy exactly as before."""
     payload = event.payload
     mime_type = _esc(payload.get("mime_type", "image/png"))
     image_base64 = _esc(payload.get("image_base64", ""))
     document_id = payload.get("document_id")
     doc_id_attr = f' data-doc-id="{_esc(document_id)}"' if document_id else ""
+    full_res_document_id = payload.get("full_res_document_id")
+    full_res_attr = (
+        f' data-full-res-src="/api/cases/{_esc(case_id)}/documents/{_esc(full_res_document_id)}"'
+        if full_res_document_id
+        else ""
+    )
     return (
         '<li class="annotated-overlay"><div class="doc-viewer">'
         '<div class="doc-viewer__stage">'
         f'<img src="data:{mime_type};base64,{image_base64}" '
-        f'alt="Annotated evidence overlay"{doc_id_attr}>'
+        f'alt="Annotated evidence overlay"{doc_id_attr}{full_res_attr}>'
         "</div>"
         f"{_render_doc_viewer_legend()}"
         "</div></li>"
     )
 
 
+_MAX_MAILTO_BODY_CHARS: Final[int] = 1800
+"""A conservative cap keeping the composed `mailto:` URL well under the
+~2000-character limit some mail clients/browsers silently truncate at --
+long enough for most objection letters in full, with an honest truncation
+note (never a silently cut-off letter) when one runs longer."""
+
+
+def _mailto_href(*, subject: str, body: str) -> str:
+    """A `mailto:` link with a prefilled subject/body (LEO-FEEDBACK-
+    UIUX.md §6) -- no email is ever sent server-side; this only opens the
+    resident's own mail client with the text already filled in."""
+    truncated = len(body) > _MAX_MAILTO_BODY_CHARS
+    text = body[:_MAX_MAILTO_BODY_CHARS]
+    if truncated:
+        text += "\n\n[...continues -- use “Copy text” for the full letter]"
+    return f"mailto:?subject={_urlquote(subject)}&body={_urlquote(text)}"
+
+
+def _render_document_actions(
+    *, label: str, markdown_text: str, html_download_href: str, textarea_id: str
+) -> str:
+    """The shared actions row for a composed document (LEO-FEEDBACK-
+    UIUX.md §6): **Copy text** (plain text to clipboard, via `app.js`
+    reading the paired hidden `<textarea>`) and **Email this** (`mailto:`,
+    prefilled) as the two primary actions; the HTML download stays as a
+    secondary link. The Markdown download is deliberately not linked here
+    at all -- residents don't know what a `.md` file is -- though the
+    `.md` API route itself is untouched for anyone who wants it directly."""
+    mailto = _mailto_href(subject=f"My {label.lower()}", body=markdown_text)
+    return f"""
+      <textarea class="visually-hidden" id="{_esc(textarea_id)}"
+                aria-hidden="true" tabindex="-1" readonly>{_esc(markdown_text)}</textarea>
+      <p class="document-actions">
+        <button type="button" class="button--secondary copy-text-button"
+                data-copy-source="{_esc(textarea_id)}">Copy text</button>
+        <a class="button--secondary" href="{_esc(mailto)}">Email this</a>
+        <a class="document-downloads__html" href="{_esc(html_download_href)}">Download HTML</a>
+      </p>
+    """
+
+
 def _render_submission_composed_item(case_id: str, event: CaseEvent) -> str:
     submission_html = str(event.payload.get("submission_html", ""))
+    submission_markdown = str(event.payload.get("submission_markdown", ""))
     refusals_html = str(event.payload.get("refusals_html", ""))
+    refusals_markdown = str(event.payload.get("refusals_markdown", ""))
     base = f"/api/cases/{_esc(case_id)}"
+    submission_actions = _render_document_actions(
+        label="objection submission",
+        markdown_text=submission_markdown,
+        html_download_href=f"{base}/submission.html",
+        textarea_id=f"submission-text-{event.sequence}",
+    )
+    refusals_actions = _render_document_actions(
+        label="refusals explainer",
+        markdown_text=refusals_markdown,
+        html_download_href=f"{base}/refusals.html",
+        textarea_id=f"refusals-text-{event.sequence}",
+    )
     return f"""<li class="submission-package">
       <div class="document-preview">{submission_html}</div>
-      <p class="document-downloads">
-        <a href="{base}/submission.md" download>Download submission (.md)</a>
-        &middot;
-        <a href="{base}/submission.html" download>Download submission (.html)</a>
-      </p>
+      {submission_actions}
       <div class="document-preview">{refusals_html}</div>
-      <p class="document-downloads">
-        <a href="{base}/refusals.md" download>Download refusals explainer (.md)</a>
-        &middot;
-        <a href="{base}/refusals.html" download>Download refusals explainer (.html)</a>
-      </p>
+      {refusals_actions}
     </li>"""
 
 
@@ -1140,11 +1473,63 @@ def _humanize_filename(filename: str) -> str:
     return " ".join([first.capitalize(), *(w.lower() for w in rest)])
 
 
+_SYDNEY_TZ: Final = ZoneInfo("Australia/Sydney")
+"""Every timestamp shown to a resident renders in this timezone, converted
+from whatever tz-aware `datetime` was actually stored (UTC in production,
+`state.firestore._utcnow`) -- LEO-FEEDBACK-UIUX.md §7: timestamps
+previously rendered a bare `dt.hour`/`dt.minute` as if the stored UTC value
+were already local Sydney time, silently wrong by up to 11 hours."""
+
+
+def _to_sydney(dt: datetime) -> datetime:
+    aware = dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+    return aware.astimezone(_SYDNEY_TZ)
+
+
 def _format_clock_time(dt: datetime) -> str:
-    """`"2:14pm"`, not an ISO timestamp (copy tone guide §4 rule 2)."""
-    hour = dt.hour % 12 or 12
-    period = "am" if dt.hour < 12 else "pm"
-    return f"{hour}:{dt.minute:02d}{period}"
+    """`"2:14pm"` in Australia/Sydney time -- not an ISO timestamp (copy
+    tone guide §4 rule 2), and not the stored UTC clock time read verbatim
+    (the bug this fixes)."""
+    sydney = _to_sydney(dt)
+    hour = sydney.hour % 12 or 12
+    period = "am" if sydney.hour < 12 else "pm"
+    return f"{hour}:{sydney.minute:02d}{period}"
+
+
+def _transcript_line(event: CaseEvent) -> str:
+    role = str(event.payload.get("role", "system"))
+    speaker = "You" if role == "resident" else "Setback"
+    message = str(event.payload.get("message", ""))
+    return f"{speaker}  {_format_sydney_export_timestamp(event.recorded_at)}  {message}"
+
+
+def _render_transcript_text(events: Sequence[CaseEvent]) -> str:
+    """Plain-text lines like `"Setback  2026-08-29 19:42 AEST  <message>"`
+    (LEO-FEEDBACK-UIUX.md §2's exact format) for `GET /transcript.txt`."""
+    turn_events = sorted(
+        (e for e in events if e.event_type == "interview_turn"), key=lambda e: e.sequence
+    )
+    if not turn_events:
+        return ""
+    return "\n".join(_transcript_line(e) for e in turn_events) + "\n"
+
+
+def _format_sydney_export_timestamp(dt: datetime) -> str:
+    """`"2026-08-29 19:42 AEST"` -- the literal export-transcript line
+    format (LEO-FEEDBACK-UIUX.md §2), distinct from `_format_sydney_
+    timestamp`'s human "29 Aug 2026, 7:42pm" prose form used elsewhere on
+    the page."""
+    sydney = _to_sydney(dt)
+    return f"{sydney.strftime('%Y-%m-%d %H:%M')} {sydney.tzname()}"
+
+
+def _format_sydney_timestamp(dt: datetime) -> str:
+    """An absolute Australia/Sydney date+time, e.g. `"29 Aug 2026, 7:42pm
+    AEST"` -- LEO-FEEDBACK-UIUX.md §7's "with the date" requirement, used
+    wherever a tribunal/event timestamp needs to be unambiguous rather than
+    just a same-day clock time (`_format_clock_time`)."""
+    sydney = _to_sydney(dt)
+    return f"{sydney.day} {sydney.strftime('%b %Y')}, {_format_clock_time(dt)} {sydney.tzname()}"
 
 
 def _is_photo_upload(filename: str, content_type: object) -> bool:
@@ -1185,44 +1570,31 @@ def _render_document_uploaded_item(case_id: str, event: CaseEvent) -> str:
             '<span class="tag tag--grade-a" title="Provenance grade A -- your own photo">'
             "Your photo</span>"
         )
-    if is_photo and document_id:
-        doc_url = f"/api/cases/{_esc(case_id)}/documents/{_esc(document_id)}"
+    doc_url = f"/api/cases/{_esc(case_id)}/documents/{_esc(document_id)}" if document_id else None
+    if is_photo and doc_url:
         thumb = f'<img class="doc-card__thumb" src="{doc_url}" alt="{_esc(title)}">'
     else:
         thumb = '<div class="doc-card__thumb doc-card__thumb--placeholder"></div>'
-    return (
-        '<li><div class="doc-card">'
+    card_body = (
         f"{thumb}"
         '<div class="doc-card__body">'
         f'<p class="doc-card__title">{_esc(title)}</p>'
         f'<p class="doc-card__meta">{_esc(kind_label)} &middot; uploaded {_esc(uploaded_at)}</p>'
         "</div>"
         f"{grade_badge}"
-        "</div></li>"
     )
-
-
-def _render_interview_turn_item(_case_id: str, event: CaseEvent) -> str:
-    """The server-rendered twin of `app.js`'s client-side chat bubble
-    (UI-SPEC.md §2.1/§3.4) -- both must look identical, since they show the
-    same transcript on the same page."""
-    payload = event.payload
-    role = str(payload.get("role", "system"))
-    message = str(payload.get("message", ""))
-    if role == "resident":
-        bubble = (
-            '<div class="chat-turn chat-turn--resident">'
-            f'<p class="chat-turn__text">{_esc(message)}</p>'
-            "</div>"
+    # LEO-FEEDBACK-UIUX.md §4: a doc-card must open the full image/PDF in a
+    # new tab -- previously inert ("I cannot do anything with that"). Every
+    # uploaded document (photo or PDF) is already servable at `doc_url`, so
+    # this needs no new storage or preview pipeline, only a real link.
+    if doc_url is not None:
+        card = (
+            f'<a class="doc-card doc-card--clickable" href="{doc_url}" '
+            f'target="_blank" rel="noopener">{card_body}</a>'
         )
     else:
-        bubble = (
-            '<div class="chat-turn chat-turn--ai">'
-            '<span class="chat-turn__label">Setback</span>'
-            f'<p class="chat-turn__text">{_esc(message)}</p>'
-            "</div>"
-        )
-    return f"<li>{bubble}</li>"
+        card = f'<div class="doc-card">{card_body}</div>'
+    return f"<li>{card}</li>"
 
 
 def _render_tribunal_requested_item(event: CaseEvent) -> str:
@@ -1232,8 +1604,72 @@ def _render_tribunal_requested_item(event: CaseEvent) -> str:
     show beyond that. Found live on the deployed console rendering as a
     bare `{}` before this fix (fallthrough to the raw-JSON branch below),
     violating founder requirement #3."""
-    started_at = _format_clock_time(event.recorded_at)
-    return f'<li class="tribunal-event">Tribunal run started at {_esc(started_at)}.</li>'
+    started_at = _format_sydney_timestamp(event.recorded_at)
+    return f'<li class="tribunal-event">Tribunal run started {_esc(started_at)}.</li>'
+
+
+def _render_ingest_resolved_item(event: CaseEvent) -> str:
+    """`job.pipeline.RealPipelineRunner.run`'s `ingest_resolved` event
+    (wave 9's un-frozen ingest) -- plain-English handoff for whoever owns
+    `console/app.py`, per the fixer's cross-lane note: this must never fall
+    through to the raw-JSON branch, and a resident whose typed DA number
+    could not be resolved live deserves to know their submission is using
+    the demo case's letterhead instead, not silently guess why."""
+    payload = event.payload
+    application_number = str(payload.get("application_number", ""))
+    if payload.get("used_demo_fixture"):
+        council_number = str(payload.get("council_application_number", ""))
+        return (
+            '<li class="tribunal-event">Could not fetch '
+            f"{_esc(application_number)} live; showing the demo case "
+            f"({_esc(council_number)}) instead.</li>"
+        )
+    return (
+        f'<li class="tribunal-event">Fetched live council data for {_esc(application_number)}.</li>'
+    )
+
+
+def _render_tribunal_rerun_ignored_item(event: CaseEvent) -> str:
+    """`job.pipeline.RealPipelineRunner.run`'s idempotency guard (SMOKE.md's
+    "Fix 4"): a judge pressing "Start tribunal" a second time against an
+    already-decided case makes no changes -- told here in plain English
+    rather than dropped or raw-JSON-dumped."""
+    return (
+        '<li class="tribunal-event">This case&rsquo;s tribunal has already '
+        "run &mdash; nothing further happened.</li>"
+    )
+
+
+_TRIBUNAL_SECTION_EVENT_TYPES: Final[tuple[str, ...]] = (
+    "ingest_resolved",
+    "tribunal_requested",
+    "tribunal_rerun_ignored",
+)
+"""Every event type the merged "Tribunal" section (`_render_tribunal_
+section`) draws from, combined into one chronological list rather than one
+same-titled card per type -- `ground_rerun_skipped` is deliberately absent
+(an internal resume-safety signal with no resident-facing value, per the
+fixer's own cross-lane note)."""
+
+
+def _render_tribunal_section(case_id: str, events: Sequence[CaseEvent]) -> str:
+    """The merged "Tribunal" card: `ingest_resolved`, `tribunal_requested`,
+    and `tribunal_rerun_ignored` events, interleaved in the order they
+    actually happened (`event.sequence`) rather than split across three
+    separate same-titled cards."""
+    renderers: Mapping[str, Callable[[CaseEvent], str]] = {
+        "ingest_resolved": _render_ingest_resolved_item,
+        "tribunal_requested": _render_tribunal_requested_item,
+        "tribunal_rerun_ignored": _render_tribunal_rerun_ignored_item,
+    }
+    relevant = sorted((e for e in events if e.event_type in renderers), key=lambda e: e.sequence)
+    if not relevant:
+        return (
+            '<section class="card" id="tribunal"><h3>Tribunal</h3>'
+            '<p class="empty">Nothing yet.</p></section>'
+        )
+    items = "".join(renderers[e.event_type](e) for e in relevant)
+    return f'<section class="card" id="tribunal"><h3>Tribunal</h3><ul class="event-list">{items}</ul></section>'  # noqa: E501
 
 
 _ADJUDICATION_STANCE_LABELS: Mapping[str, str] = {
@@ -1279,28 +1715,30 @@ def _render_resident_refusal_feedback_item(event: CaseEvent) -> str:
 
 
 _EVENT_ITEM_RENDERERS: Mapping[str, Callable[[str, CaseEvent], str]] = {
-    "review_verdict": lambda _case_id, e: _render_review_verdict_item(e),
-    "annotated_overlay": lambda _case_id, e: _render_annotated_overlay_item(e),
+    "annotated_overlay": _render_annotated_overlay_item,
     "submission_composed": _render_submission_composed_item,
     "document_uploaded": _render_document_uploaded_item,
-    "interview_turn": _render_interview_turn_item,
-    "tribunal_requested": lambda _case_id, e: _render_tribunal_requested_item(e),
-    "adjudication_decision": lambda _case_id, e: _render_adjudication_decision_item(e),
     "resident_refusal_feedback": lambda _case_id, e: _render_resident_refusal_feedback_item(e),
 }
-"""Event types rendered via the `(case_id, event) -> html` shape. `gate_
-decision` is deliberately absent -- it needs the case's full grounds list
-(to name a refused ground's claim and count its unaffected siblings), so
-it is rendered by `_render_gate_decisions_section` instead, called
-directly from `render_case_page`."""
+"""Event types rendered via the `(case_id, event) -> html` shape, one flat
+list section apiece. `interview_turn`, `review_verdict`, `adjudication_
+decision`, and `gate_decision` are deliberately absent -- the interview
+transcript lives only in the chat pane now, and the other three render
+INSIDE each ground's own accordion (`_render_ground_card`, called from
+`_render_grounds_section`) rather than as separate, unlinked flat lists --
+see `render_case_page`."""
 
 
 def _render_events_section(
     case_id: str, event_type: str, title: str, events: Sequence[CaseEvent]
 ) -> str:
+    id_attr = ""
+    anchor_id = _SECTION_ANCHOR_IDS.get(event_type)
+    if anchor_id is not None:
+        id_attr = f' id="{_esc(anchor_id)}"'
     if not events:
         return (
-            f'<section class="card"><h3>{_esc(title)}</h3>'
+            f'<section class="card"{id_attr}><h3>{_esc(title)}</h3>'
             '<p class="empty">Nothing yet.</p></section>'
         )
     renderer = _EVENT_ITEM_RENDERERS.get(event_type)
@@ -1313,22 +1751,8 @@ def _render_events_section(
             for e in events
         )
     return (
-        f'<section class="card"><h3>{_esc(title)}</h3><ul class="event-list">{items}</ul></section>'
-    )
-
-
-def _render_gate_decisions_section(
-    events: Sequence[CaseEvent], grounds_by_id: Mapping[str, GroundRecord], total_grounds: int
-) -> str:
-    title = _EVENT_SECTION_TITLES["gate_decision"]
-    if not events:
-        return (
-            f'<section class="card"><h3>{_esc(title)}</h3>'
-            '<p class="empty">Nothing yet.</p></section>'
-        )
-    items = "".join(_render_gate_decision_item(e, grounds_by_id, total_grounds) for e in events)
-    return (
-        f'<section class="card"><h3>{_esc(title)}</h3><ul class="event-list">{items}</ul></section>'
+        f'<section class="card"{id_attr}><h3>{_esc(title)}</h3>'
+        f'<ul class="event-list">{items}</ul></section>'
     )
 
 
@@ -1345,45 +1769,72 @@ _GROUND_STATUS_MODIFIER_AND_LABEL: Mapping[GroundStatus, tuple[str, str]] = {
 }
 
 
-def _render_ground_card(ground: GroundRecord, gate_decision: Mapping[str, Any] | None) -> str:
+def _render_ground_card(
+    ground: GroundRecord,
+    gate_decision: Mapping[str, Any] | None,
+    review_verdicts: Sequence[CaseEvent],
+    adjudication: CaseEvent | None,
+    total_grounds: int,
+) -> str:
+    """One ground as an accordion (LEO-FEEDBACK-UIUX.md §3): a clamped
+    one-liner of the resident's own words + a status pill, always visible;
+    the statutory basis/explanation, the reviewers' opinions, and (for a
+    refusal) the gate's ground-naming refusal card all live inside the
+    `<details>` body, collapsed by default. Native `<details>`/`<summary>`
+    -- no JS needed for the expand/collapse itself, and it's keyboard- and
+    screen-reader-accessible for free."""
     modifier, label = _GROUND_STATUS_MODIFIER_AND_LABEL[ground.status]
-    basis_html = ""
-    explanation_html = ""
+    detail_html = ""
     if gate_decision is not None:
-        basis = str(gate_decision.get("statutory_basis") or "")
-        if basis:
-            basis_html = (
-                '<p class="ground-card__basis">Statutory basis: '
-                f'<span class="citation-chip citation-chip--clause">{_esc(basis)}</span></p>'
-            )
-        explanation = str(gate_decision.get("explanation") or "")
-        if explanation:
-            explanation_html = f'<p class="ground-card__explanation">{_esc(explanation)}</p>'
+        detail_html += _render_gate_detail(ground, gate_decision, total_grounds)
+    opinions_html = "".join(_render_review_verdict_item(e) for e in review_verdicts)
+    if adjudication is not None:
+        opinions_html += _render_adjudication_decision_item(adjudication)
+    if opinions_html:
+        detail_html += (
+            '<div class="ground-card__opinions"><h5>What the reviewers said</h5>'
+            f'<ul class="event-list">{opinions_html}</ul></div>'
+        )
+    if not detail_html:
+        detail_html = '<p class="empty">Still under review.</p>'
     return (
         f'<li class="ground-card ground-card--{modifier}">'
-        '<div class="ground-card__stripe" aria-hidden="true"></div>'
-        '<div class="ground-card__body">'
-        '<div class="ground-card__head">'
-        f'<h4 class="ground-card__claim">{_esc(ground.claim)}</h4>'
+        '<details class="ground-card__accordion">'
+        '<summary class="ground-card__summary">'
+        f'<span class="ground-card__claim">{_esc(ground.claim)}</span>'
         f'<span class="tag tag--{modifier}">{_esc(label)}</span>'
-        "</div>"
-        f"{basis_html}{explanation_html}"
-        "</div></li>"
+        "</summary>"
+        f'<div class="ground-card__body">{detail_html}</div>'
+        "</details></li>"
     )
 
 
 def _render_grounds_section(
-    grounds: Sequence[GroundRecord], gate_decisions_by_ground: Mapping[str, Mapping[str, Any]]
+    grounds: Sequence[GroundRecord],
+    gate_decisions_by_ground: Mapping[str, Mapping[str, Any]],
+    review_verdicts_by_ground: Mapping[str, Sequence[CaseEvent]],
+    adjudication_by_ground: Mapping[str, CaseEvent],
 ) -> str:
     if not grounds:
         return (
-            '<section class="card"><h3>Grounds</h3>'
+            '<section class="card" id="grounds"><h3>Grounds</h3>'
             '<p class="empty">No grounds proposed yet.</p></section>'
         )
+    total_grounds = len(grounds)
     items = "".join(
-        _render_ground_card(g, gate_decisions_by_ground.get(g.ground_id)) for g in grounds
+        _render_ground_card(
+            g,
+            gate_decisions_by_ground.get(g.ground_id),
+            review_verdicts_by_ground.get(g.ground_id, ()),
+            adjudication_by_ground.get(g.ground_id),
+            total_grounds,
+        )
+        for g in grounds
     )
-    return f'<section class="card"><h3>Grounds</h3><ul class="ground-list">{items}</ul></section>'
+    return (
+        '<section class="card" id="grounds"><h3>Grounds</h3>'
+        f'<ul class="ground-list">{items}</ul></section>'
+    )
 
 
 def _render_check_answers_section(
@@ -1419,6 +1870,56 @@ def _render_check_answers_section(
     """
 
 
+def _tribunal_button_state(events: Sequence[CaseEvent]) -> tuple[bool, str]:
+    """`(disabled, label)` for the "Start tribunal" button (LEO-FEEDBACK-
+    UIUX.md §7): un-crashable-by-construction on the UI side -- disabled
+    with an honest label once a submission has already been composed
+    (re-running against an already-adjudicated case is the known job-side
+    crash, SMOKE.md's "Fix 4 -- not fixed", out of this lane's files) or
+    while a run is genuinely in flight; enabled again after a failed
+    attempt so a resident isn't locked out by a transient error."""
+    if any(e.event_type == "submission_composed" for e in events):
+        return True, "Tribunal complete"
+    start_sequence = max(
+        (e.sequence for e in events if e.event_type == "tribunal_requested"), default=None
+    )
+    if start_sequence is None:
+        return False, "Start tribunal"
+    terminal_sequence = max(
+        (e.sequence for e in events if e.event_type in ("submission_composed", "job_failed")),
+        default=None,
+    )
+    if terminal_sequence is None or terminal_sequence < start_sequence:
+        return True, "Tribunal running…"
+    return False, "Start tribunal"
+
+
+_SECTION_NAV_LINKS: Final[tuple[tuple[str, str], ...]] = (
+    ("grounds", "Grounds"),
+    ("evidence", "Evidence"),
+    ("overlay", "Overlay"),
+    ("documents", "Documents"),
+    ("tribunal", "Tribunal"),
+)
+"""In-page anchors for the right pane's sticky nav (LEO-FEEDBACK-UIUX.md
+§9) -- reduces scroll fatigue across the merged post-accordion section
+set (Grounds, Evidence, Annotated overlay, Documents, Tribunal & cost)."""
+
+_SECTION_ANCHOR_IDS: Mapping[str, str] = {
+    "document_uploaded": "evidence",
+    "annotated_overlay": "overlay",
+    "submission_composed": "documents",
+    # "tribunal" is no longer looked up here -- `_render_tribunal_section`
+    # hardcodes its own `id="tribunal"` since it is called explicitly
+    # rather than through the generic per-event-type dispatch loop.
+}
+
+
+def _render_section_nav() -> str:
+    links = "".join(f'<a href="#{aid}">{_esc(label)}</a>' for aid, label in _SECTION_NAV_LINKS)
+    return f'<nav class="section-nav" aria-label="Jump to a section">{links}</nav>'
+
+
 def render_case_page(
     case: CaseRecord,
     grounds: Sequence[GroundRecord],
@@ -1448,23 +1949,28 @@ def render_case_page(
     for event in events:
         by_type.setdefault(event.event_type, []).append(event)
 
-    grounds_by_id = {g.ground_id: g for g in grounds}
-    total_grounds = len(grounds)
-    gate_decision_events = by_type.get("gate_decision", ())
     gate_decisions_by_ground: dict[str, Mapping[str, Any]] = {
-        str(e.payload.get("ground_id", "")): e.payload for e in gate_decision_events
+        str(e.payload.get("ground_id", "")): e.payload for e in by_type.get("gate_decision", ())
+    }
+    review_verdicts_by_ground: dict[str, list[CaseEvent]] = {}
+    for e in by_type.get("review_verdict", ()):
+        review_verdicts_by_ground.setdefault(str(e.payload.get("ground_id", "")), []).append(e)
+    adjudication_by_ground: dict[str, CaseEvent] = {
+        str(e.payload.get("ground_id", "")): e for e in by_type.get("adjudication_decision", ())
     }
 
     sections = "".join(
-        _render_gate_decisions_section(gate_decision_events, grounds_by_id, total_grounds)
-        if event_type == "gate_decision"
-        else _render_events_section(case.case_id, event_type, title, by_type.get(event_type, ()))
+        _render_events_section(case.case_id, event_type, title, by_type.get(event_type, ()))
         for event_type, title in _EVENT_SECTION_TITLES.items()
+    ) + _render_tribunal_section(case.case_id, events)
+    grounds_section = _render_grounds_section(
+        grounds, gate_decisions_by_ground, review_verdicts_by_ground, adjudication_by_ground
     )
-    grounds_section = _render_grounds_section(grounds, gate_decisions_by_ground)
     check_answers_section = _render_check_answers_section(grounds, events)
     last_sequence = max((e.sequence for e in events), default=-1)
     run_cost_usd = ledger.total_cost_usd if ledger is not None else 0.0
+    tribunal_disabled, tribunal_label = _tribunal_button_state(events)
+    tribunal_disabled_attr = " disabled" if tribunal_disabled else ""
 
     return f"""
 <!doctype html>
@@ -1477,27 +1983,47 @@ def render_case_page(
 <body data-case-id="{_esc(case.case_id)}" data-last-sequence="{last_sequence}"
       data-run-cost-usd="{run_cost_usd:.6f}">
   <header class="topbar">
-    <h1>Setback</h1>
+    <h1><a href="/">Setback</a></h1>
     <p class="tagline">Case {_esc(case.application_number)} &middot; {_esc(case.case_id)}</p>
+    <div class="case-actions">
+      <button type="button" id="copy-link-button" class="button--secondary"
+              data-case-path="/cases/{_esc(case.case_id)}">Copy link</button>
+      <img class="case-actions__qr" src="/api/cases/{_esc(case.case_id)}/qr.png"
+           alt="QR code linking back to this case" width="72" height="72" loading="lazy">
+      {_THEME_TOGGLE_BUTTON}
+    </div>
   </header>
-  <main class="container case-page">
-    <section class="card chat-card">
-      <h3>Collaborative Partner</h3>
-      <div id="interview-transcript" class="chat-transcript"></div>
-      <form id="interview-form" class="chat-form">
-        <input id="interview-input" type="text" placeholder="Type your answer..."
-               autocomplete="off">
-        <button type="submit">Send</button>
-      </form>
-      <form id="upload-form" class="upload-form">
-        <input id="upload-input" type="file" accept="image/*,application/pdf">
-        <button type="submit">Upload photo/document</button>
-      </form>
-      <button id="start-tribunal" type="button">Start tribunal</button>
-    </section>
-    {check_answers_section}
-    {grounds_section}
-    {sections}
+  <main class="case-layout">
+    <aside class="case-layout__chat">
+      <section class="card chat-card">
+        <h3>Collaborative Partner</h3>
+        <div id="interview-transcript" class="chat-transcript" aria-live="polite"></div>
+        <div id="typing-indicator" class="typing-indicator" hidden aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <form id="interview-form" class="chat-form">
+          <input id="interview-input" type="text" placeholder="Type your answer..."
+                 autocomplete="off">
+          <button type="submit">Send</button>
+        </form>
+        <form id="upload-form" class="upload-form">
+          <input id="upload-input" type="file" accept="image/*,application/pdf">
+          <button type="submit">Upload photo/document</button>
+        </form>
+        <button id="start-tribunal" type="button"
+                data-idle-label="Start tribunal"{tribunal_disabled_attr}>
+          {_esc(tribunal_label)}
+        </button>
+        <a class="chat-card__export" href="/api/cases/{_esc(case.case_id)}/transcript.txt"
+           download>Export transcript</a>
+      </section>
+    </aside>
+    <div class="case-layout__sections">
+      {_render_section_nav()}
+      {check_answers_section}
+      {grounds_section}
+      {sections}
+    </div>
   </main>
 {_DISCLAIMER_FOOTER}
   <script src="/static/app.js"></script>

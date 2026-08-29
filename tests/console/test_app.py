@@ -133,6 +133,110 @@ def test_get_interview_is_idempotent_across_reconnects(
     assert len(response.json()["turns"]) == 1
 
 
+# --- get_interview persisted-transcript resume (LEO-FEEDBACK-UIUX.md §2) ---
+# A cold Cloud Run instance has no in-memory `InterviewFlow` for an
+# already-started case -- `get_interview` used to call `flow.start()`
+# unconditionally in that situation, appending a second, differently-worded
+# "opening" turn on top of what was already durably persisted. These tests
+# model that exact scenario: a *second*, fresh `create_app` over the *same*
+# store (mirroring `test_docket_board_survives_a_fresh_app_instance_over_
+# the_same_store`), simulating the instance loss directly rather than
+# reaching into the first app's private `interview_flows` dict.
+
+
+def test_get_interview_after_a_fresh_instance_does_not_re_greet(
+    store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
+) -> None:
+    first_app = create_app(
+        store,
+        composer=composer,
+        document_source=UserUploadedDocumentSource(),
+        job_trigger=job_trigger,
+    )
+    first_client = TestClient(first_app)
+    case_id = _create_case(first_client)
+    first_client.get(f"/api/cases/{case_id}/interview")
+    first_client.post(
+        f"/api/cases/{case_id}/interview", json={"answer": "It overshadows my garden."}
+    )
+    persisted_turn_count = len(
+        [e for e in asyncio.run(store.list_events(case_id)) if e.event_type == "interview_turn"]
+    )
+
+    second_app = create_app(
+        store,
+        composer=composer,
+        document_source=UserUploadedDocumentSource(),
+        job_trigger=job_trigger,
+    )
+    second_client = TestClient(second_app)
+    response = second_client.get(f"/api/cases/{case_id}/interview")
+    assert response.status_code == 200
+    body = response.json()
+
+    # No duplicate opening turn was appended -- the persisted event count
+    # (system + resident turns) is unchanged, and the reconstructed
+    # transcript matches it exactly.
+    turn_events_after = [
+        e for e in asyncio.run(store.list_events(case_id)) if e.event_type == "interview_turn"
+    ]
+    assert len(turn_events_after) == persisted_turn_count
+    assert len(body["turns"]) == persisted_turn_count
+    assert body["stage"] == "clarifying"
+    # The full persisted transcript renders, not just the latest turn.
+    assert any("overshadows my garden" in t["prompt"] for t in body["turns"])
+
+
+def test_get_interview_after_a_fresh_instance_can_still_advance(
+    store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
+) -> None:
+    """Proves the rehydrated flow isn't just render-only -- a resident can
+    keep answering after a cold start mid-concern, with the state machine
+    landing on the correct next stage exactly as an uninterrupted session
+    would."""
+    first_app = create_app(
+        store,
+        composer=composer,
+        document_source=UserUploadedDocumentSource(),
+        job_trigger=job_trigger,
+    )
+    first_client = TestClient(first_app)
+    case_id = _create_case(first_client)
+    first_client.get(f"/api/cases/{case_id}/interview")
+    first_client.post(
+        f"/api/cases/{case_id}/interview", json={"answer": "It overshadows my garden."}
+    )
+
+    second_app = create_app(
+        store,
+        composer=composer,
+        document_source=UserUploadedDocumentSource(),
+        job_trigger=job_trigger,
+    )
+    second_client = TestClient(second_app)
+    second_client.get(f"/api/cases/{case_id}/interview")
+    response = second_client.post(
+        f"/api/cases/{case_id}/interview", json={"answer": "Loses sun in winter afternoons."}
+    )
+    assert response.status_code == 200
+    assert response.json()["stage"] == "requesting_evidence"
+
+
+def test_get_interview_still_greets_fresh_when_no_transcript_exists_yet(
+    store: InMemoryCaseStore, composer: _FakeComposer
+) -> None:
+    """Baseline preserved: a genuinely brand-new case still greets exactly
+    once, whether or not this is the first app instance to see it."""
+    app_a = create_app(store, composer=composer, document_source=UserUploadedDocumentSource())
+    case_id = _create_case(TestClient(app_a))
+
+    app_b = create_app(store, composer=composer, document_source=UserUploadedDocumentSource())
+    response = TestClient(app_b).get(f"/api/cases/{case_id}/interview")
+    body = response.json()
+    assert body["stage"] == "opening"
+    assert len(body["turns"]) == 1
+
+
 def test_interview_unknown_case_is_404(client: TestClient) -> None:
     response = client.get("/api/cases/does-not-exist/interview")
     assert response.status_code == 404
@@ -512,11 +616,70 @@ def test_refusal_feedback_unknown_case_is_404(client: TestClient) -> None:
 _REAL_SESSION_2 = "22222222-2222-4222-8222-222222222222"
 
 
+# --- landing page (LEO-FEEDBACK-UIUX.md §1): PUBLIC, no key, docket moved to /docket ---
+
+
+def test_root_is_public_and_never_401s_even_with_a_docket_key_configured(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SETBACK_DOCKET_KEY", "let-me-in")
+    response = client.get("/")
+    assert response.status_code == 200
+
+
+def test_theme_toggle_present_on_landing_docket_and_case_pages(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LEO-FEEDBACK-UIUX.md §8: the same toggle markup everywhere, so
+    `app.js`'s one `#theme-toggle` handler wires up on every page."""
+    monkeypatch.delenv("SETBACK_DOCKET_KEY", raising=False)
+    case_id = _create_case(client)
+    for path in ("/", "/docket", f"/cases/{case_id}"):
+        response = client.get(path)
+        assert 'id="theme-toggle"' in response.text, path
+
+
+def test_root_renders_the_minimal_landing_page(client: TestClient) -> None:
+    response = client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    assert "Setback" in body
+    assert "A Collaborative Partner for planning objections" in body
+    assert "<form" in body
+    assert 'name="application_number"' in body
+    assert 'class="disclaimer-footer"' in body
+
+
+def test_root_carries_no_docket_content(client: TestClient) -> None:
+    """The landing page must never leak another resident's case data --
+    it is public, unauthenticated, and has no docket list on it at all."""
+    _create_case(client, application_number="PAN-SHOULD-NOT-APPEAR")
+    response = client.get("/")
+    assert "PAN-SHOULD-NOT-APPEAR" not in response.text
+    assert "docket-list" not in response.text
+
+
+def test_root_ignores_theme_and_key_query_params_gracefully(client: TestClient) -> None:
+    # The landing page never gates on `?key=`; an unrecognised `?theme=`
+    # degrades exactly like every other page.
+    response = client.get("/?key=anything&theme=dark")
+    assert response.status_code == 200
+
+
+def test_docket_board_moved_to_slash_docket_still_gated_the_same_way(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SETBACK_DOCKET_KEY", "let-me-in")
+    assert client.get("/docket").status_code == 401
+    assert client.get("/docket?key=wrong").status_code == 401
+    assert client.get("/docket?key=let-me-in").status_code == 200
+
+
 def test_docket_board_lists_created_cases(client: TestClient) -> None:
     case_id = _create_case(client, application_number="PAN-1", session=_REAL_SESSION)
     _create_case(client, application_number="PAN-2", session=_REAL_SESSION_2)
 
-    response = client.get("/")
+    response = client.get("/docket")
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert case_id in response.text
@@ -532,7 +695,7 @@ def test_docket_board_loads_the_client_script_so_the_create_case_form_renders(
     a `<script src="/static/app.js">` tag on this page, a resident has no
     way to start a case through the UI at all -- caught live against the
     deployed console (smoke loop #2)."""
-    response = client.get("/")
+    response = client.get("/docket")
     assert response.status_code == 200
     assert '<script src="/static/app.js"></script>' in response.text
 
@@ -547,7 +710,7 @@ def test_docket_board_does_not_hardcode_a_light_theme(client: TestClient) -> Non
     permanently defeats system dark mode for every viewer. Confirmed live
     on the deployed console with `prefers-color-scheme: dark` emulated:
     the page stayed light (`background-color: rgb(247, 245, 242)`)."""
-    response = client.get("/")
+    response = client.get("/docket")
     assert 'data-theme="light"' not in response.text
 
 
@@ -558,7 +721,7 @@ def test_docket_board_honours_theme_light_query_param(client: TestClient) -> Non
     screenshot already captured. Stamps `data-theme="light"` on `<html>`
     exactly as an explicit user toggle would, per `style.css`'s own
     `:root[data-theme="light"]` contract -- no new CSS needed."""
-    response = client.get("/?theme=light")
+    response = client.get("/docket?theme=light")
     assert response.status_code == 200
     assert '<html data-theme="light">' in response.text
 
@@ -567,7 +730,7 @@ def test_docket_board_ignores_an_unrecognised_theme_value(client: TestClient) ->
     """Only the exact, documented value forces anything -- garbage input
     degrades to the same system-default behaviour as no param at all,
     never a crash or an unrecognised `data-theme` value reaching the DOM."""
-    response = client.get("/?theme=nonsense")
+    response = client.get("/docket?theme=nonsense")
     assert response.status_code == 200
     assert "data-theme" not in response.text
 
@@ -600,7 +763,7 @@ def test_docket_board_excludes_cases_created_with_a_non_uuid_resident_session(
     hardcoded blocklist and catches any future test label the same way."""
     case_id = _create_case(client, application_number="PAN-JUNK", session=junk_session)
 
-    response = client.get("/")
+    response = client.get("/docket")
     assert response.status_code == 200
     assert "PAN-JUNK" not in response.text
 
@@ -618,7 +781,7 @@ def test_docket_board_includes_a_case_created_with_a_real_uuid_session(
     """The filter must not be so broad it hides real residents -- a normal
     `_create_case` (UUID session, the default) still appears."""
     _create_case(client, application_number="PAN-REAL")
-    response = client.get("/")
+    response = client.get("/docket")
     assert "PAN-REAL" in response.text
 
 
@@ -647,7 +810,7 @@ def test_docket_board_excludes_case_with_a_junk_application_number_despite_a_rea
         client, application_number=junk_application_number, session=_REAL_SESSION
     )
 
-    response = client.get("/")
+    response = client.get("/docket")
     assert response.status_code == 200
     assert junk_application_number not in response.text
 
@@ -663,7 +826,7 @@ def test_docket_board_does_not_exclude_a_genuine_application_number(
     """The content check must not be so eager it flags a real DA number --
     none of the junk keywords appear in an ordinary application number."""
     _create_case(client, application_number="DA2026/0359", session=_REAL_SESSION)
-    response = client.get("/")
+    response = client.get("/docket")
     assert "DA2026/0359" in response.text
 
 
@@ -682,7 +845,7 @@ def test_docket_board_collapses_duplicate_application_numbers_to_the_latest_case
     older_case_id = _create_case(client, application_number="PAN-661190", session=_REAL_SESSION)
     newer_case_id = _create_case(client, application_number="PAN-661190", session=_REAL_SESSION_2)
 
-    response = client.get("/")
+    response = client.get("/docket")
     assert response.status_code == 200
     assert newer_case_id in response.text
     assert older_case_id not in response.text
@@ -698,7 +861,7 @@ def test_docket_board_shows_an_earlier_cases_note_for_a_collapsed_application_nu
     _create_case(client, application_number="PAN-661190", session=_REAL_SESSION)
     _create_case(client, application_number="PAN-661190", session=_REAL_SESSION_2)
 
-    response = client.get("/")
+    response = client.get("/docket")
     assert "+1 earlier case" in response.text
 
 
@@ -708,7 +871,7 @@ def test_docket_board_pluralizes_the_earlier_cases_note(client: TestClient) -> N
     _create_case(client, application_number="PAN-661190", session=_REAL_SESSION_2)
     _create_case(client, application_number="PAN-661190", session=third_session)
 
-    response = client.get("/")
+    response = client.get("/docket")
     assert "+2 earlier cases" in response.text
 
 
@@ -716,7 +879,7 @@ def test_docket_board_shows_no_earlier_cases_note_for_a_single_case(
     client: TestClient,
 ) -> None:
     _create_case(client, application_number="PAN-SOLO", session=_REAL_SESSION)
-    response = client.get("/")
+    response = client.get("/docket")
     assert "earlier case" not in response.text
 
 
@@ -731,7 +894,7 @@ def test_docket_board_has_no_gate_when_setback_docket_key_is_unset(
     every test above already relies on this. Explicit here as its own
     documented case rather than only incidentally covered elsewhere."""
     monkeypatch.delenv("SETBACK_DOCKET_KEY", raising=False)
-    response = client.get("/")
+    response = client.get("/docket")
     assert response.status_code == 200
 
 
@@ -747,13 +910,13 @@ def test_docket_board_requires_the_matching_key_once_configured(
     direct link, or creates their own case, is never blocked."""
     monkeypatch.setenv("SETBACK_DOCKET_KEY", "let-me-in")
 
-    no_key = client.get("/")
+    no_key = client.get("/docket")
     assert no_key.status_code == 401
 
-    wrong_key = client.get("/?key=nope")
+    wrong_key = client.get("/docket?key=nope")
     assert wrong_key.status_code == 401
 
-    right_key = client.get("/?key=let-me-in")
+    right_key = client.get("/docket?key=let-me-in")
     assert right_key.status_code == 200
 
 
@@ -777,19 +940,31 @@ def test_docket_board_survives_a_fresh_app_instance_over_the_same_store(
     _create_case(TestClient(first_app), application_number="PAN-1", session=_REAL_SESSION)
 
     second_app = create_app(store, composer=composer, document_source=UserUploadedDocumentSource())
-    response = TestClient(second_app).get("/")
+    response = TestClient(second_app).get("/docket")
 
     assert response.status_code == 200
     assert "PAN-1" in response.text
 
 
 def test_case_page_renders_known_sections(client: TestClient) -> None:
+    """Post wave-9 merge (LEO-FEEDBACK-UIUX.md §3/§9): the interview lives
+    only in the chat pane, and reviewer opinions + gate decisions live
+    inside each ground's own accordion rather than as separate flat
+    sections -- so this asserts the surviving top-level sections plus the
+    chat pane and grounds container, not the now-removed standalone
+    "Reviewer opinions"/"Adjudication"/"Gate decisions"/"Interview
+    transcript" section titles."""
     case_id = _create_case(client)
     response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
     body_lower = response.text.lower()
-    for section in ("interview", "evidence", "reviewer", "adjudication", "gate", "submission"):
+    assert 'id="interview-transcript"' in body_lower  # the chat pane
+    for section in ("grounds", "evidence", "submission"):
         assert section in body_lower
+    assert "<h3>interview transcript</h3>" not in body_lower
+    assert "<h3>reviewer opinions</h3>" not in body_lower
+    assert "<h3>adjudication</h3>" not in body_lower
+    assert "<h3>gate decisions</h3>" not in body_lower
 
 
 def test_case_page_does_not_hardcode_a_light_theme(client: TestClient) -> None:
@@ -832,6 +1007,90 @@ def test_annotated_overlay_event_renders_as_an_image(
     assert '<img src="data:image/png;base64,QUJD"' in response.text
 
 
+def test_annotated_overlay_event_links_to_the_full_resolution_document_when_present(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """Wave-9 click-to-open fix (LEO-FEEDBACK-UIUX.md §5): when
+    `job.pipeline` recorded a `full_res_document_id`, the rendered `<img>`
+    must carry a `data-full-res-src` pointing `app.js`'s lightbox at this
+    case's own document route rather than the shrunk, embedded copy."""
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "annotated-overlay:doc-1",
+            "annotated_overlay",
+            payload={
+                "document_id": "doc-1",
+                "mime_type": "image/png",
+                "image_base64": "QUJD",
+                "full_res_document_id": "overlay-doc-1-p1",
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert f'data-full-res-src="/api/cases/{case_id}/documents/overlay-doc-1-p1"' in response.text
+
+
+def test_annotated_overlay_event_without_full_res_document_id_has_no_stray_attribute(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """An overlay event recorded before the wave-9 fix landed (an
+    append-only log, never rewritten) has no `full_res_document_id` --
+    the `<img>` must degrade gracefully with no `data-full-res-src`
+    attribute at all, not a broken link to a document that never
+    existed."""
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "annotated-overlay:doc-1",
+            "annotated_overlay",
+            payload={"document_id": "doc-1", "mime_type": "image/png", "image_base64": "QUJD"},
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert "data-full-res-src" not in response.text
+
+
+def test_full_resolution_overlay_document_is_served_with_the_overlays_own_mime_type() -> None:
+    """The full-res overlay document was never uploaded through the
+    resident upload endpoint, so `GET .../documents/{document_id}` has no
+    matching `document_uploaded` event to read a content type from -- it
+    must fall back to the `annotated_overlay` event's own `mime_type`
+    field instead of the generic `application/octet-stream` default,
+    which would make a browser download the image instead of displaying
+    it inline in the lightbox."""
+    fixed_store = InMemoryCaseStore()
+    fixed_document_source = UserUploadedDocumentSource()
+    app = create_app(fixed_store, composer=_FakeComposer(), document_source=fixed_document_source)
+    fixed_client = TestClient(app)
+    case_id = _create_case(fixed_client)
+    full_res_bytes = b"\x89PNG\r\n\x1a\nfake-full-res-bytes"
+    asyncio.run(
+        fixed_document_source.add_evidence_document(case_id, "overlay-doc-1-p1", full_res_bytes)
+    )
+    asyncio.run(
+        fixed_store.append_event(
+            case_id,
+            "annotated-overlay:doc-1",
+            "annotated_overlay",
+            payload={
+                "document_id": "doc-1",
+                "mime_type": "image/png",
+                "image_base64": "QUJD",
+                "full_res_document_id": "overlay-doc-1-p1",
+            },
+        )
+    )
+    response = fixed_client.get(f"/api/cases/{case_id}/documents/overlay-doc-1-p1")
+    assert response.status_code == 200
+    assert response.content == full_res_bytes
+    assert response.headers["content-type"] == "image/png"
+
+
 def test_annotated_overlay_event_renders_with_its_own_legend(
     client: TestClient, store: InMemoryCaseStore
 ) -> None:
@@ -871,9 +1130,13 @@ def test_annotated_overlay_event_renders_with_its_own_legend(
         assert ROLE_LEGEND_TEXT[role] in body
 
 
-def test_submission_composed_event_renders_download_links(
+def test_submission_composed_event_renders_actions_and_html_download(
     client: TestClient, store: InMemoryCaseStore
 ) -> None:
+    """LEO-FEEDBACK-UIUX.md §6: the primary actions are Copy text + Email
+    this; the HTML download is a secondary link; the Markdown download is
+    removed from the UI entirely (though the `.md` API route itself still
+    works for anyone who fetches it directly -- see the test below)."""
     case_id = _create_case(client)
     asyncio.run(
         store.append_event(
@@ -890,23 +1153,155 @@ def test_submission_composed_event_renders_download_links(
     )
     response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
-    assert f"/api/cases/{case_id}/submission.md" in response.text
-    assert f"/api/cases/{case_id}/submission.html" in response.text
-    assert f"/api/cases/{case_id}/refusals.md" in response.text
-    assert "<h1>Objection</h1>" in response.text
-
-    md_response = client.get(f"/api/cases/{case_id}/submission.md")
-    assert md_response.status_code == 200
-    assert md_response.text == "# Objection\n\nGround text."
+    body = response.text
+    assert f"/api/cases/{case_id}/submission.html" in body
+    assert f"/api/cases/{case_id}/refusals.html" in body
+    assert f"/api/cases/{case_id}/submission.md" not in body
+    assert f"/api/cases/{case_id}/refusals.md" not in body
+    assert body.count("Copy text") == 2
+    assert body.count(">Email this<") == 2
+    assert "mailto:?subject=" in body
+    assert "Ground text." in body  # the copy-text textarea carries the raw markdown
+    assert "<h1>Objection</h1>" in body
 
     html_response = client.get(f"/api/cases/{case_id}/submission.html")
     assert "<h1>Objection</h1>" in html_response.text
+
+
+def test_submission_markdown_api_route_still_works_even_though_unlinked_from_the_ui(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "submission-composed:x",
+            "submission_composed",
+            payload={
+                "submission_markdown": "# Objection\n\nGround text.",
+                "submission_html": "<article><h1>Objection</h1></article>",
+                "refusals_markdown": "# Refusals\n\nExplanation.",
+                "refusals_html": "<article><h1>Refusals</h1></article>",
+            },
+        )
+    )
+    md_response = client.get(f"/api/cases/{case_id}/submission.md")
+    assert md_response.status_code == 200
+    assert md_response.text == "# Objection\n\nGround text."
 
 
 def test_download_submission_before_composed_is_404(client: TestClient) -> None:
     case_id = _create_case(client)
     response = client.get(f"/api/cases/{case_id}/submission.md")
     assert response.status_code == 404
+
+
+# --- export transcript (LEO-FEEDBACK-UIUX.md §2) ----------------------------
+
+
+def test_export_transcript_renders_sydney_timestamped_plain_text_lines() -> None:
+    from datetime import UTC, datetime
+
+    fixed_recorded_at = datetime(2026, 8, 29, 9, 42, tzinfo=UTC)  # 19:42 AEST
+    fixed_store = InMemoryCaseStore(clock=lambda: fixed_recorded_at)
+    app = create_app(
+        fixed_store, composer=_FakeComposer(), document_source=UserUploadedDocumentSource()
+    )
+    fixed_client = TestClient(app)
+    case_id = _create_case(fixed_client)
+    asyncio.run(
+        fixed_store.append_event(
+            case_id,
+            "interview-turn:1",
+            "interview_turn",
+            payload={"role": "system", "stage": "opening", "message": "What worries you?"},
+        )
+    )
+    asyncio.run(
+        fixed_store.append_event(
+            case_id,
+            "interview-turn:2",
+            "interview_turn",
+            payload={"role": "resident", "stage": "opening", "message": "The overshadowing."},
+        )
+    )
+    response = fixed_client.get(f"/api/cases/{case_id}/transcript.txt")
+    assert response.status_code == 200
+    assert "text/plain" in response.headers["content-type"]
+    lines = response.text.strip("\n").splitlines()
+    assert lines[0] == "Setback  2026-08-29 19:42 AEST  What worries you?"
+    assert lines[1] == "You  2026-08-29 19:42 AEST  The overshadowing."
+
+
+def test_export_transcript_unknown_case_is_404(client: TestClient) -> None:
+    response = client.get("/api/cases/does-not-exist/transcript.txt")
+    assert response.status_code == 404
+
+
+def test_export_transcript_link_present_on_case_page(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert f"/api/cases/{case_id}/transcript.txt" in response.text
+    assert "Export transcript" in response.text
+
+
+# --- Start tribunal: un-crashable, honest label (LEO-FEEDBACK-UIUX.md §7) ---
+
+
+def _start_tribunal_button_html(page_html: str) -> str:
+    return page_html.split('id="start-tribunal"')[1].split("</button>")[0]
+
+
+def test_start_tribunal_button_enabled_when_not_started(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    button = _start_tribunal_button_html(response.text)
+    assert "disabled" not in button
+    assert "Start tribunal" in button
+
+
+def test_start_tribunal_button_disabled_while_running(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(case_id, "tribunal-requested:x", "tribunal_requested", payload={})
+    )
+    response = client.get(f"/cases/{case_id}")
+    button = _start_tribunal_button_html(response.text)
+    assert "disabled" in button
+    assert "Tribunal running" in button
+
+
+def test_start_tribunal_button_disabled_once_submission_composed(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """The un-crashable case, matching the known job-side idempotency gap
+    (SMOKE.md's "Fix 4 -- not fixed"): re-running the tribunal on an
+    already-adjudicated case crashes the job. Disabling this button once a
+    submission exists closes the UI half of that fix."""
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(case_id, "submission-composed:x", "submission_composed", payload={})
+    )
+    response = client.get(f"/cases/{case_id}")
+    button = _start_tribunal_button_html(response.text)
+    assert "disabled" in button
+    assert "Tribunal complete" in button
+
+
+def test_start_tribunal_button_enabled_again_after_a_failed_attempt(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(case_id, "tribunal-requested:x", "tribunal_requested", payload={})
+    )
+    asyncio.run(store.append_event(case_id, "job-failed:x", "job_failed", payload={"error": "x"}))
+    response = client.get(f"/cases/{case_id}")
+    button = _start_tribunal_button_html(response.text)
+    assert "disabled" not in button
+    assert "Start tribunal" in button
 
 
 # --- static assets ---------------------------------------------------------
@@ -988,7 +1383,7 @@ def test_document_uploaded_renders_a_doc_card_with_no_raw_json(client: TestClien
     assert '"document_id"' not in response.text
     assert '"content_type"' not in response.text
     assert '"size_bytes"' not in response.text
-    assert 'class="doc-card"' in response.text
+    assert 'class="doc-card doc-card--clickable"' in response.text
     assert "North elevation" in response.text
     # A plain-English DocumentKind label, never the raw enum value.
     assert "Elevations" in response.text
@@ -1041,6 +1436,23 @@ def test_document_uploaded_photo_renders_a_real_img_thumbnail(client: TestClient
     assert f'<img class="doc-card__thumb" src="{expected_src}"' in response.text
 
 
+def test_document_uploaded_card_is_clickable_to_the_full_document(client: TestClient) -> None:
+    """LEO-FEEDBACK-UIUX.md §4: doc-cards were previously inert ("I cannot
+    do anything with that") -- clicking one must open the full image/PDF,
+    here via a plain new-tab link to the document's own serving route."""
+    case_id = _create_case(client)
+    upload = client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+    )
+    document_id = upload.json()["document_id"]
+    response = client.get(f"/cases/{case_id}")
+    expected_href = f'href="/api/cases/{case_id}/documents/{document_id}"'
+    assert f'<a class="doc-card doc-card--clickable" {expected_href}' in response.text
+    assert 'target="_blank"' in response.text
+    assert 'rel="noopener"' in response.text
+
+
 def test_document_uploaded_pdf_still_renders_the_placeholder_icon(client: TestClient) -> None:
     """Only photo evidence gets a real thumbnail -- a PDF doc-card keeps
     the placeholder icon (no PDF-preview pipeline exists, and none is
@@ -1052,7 +1464,10 @@ def test_document_uploaded_pdf_still_renders_the_placeholder_icon(client: TestCl
     )
     response = client.get(f"/cases/{case_id}")
     assert "doc-card__thumb--placeholder" in response.text
-    assert "<img" not in response.text
+    # Scoped to the Evidence section -- the page header's own QR code
+    # (`<img class="case-actions__qr">`) is an unrelated `<img>`.
+    evidence_section = response.text.split('id="evidence"')[1].split("</section>")[0]
+    assert "<img" not in evidence_section
 
 
 def test_get_uploaded_document_serves_the_stored_bytes(client: TestClient) -> None:
@@ -1080,7 +1495,38 @@ def test_get_uploaded_document_unknown_case_is_404(client: TestClient) -> None:
     assert response.status_code == 404
 
 
-def test_interview_turn_renders_as_chat_bubbles_with_no_raw_json(client: TestClient) -> None:
+# --- QR code / copy-link re-access (LEO-FEEDBACK-UIUX.md §1) ----------------
+
+
+def test_case_qr_code_returns_a_png(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/api/cases/{case_id}/qr.png")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_case_qr_code_unknown_case_is_404(client: TestClient) -> None:
+    response = client.get("/api/cases/does-not-exist/qr.png")
+    assert response.status_code == 404
+
+
+def test_case_page_has_copy_link_and_qr_code(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}")
+    assert "Copy link" in response.text
+    assert f"/api/cases/{case_id}/qr.png" in response.text
+
+
+def test_interview_turn_has_no_standalone_server_rendered_section_and_no_raw_json(
+    client: TestClient,
+) -> None:
+    """Wave-9 (LEO-FEEDBACK-UIUX.md §2): the standalone "Interview
+    transcript" section is removed -- the chat pane (`#interview-
+    transcript`, populated client-side from the JSON interview API) is now
+    the ONLY place the transcript renders. This also closes the original
+    founder requirement #3 concern (no raw `interview_turn` JSON anywhere
+    on the page) simply by removing the section that used to leak it."""
     case_id = _create_case(client)
     client.get(f"/api/cases/{case_id}/interview")
     client.post(
@@ -1091,23 +1537,24 @@ def test_interview_turn_renders_as_chat_bubbles_with_no_raw_json(client: TestCli
     assert response.status_code == 200
     assert '"role"' not in response.text
     assert '"stage"' not in response.text
-    assert 'class="chat-turn chat-turn--ai"' in response.text
-    assert 'class="chat-turn chat-turn--resident"' in response.text
-    assert 'class="chat-turn__label"' in response.text
-    assert "It&#x27;ll overshadow my garden." in response.text or (
-        "It'll overshadow my garden." in response.text
-    )
+    assert "<h3>Interview transcript</h3>" not in response.text
+    # The chat pane exists, empty in the server HTML -- app.js populates it
+    # from `GET /api/cases/{id}/interview` on load.
+    assert 'id="interview-transcript" class="chat-transcript"' in response.text
+    transcript_div = response.text.split('id="interview-transcript" class="chat-transcript"')[1]
+    assert transcript_div.split(">", 1)[1].split("<", 1)[0].strip() == ""
 
 
-def test_interview_turn_ai_bubble_is_labelled_setback_resident_bubble_is_not(
-    client: TestClient,
-) -> None:
+def test_get_interview_turn_prompt_carries_no_html_markup(client: TestClient) -> None:
+    """The interview JSON API (`app.js`'s sole source for the chat pane's
+    bubbles, post wave-9) returns plain prompt text -- `app.js` is
+    responsible for the AI/resident label+bubble markup client-side; the
+    server never emits HTML for a turn."""
     case_id = _create_case(client)
-    client.get(f"/api/cases/{case_id}/interview")
-    response = client.get(f"/cases/{case_id}")
-    assert "Setback" in response.text
-    # The AI label appears exactly once per AI turn (one opening turn so far).
-    assert response.text.count('class="chat-turn__label">Setback<') == 1
+    response = client.get(f"/api/cases/{case_id}/interview")
+    body = response.json()
+    assert body["turns"][0]["stage"] == "opening"
+    assert "<" not in body["turns"][0]["prompt"]
 
 
 # --- wave 5: suggested_replies (UI-SPEC.md §2.2) -----------------------------
@@ -1236,8 +1683,10 @@ def test_refused_gate_decision_renders_as_a_refusal_card_region(
     response = client.get(f"/cases/{case_id}")
     body = response.text
     assert 'class="refusal-card" role="region"' in body
-    assert "We didn" in body  # "We didn't include this ground" (curly apostrophe)
-    assert "Claim for g-1" in body
+    # LEO-FEEDBACK-UIUX.md §3: gate copy must NAME the ground -- never a
+    # generic "We didn't include this ground" a resident has to
+    # cross-reference against a claim shown somewhere else on the page.
+    assert "We didn&rsquo;t include: Claim for g-1" in body
     assert "Property value alone is not a s4.15(1) planning matter." in body
     assert 'role="alert"' not in body  # never framed as an error
     assert 'class="state-card--error"' not in body
@@ -1274,7 +1723,7 @@ def test_refusal_card_states_how_many_other_grounds_are_unaffected(
 
 def test_docket_board_shows_just_started_when_no_grounds(client: TestClient) -> None:
     _create_case(client)
-    response = client.get("/")
+    response = client.get("/docket")
     assert '<span class="tag tag--pending">Just started</span>' in response.text
 
 
@@ -1283,7 +1732,7 @@ def test_docket_board_shows_needs_your_input_when_a_ground_is_flagged(
 ) -> None:
     case_id = _create_case(client)
     asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.FLAGGED))
-    response = client.get("/")
+    response = client.get("/docket")
     assert '<span class="tag tag--flagged">Needs your input</span>' in response.text
 
 
@@ -1292,7 +1741,7 @@ def test_docket_board_shows_in_review_while_a_ground_is_still_pending(
 ) -> None:
     case_id = _create_case(client)
     asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.PROPOSED))
-    response = client.get("/")
+    response = client.get("/docket")
     assert '<span class="tag tag--pending">In review</span>' in response.text
 
 
@@ -1302,7 +1751,7 @@ def test_docket_board_shows_ready_to_submit_once_every_ground_is_terminal(
     case_id = _create_case(client)
     asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.SUPPORTED))
     asyncio.run(_make_ground(store, case_id, "g-2", GroundStatus.REFUSED))
-    response = client.get("/")
+    response = client.get("/docket")
     assert '<span class="tag tag--shipped">Ready to submit</span>' in response.text
 
 
@@ -1310,7 +1759,7 @@ def test_docket_board_shows_ready_to_submit_once_every_ground_is_terminal(
 
 
 def test_disclaimer_footer_present_on_docket_board(client: TestClient) -> None:
-    response = client.get("/")
+    response = client.get("/docket")
     assert 'class="disclaimer-footer"' in response.text
     assert "not a law firm" in response.text
     assert "NSW Government" in response.text
@@ -1455,6 +1904,30 @@ def test_case_page_exposes_zero_run_cost_with_no_ledger(client: TestClient) -> N
 # #3 (zero raw JSON anywhere user-facing). -----------------------------
 
 
+def test_tribunal_requested_timestamp_is_converted_from_utc_to_sydney_not_read_verbatim() -> None:
+    """LEO-FEEDBACK-UIUX.md §7: timestamps must be absolute Australia/
+    Sydney, not the stored UTC clock value read as if it were already
+    local. 03:00 UTC in the southern-hemisphere winter (AEST, UTC+10)
+    renders as 1pm the same day -- a bug that read the raw UTC hour would
+    show 3am instead."""
+    from datetime import UTC, datetime
+
+    fixed_recorded_at = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
+    fixed_store = InMemoryCaseStore(clock=lambda: fixed_recorded_at)
+    app = create_app(
+        fixed_store, composer=_FakeComposer(), document_source=UserUploadedDocumentSource()
+    )
+    fixed_client = TestClient(app)
+    case_id = _create_case(fixed_client)
+    asyncio.run(
+        fixed_store.append_event(case_id, "tribunal-requested:x", "tribunal_requested", payload={})
+    )
+    response = fixed_client.get(f"/cases/{case_id}")
+    assert "1:00pm" in response.text
+    assert "15 Jul 2026" in response.text
+    assert "3:00am" not in response.text
+
+
 def test_tribunal_requested_event_renders_with_no_raw_json(
     client: TestClient, store: InMemoryCaseStore
 ) -> None:
@@ -1465,19 +1938,124 @@ def test_tribunal_requested_event_renders_with_no_raw_json(
     response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
     assert "{}" not in response.text
-    assert (
-        "{"
-        not in response.text.split('<section class="card"><h3>Tribunal</h3>')[1].split(
-            "</section>"
-        )[0]
-    )
+    assert "{" not in response.text.split('id="tribunal"')[1].split("</section>")[0]
     assert "Tribunal run started" in response.text
 
 
-def test_adjudication_decision_event_renders_with_no_raw_json(
+def test_ingest_resolved_event_renders_live_success_with_no_raw_json(
     client: TestClient, store: InMemoryCaseStore
 ) -> None:
+    """Wave-9 handoff: `job.pipeline`'s new `ingest_resolved` event (the
+    un-frozen-ingest outcome) must render in plain English inside the
+    merged "Tribunal" section, never fall through to the raw-JSON
+    fallback."""
     case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "ingest-resolved:x",
+            "ingest_resolved",
+            payload={
+                "application_number": "DA2026/0512",
+                "council": "Georges River Council",
+                "council_application_number": "DA2026-0512",
+                "address": "12 Example Street",
+                "used_demo_fixture": False,
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    tribunal_html = response.text.split('id="tribunal"')[1].split("</section>")[0]
+    assert "{" not in tribunal_html
+    assert "used_demo_fixture" not in response.text
+    assert "Fetched live council data for DA2026/0512" in response.text
+
+
+def test_ingest_resolved_event_renders_demo_fixture_fallback_honestly(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """When live ingest failed and the run degraded to the demo fixture,
+    the resident must be told plainly -- their submission's letterhead
+    will not match the DA number they typed -- rather than this being
+    silently invisible."""
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "ingest-resolved:x",
+            "ingest_resolved",
+            payload={
+                "application_number": "DA2026/UNKNOWN",
+                "council": "Georges River Council",
+                "council_application_number": "DA2026-0359",
+                "address": "65A Vista Street",
+                "used_demo_fixture": True,
+                "reason": "could not resolve 'DA2026/UNKNOWN' live",
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert "Could not fetch DA2026/UNKNOWN live" in response.text
+    assert "showing the demo case (DA2026-0359) instead" in response.text
+
+
+def test_tribunal_rerun_ignored_event_renders_with_no_raw_json(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """A judge double-pressing "Start tribunal" against an already-decided
+    case (SMOKE.md's "Fix 4") must see an honest plain-English note, not a
+    raw JSON dump of the pipeline's internal reason string."""
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "tribunal-rerun-ignored:x",
+            "tribunal_rerun_ignored",
+            payload={"reason": "this case's tribunal has already run to completion"},
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    tribunal_html = response.text.split('id="tribunal"')[1].split("</section>")[0]
+    assert "{" not in tribunal_html
+    assert "already" in response.text.lower()
+    assert "run" in response.text.lower()
+
+
+def test_ground_rerun_skipped_event_never_appears_in_the_rendered_page(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """`ground_rerun_skipped` is an internal resume-safety signal with no
+    resident-facing value (per the fixer's own cross-lane note) -- it must
+    not appear anywhere on the page, raw or otherwise, but its mere
+    presence in the event log must not break rendering either."""
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "ground-rerun-skipped:ground-1",
+            "ground_rerun_skipped",
+            payload={"ground_id": "ground-1", "status": "supported"},
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert "ground_rerun_skipped" not in response.text
+    assert "ground-rerun-skipped" not in response.text
+
+
+def test_adjudication_decision_event_renders_inside_its_ground_with_no_raw_json(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """Wave-9 (LEO-FEEDBACK-UIUX.md §3): the standalone "Adjudication"
+    section is gone -- an adjudicator's ruling on a ground renders INSIDE
+    that ground's own accordion, alongside the reviewers' opinions, so a
+    resident sees the claim, the opinions, and the final call together
+    rather than three flat lists with no visible link between them."""
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "ground-1", GroundStatus.FLAGGED))
     asyncio.run(
         store.append_event(
             case_id,
@@ -1496,16 +2074,14 @@ def test_adjudication_decision_event_renders_with_no_raw_json(
     )
     response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
+    assert "<h3>Adjudication</h3>" not in response.text
     # Bare field-name substrings, so this catches the leak whether or not
     # `_esc`'s `html.escape` has turned the surrounding quotes into
     # `&quot;` -- a browser renders escaped JSON as readable JSON text just
     # the same, which is exactly what founder requirement #3 forbids.
     assert "cited_anchor_ids" not in response.text
-    section = response.text.split('<section class="card"><h3>Adjudication</h3>')[1].split(
-        "</section>"
-    )[0]
-    assert "{" not in section
-    assert "Both reviewers agreed the shadow diagram supports the claim." in response.text
+    ground_section = response.text.split('class="ground-card ground-card--flagged"')[1]
+    assert "Both reviewers agreed the shadow diagram supports the claim." in ground_section
 
 
 def test_resident_refusal_feedback_event_renders_with_no_raw_json(
