@@ -925,8 +925,18 @@
   function handleAnnotatedOverlay(payload) {
     // The concurrent wave's semantic-overlay pixels; this wave only adds
     // the docked chrome (Sec 2.12) around whatever image the event
-    // carries, mirroring `_render_annotated_overlay_item`'s own markup so
-    // this client render and a server re-render always agree.
+    // carries. The four legend items below (order, CSS class suffix, and
+    // copy) must stay in lockstep with `evidence.overlays.OverlayRole` /
+    // `ROLE_CSS_CLASS_SUFFIX` / `ROLE_LEGEND_TEXT` -- the Python side's
+    // single source of truth -- and with `console/app.py`'s
+    // `_render_annotated_overlay_item`, which builds the same
+    // `.doc-viewer__legend` server-side so a page reload never loses it.
+    // A prior version of this legend only listed three items (shipped/
+    // flagged/refused), omitting the fourth "not yet decided" swatch even
+    // though `style.css` already shipped `.legend-swatch--pending` for it
+    // -- every neutral (not-yet-cited) box rendered in that colour with no
+    // legend entry explaining it at all, reported live as "empty floating
+    // boxes" with no visible meaning.
     hideFlatSectionsOnce();
     const anchor = document.querySelector(".case-page");
     if (!anchor) return;
@@ -941,6 +951,7 @@
         '<span class="legend-item"><i class="legend-swatch legend-swatch--shipped"></i>Supports a shipped ground</span>' +
         '<span class="legend-item"><i class="legend-swatch legend-swatch--flagged"></i>Needs more evidence</span>' +
         '<span class="legend-item"><i class="legend-swatch legend-swatch--refused"></i>Cited in a refused ground</span>' +
+        '<span class="legend-item"><i class="legend-swatch legend-swatch--pending"></i>Evidence anchor, not yet decided</span>' +
         "</div></div>";
       anchor.appendChild(viewer);
     }

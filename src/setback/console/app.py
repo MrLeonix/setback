@@ -41,10 +41,16 @@ import secrets
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -57,7 +63,14 @@ from setback.console.guards import (
     per_case_interview_turn_guard,
     per_ip_case_creation_guard,
 )
-from setback.ingest.tracker import DocumentSource, EvidenceUploadStore, UserUploadedDocumentSource
+from setback.evidence.overlays import ROLE_CSS_CLASS_SUFFIX, ROLE_LEGEND_TEXT, OverlayRole
+from setback.ingest.tracker import (
+    DocumentNotFoundError,
+    DocumentSource,
+    EvidenceUploadStore,
+    ExhibitedDocument,
+    UserUploadedDocumentSource,
+)
 from setback.interview.flow import (
     ConcernNormaliser,
     ConcernType,
@@ -539,6 +552,44 @@ def create_app(
             await _persist_system_turn(store, case_id, turn)
         return JSONResponse({"document_id": document_id, "size_bytes": len(content)})
 
+    @app.get("/api/cases/{case_id}/documents/{document_id}")
+    async def get_uploaded_document(case_id: str, document_id: str) -> Response:
+        """Serve a previously uploaded document/photo's raw bytes back,
+        from wherever `documents` (`EvidenceUploadStore`) actually durably
+        wrote them -- in-memory in tests, `evidence.storage.GcsEvidenceStore`
+        (GCS) in production, so this works identically against the deployed
+        app with no separate wiring. The doc-card thumbnail (`_render_
+        document_uploaded_item`) points a real `<img>` at this exact URL
+        for a photo upload -- previously always a placeholder icon, even
+        though the resident's actual photo bytes existed in the store the
+        whole time.
+
+        `content_type`/`filename` aren't tracked by `EvidenceUploadStore`
+        itself (`download_document` returns bytes only), so they're read
+        back from this same case's own `document_uploaded` event -- the
+        one place that already recorded them at upload time."""
+        await _require_case(case_id)
+        content_type = "application/octet-stream"
+        for event in await store.list_events(case_id):
+            if (
+                event.event_type == "document_uploaded"
+                and event.payload.get("document_id") == document_id
+            ):
+                content_type = str(event.payload.get("content_type") or content_type)
+                break
+        try:
+            content = await documents.download_document(
+                ExhibitedDocument(
+                    document_id=document_id,
+                    title=document_id,
+                    source="user-upload",
+                    case_id=case_id,
+                )
+            )
+        except DocumentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return Response(content=content, media_type=content_type)
+
     @app.post("/api/cases/{case_id}/tribunal", status_code=202)
     async def start_tribunal(case_id: str) -> dict[str, Any]:
         await _require_case(case_id)
@@ -649,19 +700,25 @@ def create_app(
         }
 
     @app.get("/", response_class=HTMLResponse)
-    async def docket_board() -> str:
+    async def docket_board(theme: str | None = None, key: str | None = None) -> str:
+        if not _docket_key_accepted(key):
+            raise HTTPException(
+                status_code=401,
+                detail="This docket board requires a passphrase: GET /?key=<SETBACK_DOCKET_KEY>.",
+            )
         cases: list[tuple[CaseRecord, tuple[GroundRecord, ...]]] = []
         for case in await store.list_cases():
-            cases.append((case, await store.list_grounds(case.case_id)))
-        return render_docket_board(cases)
+            if _looks_like_a_resident_session(case.resident_session):
+                cases.append((case, await store.list_grounds(case.case_id)))
+        return render_docket_board(cases, force_theme=theme)
 
     @app.get("/cases/{case_id}", response_class=HTMLResponse)
-    async def case_page(case_id: str) -> str:
+    async def case_page(case_id: str, theme: str | None = None) -> str:
         case = await _require_case(case_id)
         grounds = await store.list_grounds(case_id)
         events = await store.list_events(case_id)
         ledger = await store.load_ledger(case_id)
-        return render_case_page(case, grounds, events, ledger)
+        return render_case_page(case, grounds, events, ledger, force_theme=theme)
 
     return app
 
@@ -687,6 +744,56 @@ _DISCLAIMER_FOOTER = """
 """
 """Persistent, non-dismissible footer (UI-SPEC.md §2.14/§5) -- present on
 every page, not a modal a resident can dismiss once."""
+
+
+_DOCKET_KEY_ENV_VAR: Final[str] = "SETBACK_DOCKET_KEY"
+
+_UUID_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+
+
+def _looks_like_a_resident_session(resident_session: str) -> bool:
+    """True exactly when `resident_session` is shaped like
+    `window.crypto.randomUUID()`'s output -- what every genuine resident
+    case is created with (`getResidentSessionId`, `console/static/app.js`).
+
+    The docket board's own hygiene filter (`docket_board`, below) uses this
+    as a purely structural rule rather than a hardcoded list of known
+    smoke/test/deploy-verification session labels (`SMOKE-RATE-LIMIT-
+    TEST-*`, `deploy-wiring-proof`, `deploy-verify-au-001`, ...) to keep in
+    sync by hand -- every one of those was created by a manual `POST
+    /api/cases` call during testing, never the real browser flow, and so
+    is structurally incapable of ever producing a UUID. A judge visiting
+    the hosted docket board previously saw this dev/smoke-test debris
+    ahead of the one real demo case; an individual case's own page is
+    unaffected by this filter (reachable at its unguessable case-id URL
+    regardless), only the public *list* is hygiened."""
+    return bool(_UUID_PATTERN.match(resident_session))
+
+
+def _docket_key_accepted(provided_key: str | None) -> bool:
+    """The docket **list** route's access gate: `SETBACK_DOCKET_KEY`
+    (unset by default, e.g. local dev and every test in this suite that
+    doesn't set it) disables the gate entirely, preserving today's
+    behaviour. Once configured (production/demo), `GET /` requires a
+    matching `?key=`, closing the real PII-exposure gap a judge could
+    otherwise stumble into: no login, no per-session boundary, a
+    stranger's full objection narrative and uploaded evidence reachable
+    from a public board with zero friction. An individual case page's own
+    unguessable URL stays reachable either way (`case_page` never calls
+    this) -- a judge who has a direct link, or creates their own case
+    through the normal flow, is never blocked.
+
+    `secrets.compare_digest` (already imported at module scope) rather
+    than `==`, since this is a real -- if low-stakes -- secret comparison.
+    """
+    expected = os.environ.get(_DOCKET_KEY_ENV_VAR)
+    if not expected:
+        return True
+    if provided_key is None:
+        return False
+    return secrets.compare_digest(provided_key, expected)
 
 
 _DOCKET_STATUS_MODIFIER_AND_LABEL: Mapping[str, tuple[str, str]] = {
@@ -734,7 +841,30 @@ def _render_docket_card(case: CaseRecord, grounds: Sequence[GroundRecord]) -> st
         """
 
 
-def render_docket_board(cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ...]]]) -> str:
+_VALID_FORCE_THEMES: Final[frozenset[str]] = frozenset({"light", "dark"})
+
+
+def _html_tag(force_theme: str | None) -> str:
+    """`<html>`, bare by default so `style.css`'s `prefers-color-scheme`
+    contract governs (no hardcoded theme -- see
+    `test_docket_board_does_not_hardcode_a_light_theme`), or with an
+    explicit `data-theme` when `force_theme` names one of the two themes
+    `style.css` actually implements (`?theme=light`/`?theme=dark` on
+    either page route) -- a deliberate, opt-in override for filming
+    consistency (every existing gallery screenshot is light-mode), never
+    a change to any viewer's default. Any other value (unset, unknown)
+    degrades to the bare, system-following tag rather than emitting a
+    `data-theme` value `style.css` doesn't define."""
+    if force_theme in _VALID_FORCE_THEMES:
+        return f'<html data-theme="{force_theme}">'
+    return "<html>"
+
+
+def render_docket_board(
+    cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ...]]],
+    *,
+    force_theme: str | None = None,
+) -> str:
     """Render the docket board: every case this console instance has
     created, each as a `.docket-card` (UI-SPEC.md §3.1) carrying a derived
     overall-status tag rather than a bare grounds count."""
@@ -743,7 +873,7 @@ def render_docket_board(cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ..
         rows = '<p class="empty">No cases yet -- create one to get started.</p>'
     return f"""
 <!doctype html>
-<html>
+{_html_tag(force_theme)}
 <head>
   <meta charset="utf-8">
   <title>Setback -- Docket Board</title>
@@ -842,14 +972,41 @@ def _render_gate_decision_item(
     )
 
 
+def _render_doc_viewer_legend() -> str:
+    """The one `.doc-viewer__legend` markup, shared verbatim (down to the
+    exact CSS classes and copy) with `console/static/app.js`'s
+    `handleAnnotatedOverlay`, which builds this same chrome client-side for
+    a live SSE `annotated_overlay` event. Both source their swatch order,
+    CSS class suffix, and label text from `evidence.overlays` (`OverlayRole`
+    / `ROLE_CSS_CLASS_SUFFIX` / `ROLE_LEGEND_TEXT`) -- the single place the
+    overlay's own colour semantics are defined -- so the two can never drift
+    apart the way they did before this fix (a server-rendered/reloaded case
+    page previously showed the coloured-box image with **no legend at
+    all**, since only the live-SSE JS path ever built one; colour-
+    discipline rule 4 requires a legend any time an overlay colour is on
+    screen)."""
+    items = "".join(
+        f'<span class="legend-item"><i class="legend-swatch '
+        f'legend-swatch--{ROLE_CSS_CLASS_SUFFIX[role]}"></i>{_esc(ROLE_LEGEND_TEXT[role])}</span>'
+        for role in OverlayRole
+    )
+    return f'<div class="doc-viewer__legend">{items}</div>'
+
+
 def _render_annotated_overlay_item(event: CaseEvent) -> str:
     payload = event.payload
     mime_type = _esc(payload.get("mime_type", "image/png"))
     image_base64 = _esc(payload.get("image_base64", ""))
+    document_id = payload.get("document_id")
+    doc_id_attr = f' data-doc-id="{_esc(document_id)}"' if document_id else ""
     return (
-        '<li class="annotated-overlay">'
-        f'<img src="data:{mime_type};base64,{image_base64}" alt="Annotated evidence overlay">'
-        "</li>"
+        '<li class="annotated-overlay"><div class="doc-viewer">'
+        '<div class="doc-viewer__stage">'
+        f'<img src="data:{mime_type};base64,{image_base64}" '
+        f'alt="Annotated evidence overlay"{doc_id_attr}>'
+        "</div>"
+        f"{_render_doc_viewer_legend()}"
+        "</div></li>"
     )
 
 
@@ -915,31 +1072,42 @@ def _is_photo_upload(filename: str, content_type: object) -> bool:
     return not is_pdf
 
 
-def _render_document_uploaded_item(_case_id: str, event: CaseEvent) -> str:
-    """A `.doc-card` (UI-SPEC.md §2.4/§3.3) -- always the placeholder-icon
-    thumbnail variant, since the document-upload event fires before the
-    evidence pipeline has ever rendered a first page (this wave's explicit
-    non-goal: no new thumbnail pipeline). The `DocumentKind` is classified
-    via the clerk's own deterministic, no-model-call fallback
-    (`_classify_document_by_keywords`) over the filename alone -- the same
-    fallback the clerk itself degrades to on a Gemma outage, so this never
-    makes a live call and never blocks."""
+def _render_document_uploaded_item(case_id: str, event: CaseEvent) -> str:
+    """A `.doc-card` (UI-SPEC.md §2.4/§3.3). A photo upload gets a real
+    `<img>` thumbnail -- the bytes already exist in whichever
+    `EvidenceUploadStore` this app was built with (in-memory in tests, GCS
+    in production), served back via this case's own
+    `GET /api/cases/{case_id}/documents/{document_id}` route, so this needs
+    no new storage or thumbnail-generation pipeline. A PDF upload keeps the
+    placeholder-icon variant (no PDF-preview pipeline exists, and none was
+    asked for). The `DocumentKind` is classified via the clerk's own
+    deterministic, no-model-call fallback (`_classify_document_by_keywords`)
+    over the filename alone -- the same fallback the clerk itself degrades
+    to on a Gemma outage, so this never makes a live call and never
+    blocks."""
     payload = event.payload
     filename = str(payload.get("filename") or "document")
     content_type = payload.get("content_type")
+    document_id = payload.get("document_id")
     kind = _classify_document_kind_offline(filename, "")
     kind_label = _DOCUMENT_KIND_LABELS.get(kind, "Document")
     title = _humanize_filename(filename)
     uploaded_at = _format_clock_time(event.recorded_at)
+    is_photo = _is_photo_upload(filename, content_type)
     grade_badge = ""
-    if _is_photo_upload(filename, content_type):
+    if is_photo:
         grade_badge = (
             '<span class="tag tag--grade-a" title="Provenance grade A -- your own photo">'
             "Your photo</span>"
         )
+    if is_photo and document_id:
+        doc_url = f"/api/cases/{_esc(case_id)}/documents/{_esc(document_id)}"
+        thumb = f'<img class="doc-card__thumb" src="{doc_url}" alt="{_esc(title)}">'
+    else:
+        thumb = '<div class="doc-card__thumb doc-card__thumb--placeholder"></div>'
     return (
         '<li><div class="doc-card">'
-        '<div class="doc-card__thumb doc-card__thumb--placeholder"></div>'
+        f"{thumb}"
         '<div class="doc-card__body">'
         f'<p class="doc-card__title">{_esc(title)}</p>'
         f'<p class="doc-card__meta">{_esc(kind_label)} &middot; uploaded {_esc(uploaded_at)}</p>'
@@ -1171,6 +1339,8 @@ def render_case_page(
     grounds: Sequence[GroundRecord],
     events: Sequence[CaseEvent],
     ledger: Ledger | None = None,
+    *,
+    force_theme: str | None = None,
 ) -> str:
     """Render the case page: interview transcript, evidence, reviewer
     opinions, adjudication, gate decisions with refusal explanations, and
@@ -1185,6 +1355,9 @@ def render_case_page(
     all. This package exposes the total as a `data-run-cost-usd` attribute
     on `<body>` -- the tribunal-timeline "This run: $0.02" chip itself is
     package C's (`app.js`) to render, reading this attribute.
+
+    `force_theme`: see `_html_tag` -- an opt-in `?theme=light`/`dark`
+    override for filming consistency, never a default.
     """
     by_type: dict[str, list[CaseEvent]] = {}
     for event in events:
@@ -1210,7 +1383,7 @@ def render_case_page(
 
     return f"""
 <!doctype html>
-<html>
+{_html_tag(force_theme)}
 <head>
   <meta charset="utf-8">
   <title>Setback -- {_esc(case.application_number)}</title>

@@ -72,8 +72,21 @@ def client(
     return TestClient(app)
 
 
+_REAL_SESSION = "11111111-1111-4111-8111-111111111111"
+"""A stand-in for `app.js`'s `window.crypto.randomUUID()` -- every genuine
+resident session is shaped like this (see `getResidentSessionId` in
+`console/static/app.js`), which is exactly what `console/app.py`'s docket-
+board hygiene filter (`_looks_like_a_resident_session`) uses to tell a real
+case apart from a manually-created smoke/test/deploy-verification one
+(`"s1"`, `"SMOKE-RATE-LIMIT-TEST-1"`, `"deploy-wiring-proof"`, ...), none of
+which are ever produced by the real create-case flow. Tests that exercise
+the docket board's *listing* behaviour use this constant so they are not
+accidentally testing the hygiene filter too; tests that don't care about
+docket-board visibility keep using short human-readable session labels."""
+
+
 def _create_case(
-    client: TestClient, *, application_number: str = "PAN-1", session: str = "s1"
+    client: TestClient, *, application_number: str = "PAN-1", session: str = _REAL_SESSION
 ) -> str:
     response = client.post(
         "/api/cases", json={"application_number": application_number, "resident_session": session}
@@ -87,7 +100,7 @@ def _create_case(
 
 def test_create_case_returns_deterministic_case_id(client: TestClient) -> None:
     case_id = _create_case(client)
-    assert case_id == case_id_for("PAN-1", "s1")
+    assert case_id == case_id_for("PAN-1", _REAL_SESSION)
 
 
 def test_create_case_is_idempotent(client: TestClient) -> None:
@@ -496,9 +509,12 @@ def test_refusal_feedback_unknown_case_is_404(client: TestClient) -> None:
 # --- HTML pages ----------------------------------------------------------------
 
 
+_REAL_SESSION_2 = "22222222-2222-4222-8222-222222222222"
+
+
 def test_docket_board_lists_created_cases(client: TestClient) -> None:
-    case_id = _create_case(client, application_number="PAN-1", session="s1")
-    _create_case(client, application_number="PAN-2", session="s2")
+    case_id = _create_case(client, application_number="PAN-1", session=_REAL_SESSION)
+    _create_case(client, application_number="PAN-2", session=_REAL_SESSION_2)
 
     response = client.get("/")
     assert response.status_code == 200
@@ -535,6 +551,124 @@ def test_docket_board_does_not_hardcode_a_light_theme(client: TestClient) -> Non
     assert 'data-theme="light"' not in response.text
 
 
+def test_docket_board_honours_theme_light_query_param(client: TestClient) -> None:
+    """`?theme=light` is an opt-in, filming-only override (never the
+    default -- see the test above) so a recording made on a machine whose
+    OS theme happens to be dark still matches every light-mode gallery
+    screenshot already captured. Stamps `data-theme="light"` on `<html>`
+    exactly as an explicit user toggle would, per `style.css`'s own
+    `:root[data-theme="light"]` contract -- no new CSS needed."""
+    response = client.get("/?theme=light")
+    assert response.status_code == 200
+    assert '<html data-theme="light">' in response.text
+
+
+def test_docket_board_ignores_an_unrecognised_theme_value(client: TestClient) -> None:
+    """Only the exact, documented value forces anything -- garbage input
+    degrades to the same system-default behaviour as no param at all,
+    never a crash or an unrecognised `data-theme` value reaching the DOM."""
+    response = client.get("/?theme=nonsense")
+    assert response.status_code == 200
+    assert "data-theme" not in response.text
+
+
+# --- docket hygiene: excluding smoke/test/deploy-verification cases --------
+
+
+@pytest.mark.parametrize(
+    "junk_session",
+    [
+        "SMOKE-RATE-LIMIT-TEST-1",
+        "deploy-wiring-proof",
+        "deploy-verify-au-001",
+        "smoke-session-final-run",
+        "rate-limit-burst",
+        "s1",
+    ],
+)
+def test_docket_board_excludes_cases_created_with_a_non_uuid_resident_session(
+    client: TestClient, junk_session: str
+) -> None:
+    """Every genuine resident case is created through the browser flow,
+    whose `resident_session` is always `window.crypto.randomUUID()`
+    (`getResidentSessionId`, `console/static/app.js`) -- never a short,
+    human-typed label. Every one of these labels is a real example from
+    this project's own smoke-testing/deploy-verification history
+    (STATUS.md, SMOKE.md) that a judge visiting the hosted docket board
+    would otherwise see ahead of the one real demo case. The rule is
+    purely structural (is `resident_session` UUID-shaped?), so it needs no
+    hardcoded blocklist and catches any future test label the same way."""
+    case_id = _create_case(client, application_number="PAN-JUNK", session=junk_session)
+
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "PAN-JUNK" not in response.text
+
+    # The exclusion is docket-*list* hygiene only -- a direct link to the
+    # case (its own unguessable case-id URL) must still work, exactly as
+    # it would for a real resident's case, per this fix's own brief.
+    case_response = client.get(f"/cases/{case_id}")
+    assert case_response.status_code == 200
+    assert "PAN-JUNK" in case_response.text
+
+
+def test_docket_board_includes_a_case_created_with_a_real_uuid_session(
+    client: TestClient,
+) -> None:
+    """The filter must not be so broad it hides real residents -- a normal
+    `_create_case` (UUID session, the default) still appears."""
+    _create_case(client, application_number="PAN-REAL")
+    response = client.get("/")
+    assert "PAN-REAL" in response.text
+
+
+# --- docket access gate (SETBACK_DOCKET_KEY) --------------------------------
+
+
+def test_docket_board_has_no_gate_when_setback_docket_key_is_unset(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No passphrase is configured (the default, e.g. local dev) -> the
+    docket list works exactly as it always has, with no `?key=` needed --
+    every test above already relies on this. Explicit here as its own
+    documented case rather than only incidentally covered elsewhere."""
+    monkeypatch.delenv("SETBACK_DOCKET_KEY", raising=False)
+    response = client.get("/")
+    assert response.status_code == 200
+
+
+def test_docket_board_requires_the_matching_key_once_configured(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once `SETBACK_DOCKET_KEY` is set, the docket *list* route (the one
+    that exposes every resident's case at a glance) needs a matching
+    `?key=` -- this is the real PII-exposure gap flagged live: no login,
+    no per-session boundary, a stranger's full case reachable from a
+    public board. An individual case page's own unguessable URL is
+    deliberately left ungated (see the next test) -- a judge who has a
+    direct link, or creates their own case, is never blocked."""
+    monkeypatch.setenv("SETBACK_DOCKET_KEY", "let-me-in")
+
+    no_key = client.get("/")
+    assert no_key.status_code == 401
+
+    wrong_key = client.get("/?key=nope")
+    assert wrong_key.status_code == 401
+
+    right_key = client.get("/?key=let-me-in")
+    assert right_key.status_code == 200
+
+
+def test_case_page_stays_reachable_without_the_docket_key(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case_id = _create_case(client)
+    monkeypatch.setenv("SETBACK_DOCKET_KEY", "let-me-in")
+
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+
+
 def test_docket_board_survives_a_fresh_app_instance_over_the_same_store(
     store: InMemoryCaseStore, composer: _FakeComposer
 ) -> None:
@@ -542,7 +676,7 @@ def test_docket_board_survives_a_fresh_app_instance_over_the_same_store(
     -- a brand-new app built over the same store (modelling a console
     restart/redeploy, or a second replica) must still show every case."""
     first_app = create_app(store, composer=composer, document_source=UserUploadedDocumentSource())
-    _create_case(TestClient(first_app), application_number="PAN-1", session="s1")
+    _create_case(TestClient(first_app), application_number="PAN-1", session=_REAL_SESSION)
 
     second_app = create_app(store, composer=composer, document_source=UserUploadedDocumentSource())
     response = TestClient(second_app).get("/")
@@ -568,6 +702,16 @@ def test_case_page_does_not_hardcode_a_light_theme(client: TestClient) -> None:
     assert 'data-theme="light"' not in response.text
 
 
+def test_case_page_honours_theme_light_query_param(client: TestClient) -> None:
+    """Same filming-consistency override as `test_docket_board_honours_
+    theme_light_query_param`, on the case page -- this is the page every
+    gallery/demo screenshot is actually captured from."""
+    case_id = _create_case(client)
+    response = client.get(f"/cases/{case_id}?theme=light")
+    assert response.status_code == 200
+    assert '<html data-theme="light">' in response.text
+
+
 def test_case_page_unknown_case_is_404(client: TestClient) -> None:
     response = client.get("/cases/does-not-exist")
     assert response.status_code == 404
@@ -588,6 +732,45 @@ def test_annotated_overlay_event_renders_as_an_image(
     response = client.get(f"/cases/{case_id}")
     assert response.status_code == 200
     assert '<img src="data:image/png;base64,QUJD"' in response.text
+
+
+def test_annotated_overlay_event_renders_with_its_own_legend(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """Regression for the live-reported bug: a normal (server-rendered,
+    non-SSE) case-page load previously showed the coloured-box overlay
+    image completely bare -- no `.doc-viewer` wrapper, no legend anywhere
+    -- because `_render_annotated_overlay_item` only ever emitted a lone
+    `<img>`, while `console/static/app.js`'s `handleAnnotatedOverlay`
+    built a full legend, but only in response to a *live* SSE event.
+    Reloading the page (a documented, common occurrence -- see SMOKE.md's
+    multi-instance/post-submission-reload notes) silently lost the legend
+    entirely, violating the product's own "any overlay colour on screen
+    must have its legend" rule. This asserts the server-rendered path now
+    carries the full four-role legend every time, matching
+    `evidence.overlays.OverlayRole`/`ROLE_LEGEND_TEXT` exactly, and that
+    every legend swatch has a CSS class distinct from the others."""
+    from setback.evidence.overlays import ROLE_CSS_CLASS_SUFFIX, ROLE_LEGEND_TEXT, OverlayRole
+
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "annotated-overlay:doc-1",
+            "annotated_overlay",
+            payload={"document_id": "doc-1", "mime_type": "image/png", "image_base64": "QUJD"},
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    body = response.text
+
+    assert "doc-viewer__legend" in body
+    assert body.count("doc-viewer__legend") == 1, "exactly one legend, not a duplicate"
+    for role in OverlayRole:
+        suffix = ROLE_CSS_CLASS_SUFFIX[role]
+        assert f"legend-swatch--{suffix}" in body
+        assert ROLE_LEGEND_TEXT[role] in body
 
 
 def test_submission_composed_event_renders_download_links(
@@ -732,6 +915,71 @@ def test_document_uploaded_photo_gets_your_photo_provenance_tag(client: TestClie
     response = client.get(f"/cases/{case_id}")
     assert 'class="tag tag--grade-a"' in response.text
     assert "Your photo" in response.text
+
+
+# --- doc-card real thumbnails for uploaded photo evidence -------------------
+
+
+def test_document_uploaded_photo_renders_a_real_img_thumbnail(client: TestClient) -> None:
+    """Regression for the gallery-reported gap: an uploaded photo (a
+    resident's own evidence) previously always rendered the generic grey
+    placeholder icon -- a judge sees a gallery shot captioned "Test photo"
+    next to a file icon, never the actual photo. A photo upload now gets a
+    real `<img>` thumbnail, served back from wherever the bytes actually
+    live (`EvidenceUploadStore.download_document` -- in-memory in tests,
+    GCS in production) via this case's own `/api/cases/{id}/documents/{id}`
+    endpoint, so it works identically against the deployed app."""
+    case_id = _create_case(client)
+    upload = client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+    )
+    document_id = upload.json()["document_id"]
+
+    response = client.get(f"/cases/{case_id}")
+    assert response.status_code == 200
+    assert "doc-card__thumb--placeholder" not in response.text
+    expected_src = f"/api/cases/{case_id}/documents/{document_id}"
+    assert f'<img class="doc-card__thumb" src="{expected_src}"' in response.text
+
+
+def test_document_uploaded_pdf_still_renders_the_placeholder_icon(client: TestClient) -> None:
+    """Only photo evidence gets a real thumbnail -- a PDF doc-card keeps
+    the placeholder icon (no PDF-preview pipeline exists, and none is
+    asked for here)."""
+    case_id = _create_case(client)
+    client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("site-plan.pdf", io.BytesIO(b"%PDF-fake"), "application/pdf")},
+    )
+    response = client.get(f"/cases/{case_id}")
+    assert "doc-card__thumb--placeholder" in response.text
+    assert "<img" not in response.text
+
+
+def test_get_uploaded_document_serves_the_stored_bytes(client: TestClient) -> None:
+    case_id = _create_case(client)
+    upload = client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+    )
+    document_id = upload.json()["document_id"]
+
+    response = client.get(f"/api/cases/{case_id}/documents/{document_id}")
+    assert response.status_code == 200
+    assert response.content == b"fake-photo-bytes"
+    assert response.headers["content-type"] == "image/jpeg"
+
+
+def test_get_uploaded_document_unknown_document_is_404(client: TestClient) -> None:
+    case_id = _create_case(client)
+    response = client.get(f"/api/cases/{case_id}/documents/does-not-exist")
+    assert response.status_code == 404
+
+
+def test_get_uploaded_document_unknown_case_is_404(client: TestClient) -> None:
+    response = client.get("/api/cases/does-not-exist/documents/does-not-exist")
+    assert response.status_code == 404
 
 
 def test_interview_turn_renders_as_chat_bubbles_with_no_raw_json(client: TestClient) -> None:
