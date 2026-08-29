@@ -1,3 +1,50 @@
+# STATUS — wave 6 fix-plan landed (2026-08-29)
+
+Wave-6 panel review (VERDICT.md) found the engineering ahead of median but every
+compliance/scoring gap a wrapper problem: unwired deploy stub, unfilled README
+brackets, an exposed public docket, a broken overlay widget, and several
+architecture-doc claims a grep disproved. Three fixers closed the full P0 list plus
+every ranked item that fit the ~6h budget, reconciled here:
+
+- **Stage One compliance**: `make deploy` now calls the real `deploy.sh` (was a stub
+  that printed "Not yet implemented" and exited 1); the ARCHITECTURE.md §9 mermaid
+  diagram is embedded in the README; local spin-up carries an honest no-offline-mode
+  caveat instead of silence; the verbatim hackathon model-eligibility clause is
+  inserted; `.env.example` no longer points a fresh clone at a nonexistent project id;
+  `deploy.sh` now grants `roles/datastore.user`/`roles/aiplatform.user` to both
+  service accounts (previously only manual, undocumented grants existed on the live
+  project).
+- **PII exposure / docket hygiene**: the public docket board's case *list* is now
+  gated behind `SETBACK_DOCKET_KEY` and filtered to real (UUID-shaped) resident
+  sessions, so smoke/test rows and a stranger's private objection no longer sit in
+  front of anyone with the URL; an individual case's own unguessable link is
+  unaffected.
+- **Multimodal UX**: the broken overlay widget (empty floating boxes, legend colours
+  the image never used) is fixed — a fourth FLAGGED role, all four colours pinned to
+  the console's own status tokens, and a shared server/client legend that can't drift
+  out of sync again. Uploaded photos now render as real thumbnails instead of a
+  placeholder icon.
+- **Docs-truth corrections**: ARCHITECTURE.md and DESIGN-DECISIONS.md no longer claim
+  the sweeper, the loop/turn counter, the s4.15 YAML/Firestore mirror, or the
+  per-collection credential-scoping enforcement that a full-tree grep proved were
+  never built — each is corrected to state what actually covers the gap today.
+- **Dispatch polish**: refusal/flagged headings now show the resident's own claim
+  text (or a plain-English category label) instead of a raw internal `ground_id` hash.
+
+Full suite: **503 passed** (up from 480), ruff check/format clean, mypy clean, security
+diff check clean (no secrets/identity/hostnames introduced). Pushed to `origin/main`.
+
+**Remaining = film-day items only** — everything left on the wave-6 plan needs the
+founder personally, not another agent pass: re-running the tribunal pipeline live 2–3×
+to see its honest, reliable output and scripting the demo's centerpiece beat around
+that (not a forced reviewer SPLIT); supplying/confirming the Devpost category
+checkbox; freezing deploys to the console after the final pre-film smoke test; one
+full timed rehearsal against the live deployed app; rewriting the video's cold open
+and close (currently unwritten); and the DISCLOSURE.md/Devpost narrative decisions
+around the solo agent-orchestrated build.
+
+---
+
 # STATUS — wave 5 ship-phase checkpoint: redeploy + UI smoke + proof run (2026-08-29)
 
 Ship-phase pass following the wave-5 UI-revamp integration checkpoint below: redeployed
