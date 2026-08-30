@@ -849,7 +849,8 @@
     lightbox.innerHTML =
       '<button type="button" class="lightbox__close" aria-label="Close full-size image">' +
       "&times;</button>" +
-      '<img class="lightbox__image" alt="">';
+      '<img class="lightbox__image" alt="">' +
+      '<p class="lightbox__caption" hidden></p>';
     lightbox.addEventListener("click", (event) => {
       if (event.target === lightbox || event.target.classList.contains("lightbox__close")) {
         closeLightbox();
@@ -859,11 +860,20 @@
     return lightbox;
   }
 
-  function openLightbox(src, alt) {
+  // `caption` is optional -- only the Street View fallback card supplies
+  // one (its mandatory Google attribution text, `data-lightbox-caption`
+  // on the trigger element); a resident's own photo has nothing to cite,
+  // so the caption paragraph stays hidden for it.
+  function openLightbox(src, alt, caption) {
     const lightbox = ensureLightbox();
     const img = lightbox.querySelector(".lightbox__image");
     img.src = src;
     img.alt = alt || "";
+    const captionEl = lightbox.querySelector(".lightbox__caption");
+    if (captionEl) {
+      captionEl.textContent = caption || "";
+      captionEl.hidden = !caption;
+    }
     lightbox.hidden = false;
   }
 
@@ -891,6 +901,36 @@
       openLightbox(img.dataset.fullResSrc || img.src, img.alt)
     );
   }
+
+  // Founder-reported P1 fix: an image evidence doc-card (the Street View
+  // fallback, or a resident's own photo -- see `console/app.py`'s
+  // `_render_document_uploaded_item`) is server-rendered as a
+  // `role="button"` div (`data-lightbox-src`/`-alt`/`-caption`), not a
+  // native `<button>`, since it wraps a whole flex layout of thumb/body/
+  // badge markup a `<button>` can't validly contain -- so both a click
+  // and an Enter/Space keydown must be wired by hand to keep it keyboard
+  // accessible. Opens the SAME lightbox the annotated overlay uses.
+  function wireDocCardLightbox(card) {
+    if (!card || card.dataset.lightboxWired) return;
+    card.dataset.lightboxWired = "1";
+    const open = () =>
+      openLightbox(
+        card.dataset.lightboxSrc,
+        card.dataset.lightboxAlt,
+        card.dataset.lightboxCaption
+      );
+    card.addEventListener("click", open);
+    card.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+        event.preventDefault();
+        open();
+      }
+    });
+  }
+
+  document
+    .querySelectorAll(".doc-card--lightbox")
+    .forEach((card) => wireDocCardLightbox(card));
 
   // The server-rendered overlay (a page reload/reopen after the run already
   // finished) needs wiring on load too, not just the live SSE-driven one.
