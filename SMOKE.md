@@ -1972,3 +1972,129 @@ grounding fix (site-plan-vocabulary overlay labels) is reconfirmed live on
 the actual redeployed revision. Zero defects found; nothing to fix; nothing
 rolled forward. **Build is RE-FROZEN for filming** — no further code change
 is expected before the founder's early-afternoon shoot today.
+
+---
+
+# SMOKE.md v11 — wave-12 SHIP: merge, redeploy, and P0/Veo proof (2026-08-30)
+
+## Merge
+
+`git fetch` confirmed both branches present on `origin`. Merged into `main`
+in order, `pytest`/`ruff check`/`mypy` run as a gate on the merged tree
+after each step, both green:
+
+1. `ui-bubbles-lightbox` (merge commit `0e9d272`) — the founder-reported
+   FILM-CRITICAL P0 (a saved case's rehydrated transcript rendering every
+   turn as a Setback bubble) plus the Street View/photo lightbox fix.
+   `664 passed` after this merge (+16 over pre-merge `main`'s 648).
+2. `veo-integration` (merge commit `9421487`) — the approved AI-illustration
+   evidence card. `676 passed` after this merge.
+
+Both branches had forked from `main` *before* two live P0 fixes landed on
+`main` this wave (the upload magic-byte-sniffing stored-XSS fix, the
+pipeline reviewer-label leak fix) — each branch's own diff, read in
+isolation against current `main`, looked like it *removed* both fixes. This
+was checked explicitly: `git merge-base` confirmed both branches predated
+those two commits, and after each real 3-way merge, `grep` for
+`_sniff_upload_content_type`, `_UPLOAD_MAGIC_SIGNATURES`,
+`X-Content-Type-Options`, and `Clause Reviewer:`/`Evidence Reviewer:`
+confirmed both P0 fixes survived intact in the merged tree — git's ort
+merge auto-resolved cleanly with no manual conflict resolution needed in
+either merge. Both merge commits pushed to `origin/main`.
+
+## Redeploy
+
+One `./deploy.sh` run (console + job, idempotent, per the script's own
+design). Result: `setback-console` revision **`setback-console-00020-sl4`**,
+100% traffic; `setback-tribunal` job generation **19**. HTTP-code-only
+verification (`curl -A "setback/0.1"`, no key values ever printed):
+
+```
+GET /                                                    -> 200
+GET /docket                        (no key)              -> 401
+GET /docket?key=<fetched to shell var, unset after>      -> 200
+GET /cases/cc9bfc59084fd7cac527c479f0e71996  (FILM2)     -> 200
+GET /cases/aeff0460678e76feceb7a5a7af934d31  (real-DA)   -> 200
+```
+
+`docket-key` was fetched from Secret Manager into a shell variable exactly
+once, used inside one `curl` call, and `unset` immediately after — the
+value itself was never printed, logged, or written to any file.
+
+## Browser verification (live, deployed revision above)
+
+19 pre-existing browser pages/tabs from prior QA rounds were found open at
+session start and closed before any new navigation, per standing
+instruction (one held an XSS-payload case title from prior red-team
+fuzzing — closed, not interacted with).
+
+**Founder P0 — saved-case bubble rendering**, confirmed on both canonical
+film cases, desktop (1280px) and mobile (390px): opened each case cold (no
+interview activity performed) and read the DOM directly
+(`.chat-turn--ai` vs `.chat-turn--resident`) rather than trusting visual
+inspection alone —
+
+- FILM2 (`cc9bfc59084fd7cac527c479f0e71996`): 18 turns, correctly
+  alternating AI/RESIDENT/AI/RESIDENT/... matching who actually spoke in
+  the transcript text (verified by reading each turn's own text, not just
+  its class).
+- real-DA (`aeff0460678e76feceb7a5a7af934d31`): 20 turns, same result.
+- At 390px: resident turns render as a distinct blue right-aligned bubble,
+  Setback's as plain left-aligned text — visually confirmed via screenshot,
+  not just DOM class inspection.
+
+**Street View / photo lightbox**: clicked FILM2's own-photo doc-card and
+real-DA's Street View doc-card. Both open the in-page lightbox modal
+(`role="button"` trigger → a `<img>` + "Close full-size image" button
+injected into the same page, confirmed via `list_pages` showing no new
+tab/window) — never a new tab. real-DA's Street View lightbox caption shows
+the genuinely visible "(c) Google Street View, 2024-06" attribution text.
+
+**Veo illustration card**: on FILM2's Evidence tab, a hazard-styled
+(yellow-bordered) `.simulation-card` renders with the mandatory,
+non-dismissible "AI-generated illustration — not evidence" label and a
+one-line explainer. Played the video via `element.play()` — confirmed real
+1920×1080 content actually decoding (`videoWidth`/`videoHeight` read back
+from the live `<video>` element, not just `readyState`). Network panel
+shows three `GET .../overshadowing-simulation.mp4` requests, each `206`
+(correct byte-range streaming behaviour), `content-type: video/mp4`,
+`content-length: 2494891` matching the committed asset. Same card confirmed
+present on real-DA (also one of the two canonical film cases, also has an
+overshadowing ground). **Right-cases-only gate verified negatively, not
+just positively**: the legacy predecessor case
+(`5e791203b4b538ec8b4de27b981e7ab6`) — same interview content, also raises
+an overshadowing ground, but *not* one of the two canonical film-case
+ids — shows the Street View card but **no** Simulation card at all, proving
+the gate keys on case id, not merely on ground category.
+
+**Chat-height fix**: still holds post-merge — the transcript panel has a
+bounded height with its own internal scrollbar (visible scroll thumb) at
+both viewport sizes, not full-page scroll.
+
+**Tabs**: Grounds/Evidence/Overlay/Documents all switch correctly
+post-merge, at both desktop and 390px; no console errors
+(`list_console_messages` empty on every page checked).
+
+## Security
+
+No secret value was read, printed, or transmitted — `docket-key` handled
+exactly as described above. `gcloud`/`git` used the operator's own existing
+authenticated session (identification-to-a-service-already-in-use, not
+data sent elsewhere) — no personal identifier appeared in any commit
+message, URL, request header, or file this round touched. All `curl` calls
+used the neutral `User-Agent: setback/0.1`. Canonical film cases FILM2 and
+real-DA were read-only browsed (page loads, tab clicks, one lightbox open,
+one video `.play()`) — never created, edited, or re-run. No QA test case
+was created this round.
+
+## Status
+
+**Ship phase complete.** Both branches merged to `main` (conventional merge
+commits `0e9d272`, `9421487`), full gates green after each
+(`664`→`676 passed`, `ruff check` clean, `mypy` clean), pushed. One
+redeploy: `setback-console-00020-sl4` + `setback-tribunal` gen 19,
+`australia-southeast1`. All founder P0s (saved-case bubble rendering,
+Street View/photo lightbox) and the approved Veo illustration card verified
+live on the deployed revision, on both canonical film cases, at desktop and
+390px, in a real Chrome browser — zero defects found, nothing rolled
+forward.
