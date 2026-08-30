@@ -995,16 +995,36 @@ def _mentions_a_junk_pattern(text: str) -> bool:
     return any(pattern in lowered for pattern in _JUNK_METADATA_PATTERNS)
 
 
+_DEPRECATED_CASE_IDS: Final[frozenset[str]] = frozenset(
+    {
+        "f3f8c3475e2646537212677fbf7c8075",  # DA2026/0412-FILM
+    }
+)
+"""Specific `case_id`s to hide from the docket-board list regardless of how
+legitimate their own `application_number`/`resident_session` look (P0
+synthesis wave 12, #4): `f3f8c3475e2646537212677fbf7c8075`
+(`DA2026/0412-FILM`) is a superseded predecessor of the canonical film case
+(`DA2026/0412-FILM2`, `cc9bfc59084fd7cac527c479f0e71996`) that was still
+showing up on the public docket next to it. A denylist keyed on `case_id`
+is used instead of extending `_JUNK_METADATA_PATTERNS` with a `film`
+substring precisely because that would also catch the canonical
+`DA2026/0412-FILM2` case -- `"film2".find("film") != -1` -- which must stay
+visible. Hide only, never delete: `/cases/{case_id}` is untouched."""
+
+
 def _is_hygiene_excluded(case: CaseRecord) -> bool:
     """True when `case` should never appear on the public docket-board
     *list* (its own `/cases/{case_id}` page is unaffected either way --
     see `docket_board`, which never calls this for the case-page route):
-    a `resident_session` that isn't UUID-shaped (`_looks_like_a_resident_
-    session`), or a `resident_session`/`application_number`/`case_id` that
-    contains one of `_JUNK_METADATA_PATTERNS`. The two checks are
-    deliberately independent (not just "non-UUID OR junk-keyword-in-
-    session") so a case with a genuine random UUID session is still caught
-    when the junk label was put in `application_number` instead."""
+    `case.case_id` is in `_DEPRECATED_CASE_IDS`, a `resident_session` that
+    isn't UUID-shaped (`_looks_like_a_resident_session`), or a
+    `resident_session`/`application_number`/`case_id` that contains one of
+    `_JUNK_METADATA_PATTERNS`. The latter two checks are deliberately
+    independent (not just "non-UUID OR junk-keyword-in-session") so a case
+    with a genuine random UUID session is still caught when the junk label
+    was put in `application_number` instead."""
+    if case.case_id in _DEPRECATED_CASE_IDS:
+        return True
     if not _looks_like_a_resident_session(case.resident_session):
         return True
     return any(

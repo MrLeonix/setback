@@ -12,14 +12,20 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
 
-from setback.console.app import RealJobTrigger, create_app, render_landing_page
+from setback.console.app import (
+    RealJobTrigger,
+    _is_hygiene_excluded,
+    create_app,
+    render_landing_page,
+)
 from setback.ingest.tracker import ExhibitedDocument, UserUploadedDocumentSource
 from setback.interview.flow import NormalisedConcern
-from setback.state.firestore import GroundStatus, InMemoryCaseStore, case_id_for
+from setback.state.firestore import CaseRecord, GroundStatus, InMemoryCaseStore, case_id_for
 
 
 class _FakeComposer:
@@ -963,6 +969,33 @@ def test_docket_board_keeps_case_a_visible_after_the_qa_deploy_extension(
     response = client.get("/docket")
     assert response.status_code == 200
     assert case_id in response.text
+
+
+def test_hygiene_excluded_hides_the_specific_deprecated_film_predecessor_case() -> None:
+    """P0 regression (wave-12 synthesis #4): `DA2026/0412-FILM`
+    (`f3f8c3475e2646537212677fbf7c8075`) is a deprecated predecessor of the
+    canonical film case (`DA2026/0412-FILM2`) that was still showing up on
+    the public docket board next to it. It's excluded by its specific
+    `case_id` (`_DEPRECATED_CASE_IDS`), not by extending the junk-pattern
+    heuristic with a `film` substring -- which would also catch the
+    canonical FILM2 case, still required to stay visible. A real UUID
+    `resident_session` and an otherwise unremarkable `application_number`
+    prove the case-id denylist, specifically, is what excludes it."""
+    deprecated = CaseRecord(
+        case_id="f3f8c3475e2646537212677fbf7c8075",
+        application_number="DA2026/0412-FILM",
+        resident_session=_REAL_SESSION,
+        created_at=datetime.now(UTC),
+    )
+    assert _is_hygiene_excluded(deprecated)
+
+    canonical_film2 = CaseRecord(
+        case_id="cc9bfc59084fd7cac527c479f0e71996",
+        application_number="DA2026/0412-FILM2",
+        resident_session=_REAL_SESSION,
+        created_at=datetime.now(UTC),
+    )
+    assert not _is_hygiene_excluded(canonical_film2)
 
 
 # --- docket hygiene: collapsing duplicate application numbers --------------
