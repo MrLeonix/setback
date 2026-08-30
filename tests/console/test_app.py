@@ -125,6 +125,20 @@ def test_create_case_is_idempotent(client: TestClient) -> None:
     assert first == second
 
 
+def test_create_case_marks_public_origin_for_an_anonymous_request(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """Spend-accuracy gap (security review, 2026-08-30): a case created by
+    an anonymous console visitor must be marked `public_origin` on its own
+    `case_created` event, so the job-side pipeline can later book this
+    case's real tribunal-run cost against the public spend ceiling."""
+    case_id = _create_case(client)
+
+    events = asyncio.run(store.list_events(case_id))
+    created_event = next(e for e in events if e.event_type == "case_created")
+    assert created_event.payload["public_origin"] is True
+
+
 # --- interview ------------------------------------------------------------
 
 
@@ -2846,6 +2860,32 @@ def test_privileged_session_bypasses_the_daily_case_creation_cap(
                 assert response.status_code == 201, response.text
         finally:
             del os.environ["SETBACK_DOCKET_KEY"]
+
+
+def test_create_case_does_not_mark_public_origin_for_a_privileged_request(
+    store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
+) -> None:
+    """A judge/founder session (a verified `sb_priv` cookie) is not an
+    anonymous visitor -- its cases must never be marked `public_origin`, so
+    the job-side pipeline never books a privileged session's own tribunal
+    spend against the public ceiling that pauses everyone else."""
+    app = create_app(store, composer=composer, job_trigger=job_trigger)
+    with TestClient(app, base_url="https://testserver") as privileged_client:
+        os.environ["SETBACK_DOCKET_KEY"] = "let-me-in"
+        try:
+            privileged_client.get("/docket?key=let-me-in")
+            response = privileged_client.post(
+                "/api/cases",
+                json={"application_number": "PAN-priv-origin", "resident_session": _REAL_SESSION},
+            )
+            assert response.status_code == 201, response.text
+            case_id = response.json()["case_id"]
+        finally:
+            del os.environ["SETBACK_DOCKET_KEY"]
+
+    events = asyncio.run(store.list_events(case_id))
+    created_event = next(e for e in events if e.event_type == "case_created")
+    assert created_event.payload["public_origin"] is False
 
 
 def test_tampered_privileged_cookie_does_not_bypass_the_daily_cap(

@@ -219,6 +219,29 @@ async def test_get_case_returns_none_for_unknown_case(store: CaseStore) -> None:
     assert await store.get_case("does-not-exist") is None
 
 
+async def test_create_case_defaults_to_not_public_origin(store: CaseStore) -> None:
+    case = await store.create_case(application_number="PAN-661190", resident_session="s1")
+
+    events = await store.list_events(case.case_id)
+    created_event = next(e for e in events if e.event_type == EventType.CASE_CREATED.value)
+    assert created_event.payload["public_origin"] is False
+
+
+async def test_create_case_records_public_origin_when_requested(store: CaseStore) -> None:
+    """A `public_origin=True` case (an anonymous console visitor) records
+    that on its own `case_created` event -- `job.pipeline`'s public-guard
+    cost booking reads exactly this event/payload back to decide whether a
+    completed tribunal run's ledger cost should count against the public
+    spend ceiling."""
+    case = await store.create_case(
+        application_number="PAN-661190", resident_session="s1", public_origin=True
+    )
+
+    events = await store.list_events(case.case_id)
+    created_event = next(e for e in events if e.event_type == EventType.CASE_CREATED.value)
+    assert created_event.payload["public_origin"] is True
+
+
 # --- list_cases ------------------------------------------------------------
 
 

@@ -753,10 +753,13 @@ def create_app(
         ],
     )
     async def create_case(body: CreateCaseRequest, request: Request) -> dict[str, Any]:
+        is_public = not is_privileged_request(request, docket_key_provider=docket_key_of)
         case = await store.create_case(
-            application_number=body.application_number, resident_session=body.resident_session
+            application_number=body.application_number,
+            resident_session=body.resident_session,
+            public_origin=is_public,
         )
-        if not is_privileged_request(request, docket_key_provider=docket_key_of):
+        if is_public:
             await guard_totals.increment_anonymous_cases()
             totals = await guard_totals.get_totals()
             await record_threshold_events_if_crossed(guard_totals, totals)

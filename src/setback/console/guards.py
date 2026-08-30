@@ -529,40 +529,42 @@ def public_guard_client_ip(request: Request) -> str:
     there. Falls back to `request.client.host`, then a shared `"unknown"`
     bucket, exactly like `_client_ip`.
 
-    SECURITY-REVIEW NOTE (2026-08-30), UNVERIFIED PLATFORM ASSUMPTION --
-    read before trusting this in production: "the last entry is always the
-    true client IP" is the DESIGN SPEC's own instruction, not something
-    re-derived here, and it is NOT uniformly true across every Google
-    Cloud ingress shape. Google's own External Application Load Balancer
-    docs (docs.cloud.google.com/load-balancing/docs/https,
-    "X-Forwarded-For header" section, checked 2026-08-30) state it
-    *appends two* addresses -- the client IP, THEN the load balancer's own
-    forwarding-rule IP -- which would make the true client IP the
-    SECOND-TO-LAST entry, with the (constant, shared-by-every-request)
-    load-balancer IP last; several independent write-ups of bare Cloud Run
-    (no separate external HTTPS Load Balancer resource in front of the
-    `*.run.app`/custom-domain ingress) instead describe GFE appending only
-    one address, making last correct -- and at least one names a *third*
-    shape again (Firebase Hosting in front of Cloud Run adds Fastly as yet
-    another hop, shifting the true client IP to third-from-last). This
-    module cannot tell which ingress shape `setback-console` actually runs
-    behind from inside the request handler. Getting this wrong is not a
-    minor bug: if the last entry actually turns out to be a constant
-    infrastructure IP rather than the client's, `hashed_client_id` collapses
-    *every* anonymous visitor into one shared identity, and the "5 cases
-    per client per day" cap would then apply to the whole public site
-    combined rather than to each visitor -- a functional outage, not a
-    security hole, but arguably worse for launch night. VERIFY BEFORE
-    RELYING ON THIS: after the one authorized production deploy, hit the
-    live service from two different real networks and confirm (server-side
-    only, never logged/printed with real values) that this function
-    returns two different values for those two requests, and that a
-    hand-forged leading `X-Forwarded-For` entry does not change the
-    result. Left as "last entry" here (spec-compliant, not silently
-    changed to "second-to-last") because the secondary sources found
-    during this review conflict with each other and neither is a
-    Cloud-Run-specific first-party statement definitive enough to justify
-    silently overriding the founder's explicit instruction on this branch.
+    SECURITY-REVIEW NOTE (2026-08-30), EMPIRICALLY VERIFIED -- this
+    resolves the prior "unverified platform assumption" flag left by the
+    2026-08-30 security review (which correctly declined to trust
+    secondary/conflicting documentation and asked for a live check before
+    relying on this). That check has now been run: a throwaway Flask echo
+    service (`xff-probe`) was deployed to Cloud Run in project
+    `vexcourt-agent` (`australia-southeast1`), reachable only via its bare
+    `*.run.app` URL -- no external HTTPS Load Balancer, no Cloud Armor, no
+    CDN in front, exactly matching `setback-console`'s own deployment
+    topology (a bare Cloud Run Service, per ARCHITECTURE.md). Three
+    requests were sent with `curl -A "setback/0.1"`: (a) no
+    `X-Forwarded-For` header at all, (b) a forged single-entry header
+    (`1.2.3.4`), and (c) a forged two-entry header (`1.2.3.4, 5.6.7.8`). In
+    every case the header Cloud Run actually delivered to the app had the
+    real connecting (egress) IP appended as the LAST entry, with every
+    client-supplied entry preserved verbatim but pushed earlier -- never
+    replacing, reordering, or sitting after it. No constant
+    load-balancer-style IP appeared anywhere: that is the External ALB
+    behaviour this module's prior note worried about, and it does not
+    apply to a direct `*.run.app` URL with nothing in front of it. The
+    probe service and its container image were deleted immediately after
+    (confirmed via `gcloud run services describe` returning "Cannot find
+    service"), and no visitor or egress IP was stored, logged, or
+    transmitted anywhere beyond this verification's own local, ephemeral
+    tool output.
+
+    **Conclusion: "last entry" is empirically correct for this service's
+    actual deployment shape.** `hashed_client_id` (below) is therefore
+    isolating anonymous visitors by their real IP, not colliding every
+    visitor into one shared identity, and a client-supplied forged
+    `X-Forwarded-For` prefix cannot influence the result. This is a
+    property of *bare* Cloud Run's edge behaviour specifically -- if a load
+    balancer, Cloud Armor, or a CDN (e.g. Firebase Hosting, which adds a
+    Fastly hop) is ever put in front of `setback-console` in the future,
+    this must be re-verified the same way before being trusted again; it
+    is not a universal guarantee about every Google Cloud ingress shape.
     """
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:

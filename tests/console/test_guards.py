@@ -594,6 +594,28 @@ def test_public_guard_client_ip_tolerates_trailing_whitespace_and_empty_segments
     assert public_guard_client_ip(request) == "5.6.7.8"
 
 
+def test_public_guard_client_ip_matches_the_empirically_probed_cloud_run_shapes() -> None:
+    """Pins the exact three header shapes observed live against a bare
+    Cloud Run deployment (`xff-probe`, `vexcourt-agent`,
+    `australia-southeast1`, 2026-08-30 -- see `public_guard_client_ip`'s
+    own docstring for the full writeup): a plain request with no header at
+    all, a single client-forged entry, and a two-entry client-forged
+    header, each with Cloud Run's own real (egress) IP appended last."""
+    egress_ip = "163.1.2.3"  # stand-in for the probe's real egress address
+
+    plain = _fake_public_request(host="10.0.0.1", headers={"X-Forwarded-For": egress_ip})
+    one_forged = _fake_public_request(
+        host="10.0.0.1", headers={"X-Forwarded-For": f"1.2.3.4,{egress_ip}"}
+    )
+    two_forged = _fake_public_request(
+        host="10.0.0.1", headers={"X-Forwarded-For": f"1.2.3.4, 5.6.7.8,{egress_ip}"}
+    )
+
+    assert public_guard_client_ip(plain) == egress_ip
+    assert public_guard_client_ip(one_forged) == egress_ip
+    assert public_guard_client_ip(two_forged) == egress_ip
+
+
 # --- public-abuse guard: salted client hashing -------------------------------
 
 

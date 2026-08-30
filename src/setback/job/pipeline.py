@@ -135,6 +135,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import sys
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -211,6 +212,7 @@ from setback.state.firestore import (
     GroundStatus,
     ResumeState,
 )
+from setback.state.guard_store import GuardTotalsStore
 from setback.state.ledger import BudgetExceededError, Ledger
 
 _FIXTURES_DIR: Final[Path] = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "nsw"
@@ -242,6 +244,64 @@ base64-encoded, before it even reaches Firestore, guaranteed to fail as
 `INVALID_ARGUMENT: Property payload contains an invalid nested entity.`
 (measured live). This width keeps the stored overlay comfortably under
 that ceiling while staying large enough to read on the case page."""
+
+
+# --- public-abuse guard: spend-accuracy gap (security review, 2026-08-30) --
+#
+# `console.guards`' public spend ceiling only ever booked per-turn interview
+# estimates and counts (see `console/app.py`'s `_book_anonymous_spend`) --
+# never this job's own ledger cost (the dominant real cost of a run: every
+# reviewer/adjudicator/grounding/polish model call) nor the Street View
+# Static API fetch cost, both of which happen entirely inside THIS process,
+# a separate Cloud Run Job container the console-side guard has no visibility
+# into at all. `RealPipelineRunner` closes that gap: when a case is
+# `public_origin` (see `state.firestore.CaseStore.create_case`'s own
+# docstring) and a `guard_totals_store` is wired (production only --
+# `job.main`'s default factory; every offline test in this module leaves it
+# `None`, matching every other live-only feature here), `run`/`_build_dossier`
+# book the real ledger cost and the Street View fetch cost against the same
+# `guard_totals/public` aggregate `console.guards.public_guard_dependency`
+# reads to decide whether the public demo is paused.
+
+_STREET_VIEW_FETCH_COST_USD: Final[float] = float(
+    os.environ.get("STREET_VIEW_FETCH_COST_USD", "0.007")
+)
+"""Deliberately duplicated from `console.guards.STREET_VIEW_FETCH_COST_USD`
+(same env var, same default) rather than imported: `console.app` already
+imports `job.pipeline`/`job.main` (its `LocalPipelineJobTrigger`, `console/
+app.py`'s own module docstring), so a `job.pipeline` -> `console.guards`
+import would either be a no-op re-export or, if `console.guards` ever grew
+its own import back toward `job`, a real circular-import risk -- this
+module's own docstring's "never reaching into another package's private
+internals" rule, extended to *no upward imports of `console` at all*, not
+just its internals. Reading the same env var keeps the two in sync at
+deploy time (one Cloud Run env var configures both processes) with zero
+import coupling between them."""
+
+_LEDGER_COST_BOOKING_KIND: Final[str] = "tribunal_ledger"
+_STREET_VIEW_COST_BOOKING_KIND: Final[str] = "street_view_fetch"
+
+_PUBLIC_GUARD_COST_BOOKED_EVENT_TYPE: Final[str] = "public_guard_cost_booked"
+
+
+def _guard_cost_booking_event_id(case_id: str, kind: str) -> str:
+    """A fixed, deterministic per-(case, cost-kind) event id -- the
+    idempotency key `_book_public_guard_cost` checks against this case's
+    own event log before booking (see that method's docstring)."""
+    return f"guard-cost-booked:{case_id}:{kind}"
+
+
+def _case_created_public_origin(events: Sequence[CaseEvent]) -> bool:
+    """Read this case's own `case_created` event payload for the
+    `public_origin` flag `console.app`'s `create_case` route records at
+    creation time (`state.firestore.CaseStore.create_case`'s own
+    docstring) -- `False` for a case with no `case_created` event at all
+    (should not arise: `run` always requires `resume.case is not None`
+    first) or one recorded before this flag existed."""
+    for event in events:
+        if event.event_type == "case_created":
+            return bool(event.payload.get("public_origin", False))
+    return False
 
 
 def _shrink_png_for_storage(
@@ -894,18 +954,25 @@ class RealPipelineRunner:
         ingest_client: httpx.AsyncClient | None = None,
         document_classifier: DocumentClassifier | None = None,
         street_view_secret_accessor: SecretAccessor | None = None,
+        guard_totals_store: GuardTotalsStore | None = None,
     ) -> None:
         """Args mirror the pipeline's real dependencies; `clause_model`/
         `evidence_model`/`ingest_client`/`grounding_client`/
-        `document_classifier`/`street_view_secret_accessor` exist so tests
-        can inject fakes -- production (`job.main`) leaves them at their
-        live defaults. `document_classifier` defaults to the real
-        `setback.clerk.classify_document` (see `_default_document_classifier`).
-        `street_view_secret_accessor` defaults to `None`, which
-        `evidence.imagery.fetch_street_view_fallback` itself resolves to a
-        live Secret Manager read (`default_secret_accessor()`) -- tests
-        inject a fake so the Street View trigger is exercisable with zero
-        live Secret Manager/Maps calls."""
+        `document_classifier`/`street_view_secret_accessor`/
+        `guard_totals_store` exist so tests can inject fakes -- production
+        (`job.main`) leaves them at their live defaults. `document_classifier`
+        defaults to the real `setback.clerk.classify_document` (see
+        `_default_document_classifier`). `street_view_secret_accessor`
+        defaults to `None`, which `evidence.imagery.fetch_street_view_
+        fallback` itself resolves to a live Secret Manager read
+        (`default_secret_accessor()`) -- tests inject a fake so the Street
+        View trigger is exercisable with zero live Secret Manager/Maps
+        calls. `guard_totals_store` defaults to `None` (every offline test
+        in this module) -- production wiring (`job.main`'s default pipeline
+        factory) passes a `state.guard_store.FirestoreGuardTotalsStore`
+        instead, the same aggregate `console.guards` reads to decide
+        whether the public demo is paused (see the "spend-accuracy gap"
+        section above `_book_public_guard_cost`)."""
         self._document_source = document_source
         self._polisher = polisher
         self._grounding_client = grounding_client
@@ -914,6 +981,78 @@ class RealPipelineRunner:
         self._ingest_client = ingest_client
         self._document_classifier = document_classifier or _default_document_classifier
         self._street_view_secret_accessor = street_view_secret_accessor
+        self._guard_totals_store = guard_totals_store
+
+    async def _book_public_guard_cost(
+        self,
+        case_id: str,
+        store: CaseStore,
+        events: Sequence[CaseEvent],
+        *,
+        kind: str,
+        amount_usd: float,
+        description: str,
+    ) -> None:
+        """Atomically book `amount_usd` against the public-spend guard
+        aggregate exactly once per `(case_id, kind)`, and only when this
+        case is `public_origin` (an anonymous visitor created it, see
+        `_case_created_public_origin`) and a `guard_totals_store` is wired
+        (production only). A no-op with no reads or writes at all when
+        either condition doesn't hold, or when `amount_usd` is not
+        positive (nothing genuinely happened to book).
+
+        **Idempotence** (spend-accuracy security-review follow-up,
+        2026-08-30 -- "a re-run/retry of the same job must not
+        double-book"): keyed off THIS case's own append-only event log --
+        the same durable, per-case, single-writer-assumed identity `run`'s
+        own top-of-function `submission_composed` re-run guard already
+        relies on (see that docstring), not a new idempotency mechanism.
+        `_guard_cost_booking_event_id` is a fixed, deterministic id for
+        this `(case_id, kind)` pair; if it is already present in `events`
+        (this job execution's own freshly-loaded `resume.events`, current
+        as of the moment this process started), a prior, separate job
+        execution already booked this exact cost -- most likely a crash
+        between booking and writing `submission_composed`, followed by a
+        Cloud Run Job retry -- and this call is a no-op.
+
+        `GuardTotalsStore.add_spend` is itself a single atomic Firestore
+        field-transform increment (`state.guard_store`'s "Concurrency"
+        section) with no read-then-write window of its own; this marker
+        event supplies the other half of idempotence a bare increment
+        can't provide by itself -- "don't call it twice" -- mirroring
+        `GuardTotalsStore.record_threshold_event`'s own existence-check-
+        then-set shape, just scoped to a case's own event log (this
+        module's own natural, already-idempotent identity) rather than a
+        dedicated Firestore document under `guard_totals/public`.
+
+        Accepted residual gap, documented rather than solved here (out of
+        this fix's scope, and this build's own crash-recovery story is
+        already "no automated recovery", per `ARCHITECTURE.md`/`DESIGN-
+        DECISIONS.md`): a crash-then-retry that resumes and completes
+        additional, still-unresolved grounds will not re-book the
+        incremental ledger cost accrued during that retry, since the
+        marker from the interrupted attempt already exists. This
+        deliberately favours *never double-booking* (the explicit,
+        non-negotiable requirement) over exact accuracy across a crash
+        boundary this codebase does not otherwise recover from -- and
+        under-counting here is symmetric with, not a reintroduction of,
+        the original spend-accuracy gap this closes: before this fix, the
+        job's own cost was never booked at all, in every case, every run.
+        """
+        if self._guard_totals_store is None or amount_usd <= 0:
+            return
+        if not _case_created_public_origin(events):
+            return
+        marker_id = _guard_cost_booking_event_id(case_id, kind)
+        if any(event.event_id == marker_id for event in events):
+            return
+        await self._guard_totals_store.add_spend(amount_usd)
+        await store.append_event(
+            case_id,
+            marker_id,
+            _PUBLIC_GUARD_COST_BOOKED_EVENT_TYPE,
+            payload={"kind": kind, "amount_usd": amount_usd, "description": description},
+        )
 
     async def _ground_annotated_evidence(
         self, dossier: CaseDossier
@@ -1152,6 +1291,7 @@ class RealPipelineRunner:
         fallback_document: tuple[str, str, bytes, ProvenanceGrade],
         *,
         store: CaseStore | None,
+        events: Sequence[CaseEvent] = (),
     ) -> None:
         """Surface a fetched Street View fallback to the resident-facing
         Evidence section, not only to the grounding model.
@@ -1178,6 +1318,14 @@ class RealPipelineRunner:
         handful of this module's white-box tests call `_build_dossier`
         directly with no store, and degrading rather than requiring one
         keeps those unaffected) -- `run()` always passes a real one.
+
+        Also books the real, metered Street View Static API cost against
+        the public-spend guard aggregate via `_book_public_guard_cost` --
+        `events` should be this case's own `resume.events` (its caller,
+        `_build_dossier`, has exactly that); a no-op there when the case
+        isn't `public_origin` or no `guard_totals_store` is wired, exactly
+        like every other call into that method (see its own docstring for
+        the "spend-accuracy gap" this closes and its idempotence guarantee).
         """
         if store is None:
             return
@@ -1197,6 +1345,16 @@ class RealPipelineRunner:
                 "size_bytes": len(image_bytes),
                 "provenance_grade": grade.value,
             },
+        )
+        await self._book_public_guard_cost(
+            case_id,
+            store,
+            events,
+            kind=_STREET_VIEW_COST_BOOKING_KIND,
+            amount_usd=_STREET_VIEW_FETCH_COST_USD,
+            description=(
+                "Street View Static API fetch (evidence.imagery.fetch_street_view_fallback)"
+            ),
         )
 
     async def _build_dossier(
@@ -1265,7 +1423,7 @@ class RealPipelineRunner:
             if fallback_document is not None:
                 photo_documents.append(fallback_document)
                 await self._record_street_view_fallback_event(
-                    case_id, fallback_document, store=store
+                    case_id, fallback_document, store=store, events=resume.events
                 )
 
         dossier = build_dossier(
@@ -1557,6 +1715,23 @@ class RealPipelineRunner:
 
         await store.save_breaker(case_id, adjudicator_breaker)
         await store.save_ledger(case_id, ledger)
+        # Spend-accuracy gap (security review, 2026-08-30): this run's real
+        # ledger cost -- every reviewer/adjudicator/grounding/polish model
+        # call above, the dominant real cost of a tribunal run -- is now
+        # known. Book it against the public-spend guard aggregate when this
+        # case is `public_origin`; see `_book_public_guard_cost`'s own
+        # docstring for the idempotence guarantee (no double-booking on a
+        # crash-then-retry) and why this closes the gap `console.guards`'
+        # per-turn estimate booking alone could never reach (that guard has
+        # no visibility into this separate Cloud Run Job container at all).
+        await self._book_public_guard_cost(
+            case_id,
+            store,
+            resume.events,
+            kind=_LEDGER_COST_BOOKING_KIND,
+            amount_usd=ledger.total_cost_usd,
+            description="tribunal run ledger cost (reviewers, adjudication, grounding, polish)",
+        )
 
         case_info = CaseInfo(
             da_number=dossier.da_record.council_application_number,

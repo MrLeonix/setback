@@ -180,12 +180,24 @@ def _default_pipeline_factory() -> PipelineRunner:
     codebase makes, timing out for real real-world NSW-API latency observed
     directly during this wave's live verification (a real, successful fetch
     of this build's own demo PAN took ~8.5s end-to-end). A neutral
-    `User-Agent` carries no identity, per this project's security rules."""
+    `User-Agent` carries no identity, per this project's security rules.
+
+    `guard_totals_store` (security-review spend-accuracy-gap fix,
+    2026-08-30): a real `FirestoreGuardTotalsStore`, the same aggregate
+    `console.app`'s own production wiring (`_build_production_app`) passes
+    `console.guards`' public-spend-ceiling reader -- this job's Cloud Run
+    Job service account (`sa-orchestrator`) already has the `datastore.user`
+    role needed to write it. Without this, `RealPipelineRunner` would never
+    book this job's own (dominant) real cost against the ceiling the
+    founder is relying on as the one hard blocker on public spend, exactly
+    the gap the security review's headline finding described for the
+    console side."""
     import httpx
 
     from setback.evidence.storage import GcsEvidenceStore
     from setback.job.pipeline import RealPipelineRunner
     from setback.models.client import ModelClient
+    from setback.state.guard_store import FirestoreGuardTotalsStore
 
     return RealPipelineRunner(
         document_source=GcsEvidenceStore(),
@@ -196,6 +208,7 @@ def _default_pipeline_factory() -> PipelineRunner:
             headers={"User-Agent": "setback/0.1"},
             timeout=httpx.Timeout(30.0, connect=10.0),
         ),
+        guard_totals_store=FirestoreGuardTotalsStore(),
     )
 
 

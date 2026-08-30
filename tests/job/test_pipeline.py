@@ -40,11 +40,15 @@ from setback.ingest.tracker import (
     UserUploadedDocumentSource,
 )
 from setback.job.pipeline import (
+    _LEDGER_COST_BOOKING_KIND,
     _MAX_TRACKER_DOCUMENTS,
+    _STREET_VIEW_COST_BOOKING_KIND,
     _STREET_VIEW_DOCUMENT_ID,
+    _STREET_VIEW_FETCH_COST_USD,
     RealPipelineRunner,
     _first_page_text,
     _GroundedOverlayContext,
+    _guard_cost_booking_event_id,
     _load_frozen_ingest,
     _load_ingest_for_application,
     _looks_like_plan_document,
@@ -55,6 +59,7 @@ from setback.job.pipeline import (
     _shrink_png_for_storage,
 )
 from setback.state.firestore import GroundStatus, InMemoryCaseStore, resume_case
+from setback.state.guard_store import InMemoryGuardTotalsStore
 from tests.court._fakes import FakeLlm, review_body
 
 
@@ -613,13 +618,16 @@ async def _seed_case(
     store: InMemoryCaseStore,
     *,
     document_source: UserUploadedDocumentSource,
+    public_origin: bool = False,
 ) -> tuple[str, str, str]:
     """Seed a case with two confirmed concerns (one planning-relevant, one
     not) and one uploaded plan document, mirroring what the console's
     interview + upload endpoints record. Returns
     `(case_id, overshadowing_ground_id, property_value_ground_id)`."""
     case = await store.create_case(
-        application_number=_APPLICATION_NUMBER, resident_session="resident-1"
+        application_number=_APPLICATION_NUMBER,
+        resident_session="resident-1",
+        public_origin=public_origin,
     )
     case_id = case.case_id
 
@@ -671,7 +679,10 @@ async def _seed_case(
 
 
 async def _seed_case_single_ground(
-    store: InMemoryCaseStore, *, document_source: UserUploadedDocumentSource
+    store: InMemoryCaseStore,
+    *,
+    document_source: UserUploadedDocumentSource,
+    public_origin: bool = False,
 ) -> tuple[str, str]:
     """Like `_seed_case` but with exactly one confirmed ground -- for tests
     that need every ground's reviewer citation to land on a single,
@@ -681,7 +692,9 @@ async def _seed_case_single_ground(
     ground a given anchor ends up attributed to). Returns
     `(case_id, ground_id)`."""
     case = await store.create_case(
-        application_number=_APPLICATION_NUMBER, resident_session="resident-1"
+        application_number=_APPLICATION_NUMBER,
+        resident_session="resident-1",
+        public_origin=public_origin,
     )
     case_id = case.case_id
 
@@ -807,6 +820,172 @@ async def test_run_ships_a_resolvable_ground_and_refuses_the_irrelevant_one() ->
     assert property_value_id not in submission_event.payload["refusals_markdown"]
     assert "### Property value" in submission_event.payload["refusals_markdown"]
     assert "not a matter listed in s4.15(1)" in submission_event.payload["refusals_markdown"]
+
+
+# --- public-abuse guard: spend-accuracy gap (security review, 2026-08-30) --
+
+
+def _supporting_fakes(ground_id: str) -> tuple[FakeLlm, FakeLlm]:
+    """A clause/evidence reviewer pair that unanimously supports `ground_id`
+    off the plan document's own page-level anchor -- just enough court
+    activity for `run` to accrue a non-zero `ledger.total_cost_usd`, which
+    is what these tests actually care about."""
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+    clause = FakeLlm(
+        model="gemini-3.5-flash-lite",
+        bodies=[
+            review_body(
+                ground_id=ground_id,
+                stance="support",
+                confidence=0.95,
+                cited_anchor_ids=[page_anchor_id],
+                rationale="clause reviewer supports",
+            )
+        ],
+    )
+    evidence = FakeLlm(
+        model="gemini-3.5-flash-lite",
+        bodies=[
+            review_body(
+                ground_id=ground_id,
+                stance="support",
+                confidence=0.9,
+                cited_anchor_ids=[page_anchor_id],
+                rationale="evidence reviewer supports",
+            )
+        ],
+    )
+    return clause, evidence
+
+
+async def test_run_books_ledger_cost_against_guard_totals_for_a_public_origin_case() -> None:
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, public_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    guard_totals_store = InMemoryGuardTotalsStore()
+
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        grounding_client=None,
+        guard_totals_store=guard_totals_store,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    ledger = await store.load_ledger(case_id)
+    assert ledger is not None
+    assert ledger.total_cost_usd > 0
+
+    totals = await guard_totals_store.get_totals()
+    assert totals.spend_usd == pytest.approx(ledger.total_cost_usd)
+
+    events = await store.list_events(case_id)
+    marker_id = _guard_cost_booking_event_id(case_id, _LEDGER_COST_BOOKING_KIND)
+    booked_events = [e for e in events if e.event_id == marker_id]
+    assert len(booked_events) == 1
+    assert booked_events[0].event_type == "public_guard_cost_booked"
+    assert booked_events[0].payload["amount_usd"] == pytest.approx(ledger.total_cost_usd)
+
+
+async def test_run_does_not_book_ledger_cost_for_a_non_public_origin_case() -> None:
+    """The default case (no `public_origin=True`) must never book against
+    the public guard, even when a `guard_totals_store` is wired -- a
+    judge/founder session's own usage never counts against the ceiling
+    that pauses everyone else (mirrors `console.app._book_anonymous_spend`'s
+    own privileged-session exemption)."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(store, document_source=document_source)
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    guard_totals_store = InMemoryGuardTotalsStore()
+
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        grounding_client=None,
+        guard_totals_store=guard_totals_store,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    totals = await guard_totals_store.get_totals()
+    assert totals.spend_usd == 0.0
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type == "public_guard_cost_booked" for e in events)
+
+
+async def test_run_does_not_book_ledger_cost_when_no_guard_totals_store_is_configured() -> None:
+    """`guard_totals_store` defaults to `None` (every other offline test in
+    this module) -- a public_origin case must still run to completion with
+    zero guard-booking side effects, never an `AttributeError`/crash."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, public_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        grounding_client=None,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type == "public_guard_cost_booked" for e in events)
+
+
+async def test_run_does_not_double_book_ledger_cost_on_a_retried_job_execution() -> None:
+    """Idempotence (spend-accuracy security-review follow-up, 2026-08-30):
+    a crash-then-retry of the SAME job execution must not book the same
+    ledger cost twice. Simulated here by pre-appending the exact marker
+    event a completed booking would have written *before* `run` is ever
+    called -- standing in for "a prior, separate job execution already
+    booked this and then crashed before writing `submission_composed`" --
+    and confirming the aggregate is untouched by this (fresh) execution."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, public_origin=True
+    )
+    marker_id = _guard_cost_booking_event_id(case_id, _LEDGER_COST_BOOKING_KIND)
+    await store.append_event(
+        case_id,
+        marker_id,
+        "public_guard_cost_booked",
+        payload={"kind": _LEDGER_COST_BOOKING_KIND, "amount_usd": 0.05, "description": "prior run"},
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    guard_totals_store = InMemoryGuardTotalsStore()
+
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        grounding_client=None,
+        guard_totals_store=guard_totals_store,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    # Never touched: the marker from the "prior execution" already
+    # satisfied `_book_public_guard_cost`'s idempotency check.
+    totals = await guard_totals_store.get_totals()
+    assert totals.spend_usd == 0.0
+
+    events = await store.list_events(case_id)
+    booked_events = [e for e in events if e.event_id == marker_id]
+    assert len(booked_events) == 1  # the pre-seeded marker, never duplicated
 
 
 async def test_a_ground_the_court_rejects_never_ships_even_with_a_resolving_citation() -> None:
@@ -2335,6 +2514,130 @@ async def test_build_dossier_adds_a_street_view_fallback_when_no_resident_photo_
         )
     )
     assert stored_bytes == _tiny_white_png(50, 50)
+
+
+@respx.mock
+async def test_build_dossier_books_street_view_cost_for_a_public_origin_case() -> None:
+    """Spend-accuracy gap (security review, 2026-08-30): the real, metered
+    Street View Static API fetch cost must be booked against the public
+    guard aggregate when the fetching case is `public_origin` -- this cost
+    happens entirely inside this job process, invisible to `console.guards`'
+    own per-turn estimate booking."""
+    _mock_live_onlineda_and_spatial_for_other_pan()
+    _mock_etrack_lists_no_documents()
+    respx.get(STREET_VIEW_METADATA_URL).mock(
+        return_value=httpx.Response(200, json={"status": "OK", "pano_id": "p1", "date": "2023-01"})
+    )
+    respx.get(STREET_VIEW_IMAGE_URL).mock(
+        return_value=httpx.Response(200, content=_tiny_white_png(50, 50))
+    )
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(
+        application_number=_OTHER_PAN, resident_session="resident-1", public_origin=True
+    )
+    case_id = case.case_id
+    plan_document_id = "elevations-doc"
+    document_source.add_document(_OTHER_PAN, plan_document_id, ELEVATIONS_PDF.read_bytes())
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{plan_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": plan_document_id,
+            "filename": "elevations.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 123,
+        },
+    )
+    guard_totals_store = InMemoryGuardTotalsStore()
+
+    async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+        runner = RealPipelineRunner(
+            document_source=document_source,
+            ingest_client=ingest_client,
+            grounding_client=None,
+            street_view_secret_accessor=_fake_street_view_secret_accessor,
+            guard_totals_store=guard_totals_store,
+        )
+        resume = await resume_case(store, case_id)
+        await runner._build_dossier(case_id, resume, store=store)  # noqa: SLF001
+
+    totals = await guard_totals_store.get_totals()
+    assert totals.spend_usd == pytest.approx(_STREET_VIEW_FETCH_COST_USD)
+
+    events = await store.list_events(case_id)
+    marker_id = _guard_cost_booking_event_id(case_id, _STREET_VIEW_COST_BOOKING_KIND)
+    booked_events = [e for e in events if e.event_id == marker_id]
+    assert len(booked_events) == 1
+    assert booked_events[0].event_type == "public_guard_cost_booked"
+
+
+@respx.mock
+async def test_build_dossier_does_not_double_book_street_view_cost_on_a_retried_job_execution() -> (
+    None
+):
+    """Idempotence, mirroring the ledger-cost test: a marker from a prior,
+    separate execution must stop this one from booking again."""
+    _mock_live_onlineda_and_spatial_for_other_pan()
+    _mock_etrack_lists_no_documents()
+    respx.get(STREET_VIEW_METADATA_URL).mock(
+        return_value=httpx.Response(200, json={"status": "OK", "pano_id": "p1", "date": "2023-01"})
+    )
+    respx.get(STREET_VIEW_IMAGE_URL).mock(
+        return_value=httpx.Response(200, content=_tiny_white_png(50, 50))
+    )
+
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case = await store.create_case(
+        application_number=_OTHER_PAN, resident_session="resident-1", public_origin=True
+    )
+    case_id = case.case_id
+    plan_document_id = "elevations-doc"
+    document_source.add_document(_OTHER_PAN, plan_document_id, ELEVATIONS_PDF.read_bytes())
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{plan_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": plan_document_id,
+            "filename": "elevations.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 123,
+        },
+    )
+    marker_id = _guard_cost_booking_event_id(case_id, _STREET_VIEW_COST_BOOKING_KIND)
+    await store.append_event(
+        case_id,
+        marker_id,
+        "public_guard_cost_booked",
+        payload={
+            "kind": _STREET_VIEW_COST_BOOKING_KIND,
+            "amount_usd": _STREET_VIEW_FETCH_COST_USD,
+            "description": "prior run",
+        },
+    )
+    guard_totals_store = InMemoryGuardTotalsStore()
+
+    async with httpx.AsyncClient(follow_redirects=True) as ingest_client:
+        runner = RealPipelineRunner(
+            document_source=document_source,
+            ingest_client=ingest_client,
+            grounding_client=None,
+            street_view_secret_accessor=_fake_street_view_secret_accessor,
+            guard_totals_store=guard_totals_store,
+        )
+        resume = await resume_case(store, case_id)
+        await runner._build_dossier(case_id, resume, store=store)  # noqa: SLF001
+
+    totals = await guard_totals_store.get_totals()
+    assert totals.spend_usd == 0.0
+
+    events = await store.list_events(case_id)
+    booked_events = [e for e in events if e.event_id == marker_id]
+    assert len(booked_events) == 1  # the pre-seeded marker, never duplicated
 
 
 @respx.mock

@@ -339,8 +339,20 @@ class CaseStore(Protocol):
     """
 
     async def create_case(
-        self, *, application_number: str, resident_session: str
-    ) -> CaseRecord: ...
+        self, *, application_number: str, resident_session: str, public_origin: bool = False
+    ) -> CaseRecord:
+        """`public_origin=True` marks a case created by an anonymous (not
+        `console.guards.is_privileged_request`) caller -- recorded on this
+        case's own `case_created` event payload (`EventType.CASE_CREATED`),
+        never as a new `CaseRecord` field: it is set once, at creation, and
+        every other reader of a case's origin (`job.pipeline`'s public-guard
+        cost booking, see that module) already reads this same append-only
+        event log rather than a separate mutable flag. Idempotent like
+        every other field here: a second `create_case` call against an
+        existing case id is a no-op regardless of what `public_origin` it
+        is called with -- a case's origin, like its `application_number`,
+        is fixed at the moment it is first created."""
+        ...
 
     async def get_case(self, case_id: str) -> CaseRecord | None: ...
 
@@ -454,7 +466,9 @@ class InMemoryCaseStore:
             raise CaseNotFoundError(case_id)
         return data
 
-    async def create_case(self, *, application_number: str, resident_session: str) -> CaseRecord:
+    async def create_case(
+        self, *, application_number: str, resident_session: str, public_origin: bool = False
+    ) -> CaseRecord:
         case_id = case_id_for(application_number, resident_session)
         existing = self._get(case_id)
         if existing is not None:
@@ -470,7 +484,7 @@ class InMemoryCaseStore:
             case_id,
             _case_created_event_id(case_id),
             EventType.CASE_CREATED,
-            payload={"application_number": application_number},
+            payload={"application_number": application_number, "public_origin": public_origin},
         )
         return record
 
@@ -795,7 +809,9 @@ class FirestoreCaseStore:
         if not snapshot.exists:
             raise CaseNotFoundError(case_id)
 
-    async def create_case(self, *, application_number: str, resident_session: str) -> CaseRecord:
+    async def create_case(
+        self, *, application_number: str, resident_session: str, public_origin: bool = False
+    ) -> CaseRecord:
         case_id = case_id_for(application_number, resident_session)
         ref = self._case_ref(case_id)
         snapshot = await ref.get()
@@ -814,7 +830,7 @@ class FirestoreCaseStore:
             case_id,
             _case_created_event_id(case_id),
             EventType.CASE_CREATED,
-            payload={"application_number": application_number},
+            payload={"application_number": application_number, "public_origin": public_origin},
         )
         return record
 
