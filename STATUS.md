@@ -1,3 +1,45 @@
+# STATUS — wave 12 ship phase: merged, redeployed, Veo shipped (2026-08-30)
+
+Ship phase closed out the wave-12 fix rounds below: merged both parked feature branches to
+`main`, ran the full gate, and redeployed. Full detail in `SMOKE.md`'s "Ship phase" section
+(the redeploy + live browser verification); headline here.
+
+- **Merged to `main`:** `ui-bubbles-lightbox` (founder P0 saved-case chat-bubble
+  speaker/role fix, plus the photo/Street View doc-card in-page lightbox) and
+  `veo-integration` (the founder-approved AI-generated overshadowing-illustration card —
+  see below). Both branches had forked before the same-wave reviewer-label-leak and
+  upload-magic-byte-sniffing P0 fixes landed on `main`; both merges were confirmed by grep,
+  post-merge, to still carry those two fixes intact.
+- **Redeployed:** `setback-console` revision `setback-console-00020-sl4` (100% traffic),
+  `setback-tribunal` job generation **19**, `australia-southeast1`. This supersedes the
+  `setback-console-00018-z2s` / generation-17 revision recorded in the wave-12 P0 entries
+  below — anything in this file or elsewhere citing `00018-z2s` as the current live
+  revision is describing the pre-ship-phase deploy, not what's live now.
+- **Veo illustration card shipped** (founder-approved, "ship Veo"): a pre-generated
+  `veo-3.1-generate-001` clip, conditioned on the real DA's own elevation drawing, renders
+  on the Evidence tab of both canonical film cases (each raised an overshadowing ground),
+  captioned with the mandatory, non-dismissible "AI-generated illustration — not evidence"
+  label. No on-demand/runtime Veo calls — the clip is a static asset. Structurally excluded
+  from the tribunal pipeline (never an anchor/`SourceDocument`, never citable, never seen by
+  a reviewer or the adjudicator); confirmed both by a new structural-exclusion unit test
+  against a built case dossier and by live browser verification (real video decode, correct
+  byte-range streaming, and a negative check confirming the card does **not** render on a
+  legacy case that raises the same ground but isn't one of the two conditioned-on case ids).
+- Full offline suite green: **676 passed** (up from 662 at the prior P0-fix-round entry
+  below), `ruff check` clean, `ruff format --check` clean, full-tree `mypy` clean. No secret
+  value, personal identifier, or hostname was read, printed, or transmitted this round;
+  `docket-key` was fetched into a shell variable once for one verification `curl` call and
+  `unset` immediately after.
+
+**Known, not fixed by this phase:** the composed objection letter's internal
+`Clause Reviewer:`/`Evidence Reviewer:` label leak (P0 #3 in the wave-12 synthesis) is fixed
+in `job/pipeline.py` for any case run from here on, but the two canonical film cases'
+already-stored letters were composed before that fix existed and are not retroactively
+repaired — see the P0-fix-round entry below for the full explanation and why a canonical
+case's stored documents aren't re-run to fix it.
+
+---
+
 # STATUS — wave 12 P0 fix round part 2: security leak + XSS closed (2026-08-30)
 
 Resumed the wave-12 synthesis's full 9-item P0 list against the section below (which

@@ -119,7 +119,7 @@ make test
 make run-local
 ```
 
-`make test` runs the full offline suite (480 tests) and `make run-local`
+`make test` runs the full offline suite (676 tests) and `make run-local`
 serves the console UI on `localhost:8000` with no network calls — both work
 with no GCP project at all, and are enough to read the code, run the tests,
 and click through the UI.
@@ -185,12 +185,27 @@ model behind the two service accounts it deploys as.
 | `gemini-3.5-flash-lite` | Resident-facing interview | MINIMAL |
 | `gemini-3.7-flash` | Adjudication bench (conflict resolution / escalation) | LOW (its effective floor) |
 | `gemma-4-26b-a4b-it-maas` | Low-cost clerical extraction & refusal prose (OpenAI-compatible MaaS endpoint) | n/a |
+| `veo-3.1-generate-001` | Overshadowing-simulation illustration — see below | n/a |
 
 Mandatory for all categories: 1) Gemini 3.5 or newer accessed through Gemini
 API or Vertex AI.
 
-All three models above are accessed through Vertex AI and satisfy this
+All four models above are accessed through Vertex AI and satisfy this
 requirement.
+
+**Veo's role is illustration only, never evidence.** Two canonical demo
+cases that raised an overshadowing ground each carry one Veo-generated
+video clip on their Evidence tab, conditioned on the real DA's own
+elevation drawing, captioned with a mandatory, non-dismissible
+"AI-generated illustration — not evidence" label. The clip was generated
+once, offline, ahead of time (`veo-3.1-generate-001`, 1080p, 16:9, 8s) and
+is served as a static asset — the running app makes no on-demand Veo calls.
+It is structurally excluded from the tribunal's evidence pipeline: it is
+never built into a `SourceDocument`/`EvidenceAnchor`, so it can never be
+cited, graded, or seen by either reviewer or the adjudicator
+(`tests/evidence/test_illustration.py` asserts this directly against a
+built case dossier). See [DISCLOSURE.md](./DISCLOSURE.md) for the
+generation process.
 
 ## Data sources
 

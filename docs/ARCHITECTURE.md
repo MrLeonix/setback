@@ -227,7 +227,7 @@ cases/{case_id}/grounds/{ground_id}
 cases/{case_id}/evidence/{anchor_id}
   anchor_id          = sha256(source_doc + page + bbox_tuple)[:16]    # deterministic
   source_doc, page, bbox: [x0, y0, x1, y1]
-  provenance_grade   ∈ {A, B, C}   # A = official council doc, B = verified applicant plan, C = unverified resident photo
+  provenance_grade   ∈ {A, B, C}   # A = resident's own photo, B = Street View archival fallback, C = documents only (no photo)
   extracted_text_or_caption
   fetched_at
 
@@ -306,8 +306,8 @@ than silently claimed as built:
 
 ### Retry/backoff on 429 (Dynamic Shared Quota)
 
-Handled *inside* `llm/client.py`, the single call site (§7), **before** a failure counts
-against the breaker: exponential backoff with jitter, base 1s, cap 30s, max 5 attempts.
+Handled *inside* `models/client.py`, the single call site (§7), **before** a failure counts
+against the breaker: exponential backoff with jitter, base 1s, cap 20s, max 5 attempts.
 Only after all 5 attempts fail does it register as one breaker failure. This separates
 "quota hiccup, retry transparently" from "stage is actually unhealthy, degrade."
 
@@ -390,15 +390,15 @@ across all cases, not an automated gate) raises `BudgetExceededError` *before* t
 counted, rather than discovering the overage after the fact. This is a hard stop, not a
 warning — no stage can book spend past it.
 
-**Docs-truth note:** as of this wave, every stage that can reach the ledger does —
+**Docs-truth note:** every stage that can reach the ledger does —
 `models/client.py`-routed calls (interview, clerk extraction, grounding, composer polish)
 book directly; the ADK court stages (reviewers, adjudicator) book via `court/graph.py`'s
-event-stream extraction (§2). The one caller-side step still required for the court
-stages' bookings to actually land in a live run is `job/pipeline.py` passing its
-`Ledger` instance through to `run_court_verbose(..., ledger=...)` — `court/graph.py`
-added the parameter and the extraction logic this wave, but `job/pipeline.py` is a
-different work package's lane and had not yet been updated to pass it as of this
-checkpoint (see this doc's revision history / the integrator's notes for status).
+event-stream extraction (§2). The one caller-side step required for the court stages'
+bookings to land in a live run is `job/pipeline.py` passing its `Ledger` instance through
+to `run_court_verbose(..., ledger=...)` — confirmed in the current source
+(`job/pipeline.py`'s `RealPipelineRunner.run` passes `ledger=ledger` at its
+`run_court_verbose` call site), so this gap that an earlier revision of this note flagged
+as still-open is closed.
 
 ---
 
@@ -413,8 +413,11 @@ checkpoint (see this doc's revision history / the integrator's notes for status)
   - `setback-console-sa` (`sa-console`): `roles/datastore.user`, `roles/aiplatform.user`
     (interview chat calls), `roles/run.jobsExecutorWithOverrides` scoped to the
     `setback-tribunal` job resource only (to trigger it with a `CASE_ID` override — see
-    `deploy.sh`'s inline note on why plain `run.invoker` isn't sufficient for that call).
-    No Maps secret access (`--clear-secrets` passed explicitly on every console deploy).
+    `deploy.sh`'s inline note on why plain `run.invoker` isn't sufficient for that call),
+    and `roles/secretmanager.secretAccessor` scoped to exactly the `docket-key` secret
+    (`deploy.sh`'s step 3b) — this is the passphrase gating the `/docket` board route, not
+    a Google Cloud API credential. No Maps secret access (`--clear-secrets` passed
+    explicitly on every console deploy).
   - `setback-tribunal-sa` (`sa-orchestrator`): `roles/datastore.user`,
     `roles/aiplatform.user` (review/adjudication/composition/grounding calls), outbound
     egress to `onlineda.*`, `api.apps1.nsw.gov.au`, and `etrack.georgesriver.nsw.gov.au`
