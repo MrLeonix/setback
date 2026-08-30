@@ -101,6 +101,35 @@ from setback.state.ledger import Ledger
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _DEFAULT_MAX_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB
 
+# Magic-byte signatures for the only upload kinds the console's own upload
+# widget offers (`accept="image/*,application/pdf"`). Keyed by the exact
+# content-type this app will trust; the client-supplied `UploadFile.
+# content_type` header is never trusted on its own (P0 security fix: a
+# same-origin stored-XSS path existed where an attacker-controlled
+# Content-Type header, echoed back verbatim by `get_uploaded_document`,
+# could get arbitrary bytes served -- and rendered -- as `text/html`).
+_UPLOAD_MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"%PDF-", "application/pdf"),
+)
+
+
+def _sniff_upload_content_type(content: bytes) -> str | None:
+    """Determine the real content type of an uploaded file from its own
+    bytes, never from the client-supplied header. Returns `None` for
+    anything that isn't one of the image/PDF kinds this app accepts --
+    the caller must reject those, not fall back to trusting the header."""
+    for signature, content_type in _UPLOAD_MAGIC_SIGNATURES:
+        if content.startswith(signature):
+            return content_type
+    if content[:12].startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 _CONCERN_CATEGORY: Mapping[ConcernType, str] = {
     ConcernType.HEIGHT_BULK: "epi_dcp_provisions",
     ConcernType.PRIVACY_OVERLOOKING: "environmental_and_social_impacts",
@@ -687,9 +716,17 @@ def create_app(
                 status_code=413,
                 detail=f"document exceeds the {max_upload_bytes}-byte upload limit",
             )
+        # Server-determined from the bytes themselves, never the
+        # client-supplied header -- see `_sniff_upload_content_type`.
+        sniffed_content_type = _sniff_upload_content_type(content)
+        if sniffed_content_type is None:
+            raise HTTPException(
+                status_code=415,
+                detail="unsupported file type -- only photos and PDF documents are accepted",
+            )
         document_id = hashlib.sha256(content).hexdigest()[:16]
         await documents.add_evidence_document(
-            case_id, document_id, content, content_type=file.content_type
+            case_id, document_id, content, content_type=sniffed_content_type
         )
         await store.append_event(
             case_id,
@@ -698,7 +735,7 @@ def create_app(
             payload={
                 "document_id": document_id,
                 "filename": file.filename,
-                "content_type": file.content_type,
+                "content_type": sniffed_content_type,
                 "size_bytes": len(content),
             },
         )
@@ -757,7 +794,11 @@ def create_app(
             )
         except DocumentNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return Response(content=content, media_type=content_type)
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
 
     @app.get("/api/cases/{case_id}/qr.png")
     async def case_qr_code(case_id: str, request: Request) -> Response:

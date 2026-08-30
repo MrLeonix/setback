@@ -27,6 +27,13 @@ from setback.ingest.tracker import ExhibitedDocument, UserUploadedDocumentSource
 from setback.interview.flow import NormalisedConcern
 from setback.state.firestore import CaseRecord, GroundStatus, InMemoryCaseStore, case_id_for
 
+# Real JPEG magic bytes (SOI + APP0 marker) prefixed onto otherwise-fake
+# photo content -- since the upload route now sniffs actual file bytes
+# rather than trusting the client-supplied Content-Type header (P0
+# security fix), fixture "photos" must carry a real signature to be
+# accepted as `image/jpeg`.
+_FAKE_JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"fake-photo-bytes"
+
 
 class _FakeComposer:
     """Deterministic stand-in for `ModelQuestionComposer` -- no model call."""
@@ -389,7 +396,7 @@ def test_upload_document_records_event_and_advances_interview(
 
     response = client.post(
         f"/api/cases/{case_id}/documents",
-        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+        files={"file": ("garden.jpg", io.BytesIO(_FAKE_JPEG_BYTES), "image/jpeg")},
     )
     assert response.status_code == 200, response.text
     document_id = response.json()["document_id"]
@@ -418,6 +425,64 @@ def test_upload_document_unknown_case_is_404(client: TestClient) -> None:
         files={"file": ("a.jpg", io.BytesIO(b"abc"), "image/jpeg")},
     )
     assert response.status_code == 404
+
+
+def test_upload_document_rejects_content_with_no_recognized_image_or_pdf_signature(
+    client: TestClient,
+) -> None:
+    """P0 security fix: the upload route must reject a file whose bytes
+    don't match any accepted image/PDF signature, regardless of what
+    Content-Type the client claims -- this is what closes the stored-XSS
+    path (an attacker upload declaring `text/html`/`image/jpeg` while
+    the bytes are actually an HTML/script payload)."""
+    case_id = _create_case(client)
+    response = client.post(
+        f"/api/cases/{case_id}/documents",
+        files={
+            "file": (
+                "evil.jpg",
+                io.BytesIO(b"<script>alert(document.referrer)</script>"),
+                "image/jpeg",
+            )
+        },
+    )
+    assert response.status_code == 415, response.text
+
+
+def test_upload_document_ignores_a_spoofed_content_type_header(client: TestClient) -> None:
+    """P0 security fix: the stored/served content type comes from sniffing
+    the file's own magic bytes, never from the client-supplied header --
+    a resident's browser sends a real header, but nothing stops an
+    attacker's client from lying. Real PNG bytes declared as `text/html`
+    must still be stored (and later served) as `image/png`, not the
+    attacker-chosen type."""
+    case_id = _create_case(client)
+    real_png_bytes = b"\x89PNG\r\n\x1a\n" + b"not-really-a-full-png-but-has-the-signature"
+    upload = client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("evil.png", io.BytesIO(real_png_bytes), "text/html")},
+    )
+    assert upload.status_code == 200, upload.text
+    document_id = upload.json()["document_id"]
+
+    response = client.get(f"/api/cases/{case_id}/documents/{document_id}")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+
+
+def test_get_uploaded_document_sets_nosniff_header(client: TestClient) -> None:
+    """Belt-and-braces alongside server-side content-type sniffing: even
+    if a stored `content_type` were ever wrong, the browser must not be
+    allowed to MIME-sniff its way into rendering the response as HTML."""
+    case_id = _create_case(client)
+    upload = client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("garden.jpg", io.BytesIO(_FAKE_JPEG_BYTES), "image/jpeg")},
+    )
+    document_id = upload.json()["document_id"]
+
+    response = client.get(f"/api/cases/{case_id}/documents/{document_id}")
+    assert response.headers["x-content-type-options"] == "nosniff"
 
 
 class _RecordingEvidenceStore:
@@ -450,12 +515,12 @@ def test_upload_document_writes_through_the_evidence_store_keyed_by_case_id(
 
     response = client.post(
         f"/api/cases/{case_id}/documents",
-        files={"file": ("garden.jpg", io.BytesIO(b"photo bytes"), "image/jpeg")},
+        files={"file": ("garden.jpg", io.BytesIO(_FAKE_JPEG_BYTES), "image/jpeg")},
     )
     assert response.status_code == 200, response.text
     document_id = response.json()["document_id"]
 
-    assert evidence_store.calls == [(case_id, document_id, b"photo bytes", "image/jpeg")]
+    assert evidence_store.calls == [(case_id, document_id, _FAKE_JPEG_BYTES, "image/jpeg")]
 
 
 # --- tribunal trigger ---------------------------------------------------------
@@ -1676,7 +1741,7 @@ def test_document_uploaded_photo_gets_your_photo_provenance_tag(client: TestClie
     case_id = _create_case(client)
     client.post(
         f"/api/cases/{case_id}/documents",
-        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+        files={"file": ("garden.jpg", io.BytesIO(_FAKE_JPEG_BYTES), "image/jpeg")},
     )
     response = client.get(f"/cases/{case_id}")
     assert 'class="tag tag--grade-a"' in response.text
@@ -1735,7 +1800,7 @@ def test_document_uploaded_photo_renders_a_real_img_thumbnail(client: TestClient
     case_id = _create_case(client)
     upload = client.post(
         f"/api/cases/{case_id}/documents",
-        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+        files={"file": ("garden.jpg", io.BytesIO(_FAKE_JPEG_BYTES), "image/jpeg")},
     )
     document_id = upload.json()["document_id"]
 
@@ -1753,7 +1818,7 @@ def test_document_uploaded_card_is_clickable_to_the_full_document(client: TestCl
     case_id = _create_case(client)
     upload = client.post(
         f"/api/cases/{case_id}/documents",
-        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+        files={"file": ("garden.jpg", io.BytesIO(_FAKE_JPEG_BYTES), "image/jpeg")},
     )
     document_id = upload.json()["document_id"]
     response = client.get(f"/cases/{case_id}")
@@ -1787,13 +1852,13 @@ def test_get_uploaded_document_serves_the_stored_bytes(client: TestClient) -> No
     case_id = _create_case(client)
     upload = client.post(
         f"/api/cases/{case_id}/documents",
-        files={"file": ("garden.jpg", io.BytesIO(b"fake-photo-bytes"), "image/jpeg")},
+        files={"file": ("garden.jpg", io.BytesIO(_FAKE_JPEG_BYTES), "image/jpeg")},
     )
     document_id = upload.json()["document_id"]
 
     response = client.get(f"/api/cases/{case_id}/documents/{document_id}")
     assert response.status_code == 200
-    assert response.content == b"fake-photo-bytes"
+    assert response.content == _FAKE_JPEG_BYTES
     assert response.headers["content-type"] == "image/jpeg"
 
 
