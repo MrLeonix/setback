@@ -1017,13 +1017,25 @@ class RealPipelineRunner:
 
         `GuardTotalsStore.add_spend` is itself a single atomic Firestore
         field-transform increment (`state.guard_store`'s "Concurrency"
-        section) with no read-then-write window of its own; this marker
-        event supplies the other half of idempotence a bare increment
-        can't provide by itself -- "don't call it twice" -- mirroring
-        `GuardTotalsStore.record_threshold_event`'s own existence-check-
-        then-set shape, just scoped to a case's own event log (this
-        module's own natural, already-idempotent identity) rather than a
-        dedicated Firestore document under `guard_totals/public`.
+        section) with no read-then-write window of its own -- but it is
+        NOT atomic *with* the marker write below: they are two separate
+        RPCs, and this method therefore writes the marker event FIRST,
+        strictly before calling `add_spend`, not the other way around.
+        Ordering it this way is load-bearing, not stylistic (adversarial
+        re-check, 2026-08-30, `tests/job/test_pipeline.py::
+        test_book_public_guard_cost_does_not_double_book_when_marker_write_fails_after_spend`
+        pins it red against the old order): `store.append_event` is
+        idempotent and durable-or-raised (no torn writes), so if this call
+        crashes/errors after the marker lands but before `add_spend` runs,
+        a retry's fresh `events` will already contain the marker and the
+        early-return check above will skip re-booking -- an accepted
+        under-count (see below), never a double-count. Writing `add_spend`
+        first (the old, buggy order) has the opposite failure mode: a
+        crash after the spend lands but before the marker persists leaves
+        no trace for a retry to detect, so the retry's `add_spend` call
+        runs again for the same real cost -- an actual double-booking of
+        the founder's spend ceiling, the one outcome this mechanism is
+        required to prevent.
 
         Accepted residual gap, documented rather than solved here (out of
         this fix's scope, and this build's own crash-recovery story is
@@ -1031,13 +1043,15 @@ class RealPipelineRunner:
         DECISIONS.md`): a crash-then-retry that resumes and completes
         additional, still-unresolved grounds will not re-book the
         incremental ledger cost accrued during that retry, since the
-        marker from the interrupted attempt already exists. This
-        deliberately favours *never double-booking* (the explicit,
-        non-negotiable requirement) over exact accuracy across a crash
-        boundary this codebase does not otherwise recover from -- and
-        under-counting here is symmetric with, not a reintroduction of,
-        the original spend-accuracy gap this closes: before this fix, the
-        job's own cost was never booked at all, in every case, every run.
+        marker from the interrupted attempt already exists. The same
+        residual now also covers the (rarer) case of a crash landing the
+        marker but not the spend increment. Both deliberately favour
+        *never double-booking* (the explicit, non-negotiable requirement)
+        over exact accuracy across a crash boundary this codebase does not
+        otherwise recover from -- and under-counting here is symmetric
+        with, not a reintroduction of, the original spend-accuracy gap
+        this closes: before this fix, the job's own cost was never booked
+        at all, in every case, every run.
         """
         if self._guard_totals_store is None or amount_usd <= 0:
             return
@@ -1046,13 +1060,13 @@ class RealPipelineRunner:
         marker_id = _guard_cost_booking_event_id(case_id, kind)
         if any(event.event_id == marker_id for event in events):
             return
-        await self._guard_totals_store.add_spend(amount_usd)
         await store.append_event(
             case_id,
             marker_id,
             _PUBLIC_GUARD_COST_BOOKED_EVENT_TYPE,
             payload={"kind": kind, "amount_usd": amount_usd, "description": description},
         )
+        await self._guard_totals_store.add_spend(amount_usd)
 
     async def _ground_annotated_evidence(
         self, dossier: CaseDossier

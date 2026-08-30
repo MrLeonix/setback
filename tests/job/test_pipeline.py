@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import base64
 import io
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,7 @@ from setback.job.pipeline import (
     _STREET_VIEW_DOCUMENT_ID,
     _STREET_VIEW_FETCH_COST_USD,
     RealPipelineRunner,
+    _case_created_public_origin,
     _first_page_text,
     _GroundedOverlayContext,
     _guard_cost_booking_event_id,
@@ -58,7 +61,7 @@ from setback.job.pipeline import (
     _select_plan_document,
     _shrink_png_for_storage,
 )
-from setback.state.firestore import GroundStatus, InMemoryCaseStore, resume_case
+from setback.state.firestore import CaseEvent, GroundStatus, InMemoryCaseStore, resume_case
 from setback.state.guard_store import InMemoryGuardTotalsStore
 from tests.court._fakes import FakeLlm, review_body
 
@@ -986,6 +989,140 @@ async def test_run_does_not_double_book_ledger_cost_on_a_retried_job_execution()
     events = await store.list_events(case_id)
     booked_events = [e for e in events if e.event_id == marker_id]
     assert len(booked_events) == 1  # the pre-seeded marker, never duplicated
+
+
+class _CrashOnceOnAppend(InMemoryCaseStore):
+    """An `InMemoryCaseStore` whose `append_event` raises exactly once for
+    a chosen `event_id` (set via `marker_event_id` once the case -- and
+    therefore its deterministic `case_id` -- exists). Stands in for a job
+    process crashing/erroring after `GuardTotalsStore.add_spend` already
+    succeeded but before the idempotency marker event was durably
+    written -- the crash window `_book_public_guard_cost`'s two separate
+    (non-transactional) writes leave open."""
+
+    marker_event_id: str | None = None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._has_raised = False
+
+    async def append_event(  # type: ignore[override]
+        self, case_id: str, event_id: str, event_type: str, *, payload: dict[str, Any]
+    ) -> CaseEvent:
+        if event_id == self.marker_event_id and not self._has_raised:
+            self._has_raised = True
+            raise RuntimeError("simulated crash before the marker write persisted")
+        return await super().append_event(case_id, event_id, event_type, payload=payload)
+
+
+async def test_book_public_guard_cost_avoids_double_booking_when_marker_write_fails() -> None:
+    """Adversarial re-check (2026-08-30): `_book_public_guard_cost` calls
+    `GuardTotalsStore.add_spend` and *then* `store.append_event` for the
+    idempotency marker -- two separate writes, not one atomic operation.
+    If the process crashes/errors between them (the spend already landed
+    in the aggregate, the marker never durably written), a retry that
+    reloads this case's events fresh will not find the marker and will
+    call `add_spend` a SECOND time for the same real cost -- the exact
+    double-booking this mechanism exists to prevent. Proves the fix by
+    requiring the aggregate to reflect exactly one booking across a
+    simulated crash + retry, not two."""
+    store = _CrashOnceOnAppend()
+    case = await store.create_case(
+        application_number=_APPLICATION_NUMBER, resident_session="resident-1", public_origin=True
+    )
+    case_id = case.case_id
+    store.marker_event_id = _guard_cost_booking_event_id(case_id, _LEDGER_COST_BOOKING_KIND)
+
+    guard_totals_store = InMemoryGuardTotalsStore()
+    runner = RealPipelineRunner(
+        document_source=UserUploadedDocumentSource(), guard_totals_store=guard_totals_store
+    )
+
+    events_run_1 = await store.list_events(case_id)
+    with pytest.raises(RuntimeError):
+        await runner._book_public_guard_cost(  # noqa: SLF001
+            case_id,
+            store,
+            events_run_1,
+            kind=_LEDGER_COST_BOOKING_KIND,
+            amount_usd=0.05,
+            description="run 1 (crashes before the marker persists)",
+        )
+
+    # Retry: a fresh job execution reloads this case's events from the
+    # store. The marker never landed (its write raised above), so a
+    # buggy implementation would book the spend again here.
+    events_retry = await store.list_events(case_id)
+    await runner._book_public_guard_cost(  # noqa: SLF001
+        case_id,
+        store,
+        events_retry,
+        kind=_LEDGER_COST_BOOKING_KIND,
+        amount_usd=0.05,
+        description="run 2 (retry)",
+    )
+
+    totals = await guard_totals_store.get_totals()
+    assert totals.spend_usd == pytest.approx(0.05)
+
+
+def test_case_created_public_origin_defaults_to_false_for_a_legacy_event_missing_the_flag() -> None:
+    """Adversarial re-check (2026-08-30): a case created BEFORE this
+    security-review fix deployed has a `case_created` event payload with
+    no `public_origin` key at all -- not `False`, literally absent, since
+    the field didn't exist yet at write time. `_case_created_public_origin`
+    must resolve this to `False` (never raise `KeyError`/crash) so the job
+    treats every pre-deploy case as non-public rather than erroring or
+    (worse) mis-booking it."""
+    legacy_event = CaseEvent(
+        event_id="case-created:legacy-1",
+        case_id="legacy-1",
+        event_type="case_created",
+        payload={"application_number": "DA-1/2020"},
+        sequence=0,
+        recorded_at=datetime.now(UTC),
+    )
+    assert legacy_event.payload.get("public_origin") is None  # sanity: key truly absent
+    assert _case_created_public_origin([legacy_event]) is False
+
+
+async def test_run_does_not_crash_or_book_for_a_legacy_pre_deploy_public_case() -> None:
+    """End-to-end version of the above: a case whose `case_created` event
+    predates this fix (payload has no `public_origin` key) must still run
+    the full pipeline to completion with zero guard-booking side effects --
+    never an `AttributeError`/`KeyError`, and never mistakenly booked
+    (silently under-counted instead, the same accepted trade-off already
+    documented for a crash-then-retry)."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, public_origin=True
+    )
+    # Rewrite this case's own `case_created` event to strip the flag,
+    # simulating one written before this security-review fix existed.
+    case_created_id = f"case-created:{case_id}"
+    original = next(e for e in await store.list_events(case_id) if e.event_id == case_created_id)
+    legacy_payload = {k: v for k, v in original.payload.items() if k != "public_origin"}
+    store._cases[case_id].events[case_created_id] = replace(original, payload=legacy_payload)  # type: ignore[attr-defined]  # noqa: SLF001
+
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    guard_totals_store = InMemoryGuardTotalsStore()
+
+    runner = RealPipelineRunner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        grounding_client=None,
+        guard_totals_store=guard_totals_store,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)  # must not raise
+
+    totals = await guard_totals_store.get_totals()
+    assert totals.spend_usd == 0.0  # accepted under-count, never a crash
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type == "public_guard_cost_booked" for e in events)
 
 
 async def test_a_ground_the_court_rejects_never_ships_even_with_a_resolving_citation() -> None:
