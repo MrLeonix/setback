@@ -1,3 +1,24 @@
+# STATUS — wave 12 CLOSED, build RE-FROZEN FINAL (2026-08-30)
+
+**Wave 12 is done.** Film-kit patch pass re-verified every ship-phase claim below live
+against the deployed revision, reshot every gallery asset invalidated by this wave's own
+UI fixes (see `gallery-assets/INDEX.md`), added the new Veo-card shot, and patched
+`FILM-SCRIPT.md` for the two things that changed since the wave-11 script: the optional
+Veo beat and the (now fixed) chat-pane bubble/height behaviour. Final state: `setback-console`
+revision **`setback-console-00020-sl4`**, `setback-tribunal` job generation **19**,
+**676 tests green**. The build is **RE-FROZEN FINAL** — no further agent build pass is
+planned. Remaining work is exclusively human: film, upload, Monday's submission.
+
+One item stays open and needs a founder decision, not a doc fix: the objection letter's
+internal `Clause Reviewer:`/`Evidence Reviewer:` label leak is fixed in `job/pipeline.py`
+for any case run from here on, but both canonical film cases' stored letters were composed
+before that fix existed and are not retroactively repaired, since canonical cases are
+read-only/never-re-run by explicit project rule. `testing-instructions.md` now carries an
+honest, visible caveat about this so a judge isn't blindsided by it — see the ship-phase
+entry below for the full explanation.
+
+---
+
 # STATUS — wave 12 ship phase: merged, redeployed, Veo shipped (2026-08-30)
 
 Ship phase closed out the wave-12 fix rounds below: merged both parked feature branches to

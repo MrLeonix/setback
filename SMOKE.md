@@ -2098,3 +2098,81 @@ Street View/photo lightbox) and the approved Veo illustration card verified
 live on the deployed revision, on both canonical film cases, at desktop and
 390px, in a real Chrome browser — zero defects found, nothing rolled
 forward.
+
+## Wave 12 close-out — film-kit patch + re-freeze (2026-08-30)
+
+Read-only/local-only pass: no code changes, no deploy, no model calls. Re-verified
+the ship phase's own claims live and brought the film kit (Desktop scratchpad docs,
+gallery assets, the countdown page) into sync with what's actually deployed.
+
+**Live re-verification** (all via `curl -A "setback/0.1"`, docket-key fetched into a
+shell var once and `unset` immediately after, value never printed):
+
+```
+GET /                                                    -> 200
+GET /docket                        (no key)              -> 401
+GET /docket?key=<fetched to shell var, unset after>      -> 200
+GET /cases/cc9bfc59084fd7cac527c479f0e71996  (FILM2)     -> 200
+GET /cases/aeff0460678e76feceb7a5a7af934d31  (real-DA)   -> 200
+```
+`gcloud run services describe` / `jobs describe` (read-only) confirmed
+`setback-console-00020-sl4` / job generation `19` still live — unchanged from the ship
+phase above, confirming the freeze held.
+
+**Browser re-verification** (one pre-existing tab reused, closed nothing else was
+open, zero live model calls, both canonical cases read-only browsed): confirmed live
+on both FILM2 and real-DA, light and dark, desktop (1600px) and mobile (390px) —
+
+- Chat pane: correct alternating AI/resident bubbles (resident answers render as
+  distinct blue, right-aligned bubbles, never mislabelled "Setback"), bounded height
+  with its own internal scrollbar, not full-page scroll.
+- Veo "Simulation" card present on both canonical cases' Evidence tab, hazard-styled,
+  with the mandatory "AI-generated illustration — not evidence" label.
+- Overlay lightbox open/close still works (FILM2, full-resolution click-through).
+- 390px: chat-first stacked layout, no two-pane grid, `scrollWidth === clientWidth`
+  (390 === 390, confirmed via `evaluate_script`) — no horizontal scroll.
+
+**Gallery assets re-shot** (`gallery-assets/`): the prior shoot (07:40–07:45 this same
+morning) predated two wave-12 UI fixes that landed at 08:08–13:57 — the saved-case
+bubble bug and the chat-pane height fix — so every shot showing the chat pane (`03`,
+`04`, `05`, `06`, `07-overlay-flagship-card`, `07-overlay-flagship-lightbox`, `08`,
+`09`, `10`) was stale and has been retaken against the live `00020-sl4` revision. Added
+`11-veo-card.png` (new). `01`/`02` (landing/docket) don't show the chat pane and remain
+unchanged from the wave-10 shoot. Every file read back and visually confirmed after
+saving; `gallery-assets/INDEX.md` updated to match. No docket-key value, personal
+identifier, or deprecated case id appears in any pixel or filename.
+
+**`FILM-SCRIPT.md` patched**: revision/test-count references updated to
+`setback-console-00020-sl4` / 676 tests; added warning #6 (optional 6–10s Veo beat,
+explicitly droppable, with a suggested line and a fallback still) and warning #7 (the
+chat-pane bug is fixed — good news, no framing precaution needed). Every patched
+direction re-verified live this pass, not just read against the old script.
+
+**`97-hours.html` scratchpad countdown** updated: wave-12 timeline row added, headline
+test count/revision bumped to 676 / `00020-sl4`, the Veo line changed from "GO, pending
+approval" to "shipped and labelled," and the bonus plan bumped from +0.6 to +0.8 (Veo
+now counted alongside Gemma/blog/social). Design and the live countdown script were
+left untouched, per instruction.
+
+**Skeptic's REFUTED finding still open, not fixable by a doc change**: the objection
+letter's internal `Clause Reviewer:`/`Evidence Reviewer:` label leak, visible on both
+canonical film cases' own composed submission text (confirmed again this pass, e.g. in
+the `08-submission-documents.png` reshoot). The `job/pipeline.py` fix only applies to
+cases run from here on; the two canonical cases are read-only/never-re-run by explicit
+project rule, so their stored letters cannot be silently repaired. This needs a
+founder-level decision before Monday's submission if it's to be closed at all — flagged
+prominently in `STATUS.md`'s top section and `testing-instructions.md`, not buried.
+
+### Final go/no-go for filming
+
+**GO.** `setback-console-00020-sl4` (`setback-tribunal` gen 19), **676 tests green**,
+all five final live checks pass (`/` 200, `/docket` 401→200 key-silent, both canonical
+cases 200 with the Veo card visible, 390px clean), both canonical cases carry the
+Veo card and correct chat-bubble rendering, and `FILM-SCRIPT.md` is patched and
+re-verified against this exact revision. The one open item is the reviewer-label leak
+above — it does not block filming (it's in the Documents-tab body text, not scripted as
+an on-camera read in the 3:55 cut) but is a founder-level decision still outstanding
+before Monday's submission.
+
+Build is **RE-FROZEN FINAL** as of this pass. No further agent build work is planned;
+everything remaining is founder-only: film, upload, Monday 18:00 AEST submit.
