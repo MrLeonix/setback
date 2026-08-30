@@ -232,10 +232,24 @@ class CaseStoreLike(Protocol):
 DEFAULT_MAX_CONCURRENT_TRIBUNALS: Final[int] = 2
 
 _TRIBUNAL_START_EVENT: Final[str] = "tribunal_requested"
-_TRIBUNAL_TERMINAL_EVENTS: Final[frozenset[str]] = frozenset({"submission_composed", "job_failed"})
+_TRIBUNAL_TERMINAL_EVENTS: Final[frozenset[str]] = frozenset(
+    {"submission_composed", "job_failed", "tribunal_rerun_ignored"}
+)
 """Events `job/pipeline.py`/`job/main.py` record that end a tribunal run,
 successfully or not (see their module docstrings) -- a case counts as
-"still running" when it has a start event with no later terminal event."""
+"still running" when it has a start event with no later terminal event.
+
+`tribunal_rerun_ignored` is included alongside the two "a run actually
+happened" outcomes because it means the opposite of "running": it is
+`RealPipelineRunner.run`'s idempotency no-op (see its docstring) for a
+second "Start tribunal" press against an already-decided case -- nothing
+executes, so no new `submission_composed`/`job_failed` is ever written.
+Live incident (2026-08-29, film-day): without this, that request's
+`tribunal_requested` outlives the case's one and only terminal event and
+the case counts as "running" forever, permanently burning a concurrency
+slot for a run that never started -- exactly what happened to both
+canonical demo cases at once, exhausting `DEFAULT_MAX_CONCURRENT_TRIBUNALS`
+(2) for every other case."""
 
 
 async def count_running_tribunals(store: CaseStoreLike, *, case_limit: int = 200) -> int:

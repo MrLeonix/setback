@@ -237,6 +237,29 @@ async def test_count_running_tribunals_counts_a_re_requested_run_after_completio
     assert await count_running_tribunals(store) == 1
 
 
+async def test_count_running_tribunals_excludes_an_idempotent_rerun_replay() -> None:
+    """Live-incident regression (2026-08-29 film-day capacity block): a
+    second "Start tribunal" press on an already-decided case is caught by
+    `job.pipeline.RealPipelineRunner.run`'s idempotency guard, which
+    records `tribunal_rerun_ignored` and does nothing else -- no new
+    `submission_composed`/`job_failed` is ever written, because nothing
+    actually ran. The route still records the new `tribunal_requested`
+    unconditionally (see `test_a_second_tribunal_start_...` in
+    `test_app.py`), so without this fix that request's higher sequence
+    number outlives the case's one and only terminal event and the case
+    counts as "running" forever, permanently burning one of only
+    `DEFAULT_MAX_CONCURRENT_TRIBUNALS` (2) slots. This is exactly what
+    happened live to both canonical demo cases at once, exhausting the cap
+    for every other case in the docket."""
+    store = InMemoryCaseStore()
+    case_id = await _make_case_with_events(store, "PAN-1")
+    await store.append_event(case_id, "tribunal-req-1", "tribunal_requested", payload={})
+    await store.append_event(case_id, "submitted", "submission_composed", payload={})
+    await store.append_event(case_id, "tribunal-req-2", "tribunal_requested", payload={})
+    await store.append_event(case_id, "rerun-ignored", "tribunal_rerun_ignored", payload={})
+    assert await count_running_tribunals(store) == 0
+
+
 async def test_enforce_concurrent_tribunal_cap_raises_once_the_cap_is_reached() -> None:
     store = InMemoryCaseStore()
     for i in range(2):
