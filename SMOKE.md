@@ -2176,3 +2176,54 @@ before Monday's submission.
 
 Build is **RE-FROZEN FINAL** as of this pass. No further agent build work is planned;
 everything remaining is founder-only: film, upload, Monday 18:00 AEST submit.
+
+## Incident — tribunal capacity 429s + fix + live verification (2026-08-30)
+
+**Found:** every "Start tribunal" press against the live app began 429ing
+(`"the tribunal is at capacity (2 run(s) in progress); please try again shortly"`)
+starting 07:31 AEST, with no maintenance window in progress. 9 consecutive
+attempts on the QA case (`29b50e4e3822787f9b477aafea7b3775`) all failed the
+same way.
+
+**Root cause** (diagnosed against Firestore + git): the deployed capacity
+guard's `_TRIBUNAL_TERMINAL_EVENTS` set was missing `tribunal_rerun_ignored`.
+Both canonical, read-only cases (`cc9bfc59084fd7cac527c479f0e71996`,
+`aeff0460678e76feceb7a5a7af934d31`) end their event history with a
+`tribunal_requested` → `tribunal_rerun_ignored` re-press pair, which the
+guard didn't recognize as terminal — so both cases counted as "still
+running" forever, permanently occupying the concurrency cap of 2 and
+429ing every real attempt regardless of what else was actually running.
+
+**Fix commits** (branch `fix/tribunal-rerun-ignored-zombie-capacity`,
+fast-forward merged to `main`):
+- `1d5d565` `fix(console): count tribunal_rerun_ignored as a terminal event`
+  — the corrective diff itself; existing uncommitted work from an earlier
+  agent, reviewed on its merits and red/green sanity-checked before commit.
+- `230bc07` `feat(console): exclude stale tribunal runs from the concurrency
+  cap by TTL` — added `DEFAULT_STALE_RUN_TTL_SECONDS` (15 min, TDD, 4 new
+  tests) so a genuinely crashed/stuck run can't recreate the same wedge;
+  count-side only, no store writes.
+
+All gates green pre-deploy: `pytest` 681 passed, `ruff check`/`ruff format
+--check` clean, `mypy` success (39 source files). Deployed via `./deploy.sh`
+to `setback-console-00021-8m6` / `setback-tribunal` job generation 20.
+
+**Verified live** (this pass, real spend, within the ≤$0.50 budget agreed for
+this check): pressed "Start tribunal" once on the QA case — **202**, not
+429. SSE-timed end to end (background listener + server `recorded_at`
+timestamps): `tribunal_requested` recorded at +1.3s, `submission_composed`
+at **+34.6s**. Cost: **$0.004423**. One ground hit reviewer disagreement and
+went through the adjudicator (not the cheapest path) and still finished
+well under a minute. Page rendered correctly: both grounds shown with
+refusal reasons and reviewer opinions, no raw `Clause Reviewer:`-style
+label leak in the *new* letter text, cost chip present and correct.
+
+**Not fixed by this change, still open:** the two canonical cases' own
+already-composed letters (written before this fix existed) still contain
+the literal `Clause Reviewer:`/`Evidence Reviewer:` label leak noted in the
+wave-12 close-out above — this fix changes how new runs behave going
+forward; it cannot retroactively repair stored text on read-only canonical
+cases. Founder-level call, unchanged from wave-12's framing.
+
+Full timing breakdown and updated Scenario B/C math:
+`/Users/leo/Desktop/setback-hackathon/DEMO-TIMING.md` §1 and §7.
