@@ -2227,3 +2227,89 @@ cases. Founder-level call, unchanged from wave-12's framing.
 
 Full timing breakdown and updated Scenario B/C math:
 `/Users/leo/Desktop/setback-hackathon/DEMO-TIMING.md` §1 and §7.
+
+---
+
+# SMOKE.md v12 — public-abuse guard deploy + live smoke (2026-08-30)
+
+Founder-authorized deploy of the merged public-abuse guard (`feat/public-abuse-guard`
++ two follow-up fixes, `main` @ `5db3a8b`, matching `origin/main`) — layered caps,
+docket-key privileged bypass, `PUBLIC_SPEND_CEILING_USD=26.00` (~AUD$40). Pre-deploy
+gates: `uv run pytest -q` → **801 passed**; `ruff check`/`ruff format --check` clean;
+`mypy` → no issues in 40 source files.
+
+## Deploy
+
+One `./deploy.sh` run (console + job together, as the job's evidence-cost/ledger
+booking code changed too). Result:
+
+- `setback-console` revision **`setback-console-00023-t27`**, 100% traffic
+  (console URL `https://setback-console-v2kz7phkba-ts.a.run.app`).
+- `setback-tribunal` job generation **22**.
+
+## Open item resolved before this deploy, not re-done here
+
+The XFF-parsing platform assumption flagged by the 2026-08-30 security review was
+already closed by the merged code itself (`guards.py::public_guard_client_ip`'s
+"EMPIRICALLY VERIFIED" docstring, commit `32f2b4f`): a throwaway `xff-probe` Cloud Run
+service was deployed to `vexcourt-agent`/`australia-southeast1` with no load balancer
+in front (matching `setback-console`'s own bare-`*.run.app` topology), three forged-XFF
+requests were sent, the real egress IP was confirmed appended as the *last* entry in
+every case, and the probe service + image were deleted immediately after. Re-verified
+here only by reading the code/docstring and confirming no throwaway service remains
+live (`gcloud run services list` — no `xff-probe`); not repeated, since nothing in this
+deploy touched `public_guard_client_ip`'s logic.
+
+## Live smoke (`curl -A "setback/0.1"`, status codes only for key-bearing calls)
+
+| # | Check | Expected | Observed | Verdict |
+|---|-------|----------|----------|---------|
+| a | `GET /` | `200`, no pause banner | `200`; no "budget...used up" text in the response | PASS |
+| b | `GET /cases/1f4b7367fd30c089173ef09d7e8383a4` (film case) | `200`, unchanged content | `200`; grounds present, "AI-generated illustration — not evidence" (Veo) label present, overlay link present, zero raw-JSON fragments | PASS |
+| c | `GET /docket` no key | `401` | `401` | PASS |
+| c | `GET /docket?key=<wrong>` | `401` | `401` | PASS |
+| c | `GET /docket?key=<real, shell var, unset after>` | `200`, sets `sb_priv`, shows spend % | `200`; `sb_priv` cookie set; body shows `Public spend: $0.00 / $26.00 (0%) · 0 anonymous cases · 0 anonymous turns` (pre-QA-run baseline) | PASS |
+| d | Anonymous QA case (`DA2026/GUARD-QA`, real UUID `resident_session`) + 2 interview turns | `201`/`200`s; guard counters + turn-cost bookings in Firestore | Case `dbcb4e994f3e35b70638a950c18d61f2` created (`201`); 5 interview turns sent total (2 required + 3 more to reach a proposed ground for the tribunal step below), all `200`; `guard_totals/public` read (read-only) showed `spend_usd=0.005, anonymous_cases=1, anonymous_turns=5` (exactly 5×`PUBLIC_TURN_COST_ESTIMATE_USD`); case's own `case_created` event payload confirmed `public_origin: true` | PASS |
+| e | One real tribunal run on the QA case | `202`; run's ledger cost lands in `guard_totals` as a `public_origin` booking | `202`; job `setback-tribunal-vtknv` completed; two `public_guard_cost_booked` events recorded on the case (`street_view_fetch` $0.007, `tribunal_ledger` $0.0034829); `guard_totals/public` updated to `spend_usd=0.0154829` (0.005 + 0.007 + 0.0034829, exact) | PASS |
+| f | Mutating call (`POST /api/cases`) WITH `sb_priv` cookie | No counter increments | New case `509e8b7fdee2ad5df8a004562ce65ea2` created (`201`), `case_created` payload `public_origin: false`; `guard_totals/public` re-read afterward: **unchanged** (`spend_usd=0.0154829, anonymous_cases=1, anonymous_turns=5`) | PASS |
+
+Both QA cases (`DA2026/GUARD-QA`, `DA2026/GUARD-QA-PRIV`) confirmed absent from the
+`/docket` list (`_JUNK_METADATA_PATTERNS`'s `"qa"` substring match on
+`application_number`), and the docket's own spend readout after the run showed
+`Public spend: $0.02 / $26.00 (0%) · 1 anonymous cases · 5 anonymous turns` — matching
+the Firestore read exactly (display rounds to 2dp).
+
+## Final spend-aggregate value
+
+**`guard_totals/public.spend_usd = 0.0154829`** after this round's QA run (1 anonymous
+case, 5 anonymous turns, 1 tribunal run with Street View fallback) — 0.06% of the
+$26.00 ceiling. The privileged (`sb_priv`-cookied) case created for check (f) did not
+add to this total, confirmed by the before/after read above.
+
+## Anomalies
+
+None. All six checks passed on the first live pass; no fix-forward or rollback needed.
+
+## Security
+
+No secret value read, printed, or transmitted. `docket-key` fetched from Secret
+Manager into a shell variable exactly once, used inside `curl` calls, and `unset`
+immediately after — never printed. All outbound `curl` calls used the neutral
+`User-Agent: setback/0.1`. No raw visitor IP was read, stored, or printed at any point
+(only case ids, event types, and dollar amounts were read back from Firestore,
+read-only). No personal identifier (founder's name, email, hostname) appears in any
+commit, case label, or file this round touched — `DA2026/GUARD-QA`/`DA2026/GUARD-QA-PRIV`
+are synthetic labels. Firestore reads used `SETBACK_FIRESTORE_DB=setback-au` against
+the same project/database the deployed service itself uses, via the operator's own
+existing `gcloud`/ADC session — no new credentials created or read.
+
+## Status
+
+**Deployed and smoke-verified live.** `setback-console-00023-t27` / `setback-tribunal`
+generation 22, `australia-southeast1`, 100% traffic. All 6 founder-specified smoke
+checks pass; the public-abuse guard (layered caps, docket-key bypass,
+`PUBLIC_SPEND_CEILING_USD=26.00`) is live and correctly booking both interview-turn
+estimates and real job-side costs (tribunal ledger + Street View fetch) against the
+public aggregate, correctly bypassed for privileged (docket-key-cookied) sessions, and
+correctly hidden from the public docket board via the existing `qa` hygiene filter. No
+rollback performed.
