@@ -195,9 +195,10 @@ def _default_pipeline_factory() -> PipelineRunner:
     import httpx
 
     from setback.evidence.storage import GcsEvidenceStore
+    from setback.evidence.veo_live import VertexVeoLiveClient
     from setback.job.pipeline import RealPipelineRunner
     from setback.models.client import ModelClient
-    from setback.state.guard_store import FirestoreGuardTotalsStore
+    from setback.state.guard_store import FirestoreGuardTotalsStore, FirestoreVeoLiveCounterStore
 
     return RealPipelineRunner(
         document_source=GcsEvidenceStore(),
@@ -209,6 +210,16 @@ def _default_pipeline_factory() -> PipelineRunner:
             timeout=httpx.Timeout(30.0, connect=10.0),
         ),
         guard_totals_store=FirestoreGuardTotalsStore(),
+        # Wave 13 (founder-authorized): judge-gated LIVE Veo 3.1 generation.
+        # Both default to `None` (a guaranteed no-op) if omitted -- wired
+        # here, unconditionally, since the feature's own gating (judge_
+        # origin + a shipped overshadowing ground + the global cap +
+        # `VEO_LIVE_ENABLED`) already fully governs whether either is ever
+        # actually used. Constructing them makes no network call by itself
+        # (same ADC-resolved-lazily contract as `ModelClient()`/
+        # `GcsEvidenceStore()`/`FirestoreGuardTotalsStore()` above).
+        veo_client=VertexVeoLiveClient(),
+        veo_live_counter_store=FirestoreVeoLiveCounterStore(),
     )
 
 

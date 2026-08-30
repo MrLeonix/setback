@@ -139,6 +139,19 @@ def test_create_case_marks_public_origin_for_an_anonymous_request(
     assert created_event.payload["public_origin"] is True
 
 
+def test_create_case_does_not_mark_judge_origin_for_an_anonymous_request(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """Wave 13 (judge-gated LIVE Veo): an anonymous console visitor's case
+    must never be marked `judge_origin` -- the zero-Veo-spend guarantee for
+    the public flow depends on this being reliably `False`."""
+    case_id = _create_case(client)
+
+    events = asyncio.run(store.list_events(case_id))
+    created_event = next(e for e in events if e.event_type == "case_created")
+    assert created_event.payload["judge_origin"] is False
+
+
 # --- interview ------------------------------------------------------------
 
 
@@ -1339,6 +1352,38 @@ def test_full_resolution_overlay_document_is_served_with_the_overlays_own_mime_t
     assert response.status_code == 200
     assert response.content == full_res_bytes
     assert response.headers["content-type"] == "image/png"
+
+
+def test_live_illustration_document_is_served_as_video_mp4() -> None:
+    """The judge-gated LIVE Veo clip (wave 13) was never uploaded through
+    the resident upload endpoint either -- like the full-res overlay above,
+    `GET .../documents/{document_id}` must recognise this case's own
+    `illustration_ready` event and serve its `document_id` as `video/mp4`,
+    not the generic `application/octet-stream` default (which would make a
+    browser download the clip instead of playing it inline)."""
+    fixed_store = InMemoryCaseStore()
+    fixed_document_source = UserUploadedDocumentSource()
+    app = create_app(fixed_store, composer=_FakeComposer(), document_source=fixed_document_source)
+    fixed_client = TestClient(app)
+    case_id = _create_case(fixed_client)
+    clip_bytes = b"fake-mp4-bytes"
+    asyncio.run(
+        fixed_document_source.add_evidence_document(
+            case_id, "veo-live-illustration", clip_bytes, content_type="video/mp4"
+        )
+    )
+    asyncio.run(
+        fixed_store.append_event(
+            case_id,
+            "illustration-ready:probe",
+            "illustration_ready",
+            payload={"document_id": "veo-live-illustration"},
+        )
+    )
+    response = fixed_client.get(f"/api/cases/{case_id}/documents/veo-live-illustration")
+    assert response.status_code == 200
+    assert response.content == clip_bytes
+    assert response.headers["content-type"] == "video/mp4"
 
 
 def test_annotated_overlay_event_renders_with_its_own_legend(
@@ -2886,6 +2931,32 @@ def test_create_case_does_not_mark_public_origin_for_a_privileged_request(
     events = asyncio.run(store.list_events(case_id))
     created_event = next(e for e in events if e.event_type == "case_created")
     assert created_event.payload["public_origin"] is False
+
+
+def test_create_case_marks_judge_origin_for_a_privileged_request(
+    store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
+) -> None:
+    """Wave 13 (judge-gated LIVE Veo): a privileged (judge/founder) session
+    creating a case must be marked `judge_origin=True` on its own
+    `case_created` event -- the gate `job.pipeline`'s live-Veo post-step
+    reads back to decide whether this case may ever generate one."""
+    app = create_app(store, composer=composer, job_trigger=job_trigger)
+    with TestClient(app, base_url="https://testserver") as privileged_client:
+        os.environ["SETBACK_DOCKET_KEY"] = "let-me-in"
+        try:
+            privileged_client.get("/docket?key=let-me-in")
+            response = privileged_client.post(
+                "/api/cases",
+                json={"application_number": "PAN-judge-origin", "resident_session": _REAL_SESSION},
+            )
+            assert response.status_code == 201, response.text
+            case_id = response.json()["case_id"]
+        finally:
+            del os.environ["SETBACK_DOCKET_KEY"]
+
+    events = asyncio.run(store.list_events(case_id))
+    created_event = next(e for e in events if e.event_type == "case_created")
+    assert created_event.payload["judge_origin"] is True
 
 
 def test_tampered_privileged_cookie_does_not_bypass_the_daily_cap(

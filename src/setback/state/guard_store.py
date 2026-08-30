@@ -263,12 +263,133 @@ class FirestoreGuardTotalsStore:
         return True
 
 
+# --- (c) the global judge-gated live-Veo generation cap ---------------------
+#
+# Wave 13 (founder-authorized, 2026-08-29/31): judge-gated LIVE Veo 3.1
+# generation is real, metered spend on a genuinely shared quota -- unlike
+# `GuardCounterStore` above (per-actor, per-day), this is ONE deployment-wide
+# ceiling on total attempts ever, so it is a single document rather than a
+# keyed collection. `VeoLiveCounterStore.try_increment` mirrors `GuardCounter
+# Store.try_increment_daily`'s exact semantics and atomicity guarantee (a
+# single Firestore `Increment` field-transform, never a read-then-write --
+# see the module docstring's "Concurrency" section, which applies here
+# unchanged): every attempt increments the stored count, including one that
+# ends up refused, and the caller passes `limit` on each call rather than the
+# store owning it, so `job.pipeline.RealPipelineRunner` can size the cap from
+# `VEO_LIVE_MAX_GENERATIONS` without this store needing to know about env
+# vars at all.
+
+
+class VeoLiveCounterStore(Protocol):
+    """One global, atomic attempt counter, hard-capping real Veo 3.1 spend
+    across every judge-gated case in the whole deployment; plus a
+    per-case atomic claim guarding against one case being double-generated."""
+
+    async def try_increment(self, *, limit: int) -> bool:
+        """Atomically increment the single global counter and return
+        whether this attempt (the Nth) is allowed under `limit` -- i.e.
+        `N <= limit`. Every call increments, whether or not it is allowed,
+        exactly like `GuardCounterStore.try_increment_daily`."""
+        ...
+
+    async def try_claim_case(self, case_id: str) -> bool:
+        """Atomically claim `case_id` for live-Veo generation, returning
+        `True` only for (at most) one caller ever, across any number of
+        concurrent callers -- security review (2026-08-31): a case's own
+        `job.pipeline._has_illustration_event` gate reads a snapshot of
+        that case's events taken at the START of one job execution, so two
+        concurrent job executions for the SAME case_id (a known,
+        pre-existing surface: `console.app.start_tribunal`'s own comment
+        documents a double-clicked "Start tribunal" firing a second real
+        Cloud Run Job execution regardless) would each see an empty
+        snapshot and each proceed to call Veo for real -- double billing
+        one case and burning two slots of the global cap for it. Same
+        atomic-increment-then-compare shape as `try_increment` above, with
+        `limit=1`, keyed by `case_id` instead of one shared document: at
+        most one caller can ever observe the count still `<= 1`. Under
+        pathological concurrency this can (safely) let *zero* callers win
+        rather than exactly one -- see `try_increment`'s own identical,
+        already-accepted trade-off for a real-money cap."""
+        ...
+
+
+_VEO_LIVE_COUNTER_DOC_ID = "veo_live"
+"""Lives under the same `guard_totals` root collection as the public-spend
+aggregate (`guard_totals/public`) -- a sibling ceiling, not a per-case
+document, per the brief's own naming (`guard_totals/veo_live`)."""
+
+
+class InMemoryVeoLiveCounterStore:
+    """A single-int-backed `VeoLiveCounterStore` test double / local-dev
+    fallback. Not distributed or durable across a process restart -- the
+    production default is `FirestoreVeoLiveCounterStore` regardless (see
+    `InMemoryGuardCounterStore`'s own docstring for the identical caveat)."""
+
+    def __init__(self) -> None:
+        self._count = 0
+        self._claimed_case_ids: set[str] = set()
+
+    async def try_increment(self, *, limit: int) -> bool:
+        self._count += 1
+        return self._count <= limit
+
+    async def try_claim_case(self, case_id: str) -> bool:
+        if case_id in self._claimed_case_ids:
+            return False
+        self._claimed_case_ids.add(case_id)
+        return True
+
+
+class FirestoreVeoLiveCounterStore:
+    """The production `VeoLiveCounterStore`: `guard_totals/veo_live`,
+    incremented via a single atomic `firestore.Increment` field-transform
+    (never a read-then-write -- see the module docstring's "Concurrency"
+    section)."""
+
+    def __init__(self, client: firestore.AsyncClient | None = None) -> None:
+        self._client = client if client is not None else _get_client()
+
+    def _doc_ref(self) -> firestore.AsyncDocumentReference:
+        return self._client.collection("guard_totals").document(_VEO_LIVE_COUNTER_DOC_ID)
+
+    async def try_increment(self, *, limit: int) -> bool:
+        ref = self._doc_ref()
+        await ref.set({"count": firestore.Increment(1)}, merge=True)
+        snapshot = await ref.get()
+        data = snapshot.to_dict() or {}
+        current = int(data.get("count", 0))
+        return current <= limit
+
+    def _claim_doc_ref(self, case_id: str) -> firestore.AsyncDocumentReference:
+        # A sibling flat doc under the same `guard_totals` collection as the
+        # global counter doc above (`guard_totals/veo_live`), one per
+        # case_id -- `guard_totals/veo_live_claims_{case_id}` -- rather than
+        # a subcollection, so this stays a single, uncomplicated
+        # collection/document pair like every other doc this module writes.
+        return self._client.collection("guard_totals").document(f"veo_live_claims_{case_id}")
+
+    async def try_claim_case(self, case_id: str) -> bool:
+        # Same atomic-increment-then-compare shape as `try_increment`
+        # above, `limit=1`, keyed by `case_id` -- see `VeoLiveCounterStore.
+        # try_claim_case`'s own docstring for why this is needed alongside
+        # (not instead of) the global counter.
+        ref = self._claim_doc_ref(case_id)
+        await ref.set({"count": firestore.Increment(1)}, merge=True)
+        snapshot = await ref.get()
+        data = snapshot.to_dict() or {}
+        current = int(data.get("count", 0))
+        return current <= 1
+
+
 __all__ = [
     "FirestoreGuardCounterStore",
     "FirestoreGuardTotalsStore",
+    "FirestoreVeoLiveCounterStore",
     "GuardCounterStore",
     "GuardTotals",
     "GuardTotalsStore",
     "InMemoryGuardCounterStore",
     "InMemoryGuardTotalsStore",
+    "InMemoryVeoLiveCounterStore",
+    "VeoLiveCounterStore",
 ]

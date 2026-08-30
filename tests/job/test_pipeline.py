@@ -8,6 +8,7 @@ fixtures (no network), and the court graph is driven by `FakeLlm` doubles
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 from dataclasses import replace
@@ -42,16 +43,20 @@ from setback.ingest.tracker import (
     UserUploadedDocumentSource,
 )
 from setback.job.pipeline import (
+    _ILLUSTRATION_EVENT_TYPES,
     _LEDGER_COST_BOOKING_KIND,
     _MAX_TRACKER_DOCUMENTS,
     _STREET_VIEW_COST_BOOKING_KIND,
     _STREET_VIEW_DOCUMENT_ID,
     _STREET_VIEW_FETCH_COST_USD,
     RealPipelineRunner,
+    _case_created_judge_origin,
     _case_created_public_origin,
     _first_page_text,
     _GroundedOverlayContext,
     _guard_cost_booking_event_id,
+    _has_illustration_event,
+    _is_veo_live_excluded,
     _load_frozen_ingest,
     _load_ingest_for_application,
     _looks_like_plan_document,
@@ -59,10 +64,11 @@ from setback.job.pipeline import (
     _propagate_page_level_anchor_status,
     _rank_tracker_documents,
     _select_plan_document,
+    _shipped_overshadowing_ground_ids,
     _shrink_png_for_storage,
 )
 from setback.state.firestore import CaseEvent, GroundStatus, InMemoryCaseStore, resume_case
-from setback.state.guard_store import InMemoryGuardTotalsStore
+from setback.state.guard_store import InMemoryGuardTotalsStore, InMemoryVeoLiveCounterStore
 from tests.court._fakes import FakeLlm, review_body
 
 
@@ -686,6 +692,7 @@ async def _seed_case_single_ground(
     *,
     document_source: UserUploadedDocumentSource,
     public_origin: bool = False,
+    judge_origin: bool = False,
 ) -> tuple[str, str]:
     """Like `_seed_case` but with exactly one confirmed ground -- for tests
     that need every ground's reviewer citation to land on a single,
@@ -698,6 +705,7 @@ async def _seed_case_single_ground(
         application_number=_APPLICATION_NUMBER,
         resident_session="resident-1",
         public_origin=public_origin,
+        judge_origin=judge_origin,
     )
     case_id = case.case_id
 
@@ -2848,3 +2856,616 @@ async def test_street_view_fallback_document_returns_none_without_an_ingest_clie
     result = await runner._street_view_fallback_document("65A Vista Street Sans Souci NSW 2219")  # noqa: SLF001
 
     assert result is None
+
+
+# --- judge-gated LIVE Veo illustration post-step (wave 13, founder-authorized) --
+#
+# Fully isolated per the brief: an outright Veo failure/timeout must never
+# fail the tribunal run itself, so every scenario below also asserts
+# `submission_composed` still lands. `_FakeVeoLiveClient` stands in for
+# `evidence.veo_live.VertexVeoLiveClient` -- the real Vertex Veo API is
+# never called by this test module.
+
+
+class _FakeVeoLiveClient:
+    def __init__(
+        self,
+        *,
+        clip_bytes: bytes = b"fake-mp4-bytes",
+        error: Exception | None = None,
+        delay_seconds: float = 0.0,
+    ) -> None:
+        self.calls: list[tuple[bytes, str]] = []
+        self._clip_bytes = clip_bytes
+        self._error = error
+        self._delay_seconds = delay_seconds
+
+    async def generate_overshadowing_clip(
+        self, *, conditioning_image: bytes, conditioning_mime_type: str
+    ) -> bytes:
+        self.calls.append((conditioning_image, conditioning_mime_type))
+        if self._delay_seconds:
+            await asyncio.sleep(self._delay_seconds)
+        if self._error is not None:
+            raise self._error
+        return self._clip_bytes
+
+
+def _judge_gated_runner(
+    *,
+    document_source: UserUploadedDocumentSource,
+    clause_model: FakeLlm,
+    evidence_model: FakeLlm,
+    veo_client: _FakeVeoLiveClient | None,
+    veo_live_counter_store: InMemoryVeoLiveCounterStore | None = None,
+    veo_live_enabled: bool | None = None,
+    veo_live_max_generations: int | None = None,
+    veo_live_timeout_seconds: float | None = None,
+) -> RealPipelineRunner:
+    return RealPipelineRunner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        grounding_client=None,
+        veo_client=veo_client,
+        veo_live_counter_store=(
+            veo_live_counter_store
+            if veo_live_counter_store is not None
+            else (InMemoryVeoLiveCounterStore() if veo_client is not None else None)
+        ),
+        veo_live_enabled=veo_live_enabled,
+        veo_live_max_generations=veo_live_max_generations,
+        veo_live_timeout_seconds=veo_live_timeout_seconds,
+    )
+
+
+# --- pure gating-helper unit tests --------------------------------------------
+
+
+def test_case_created_judge_origin_defaults_to_false_for_a_legacy_event() -> None:
+    legacy_event = CaseEvent(
+        event_id="case-created:legacy-1",
+        case_id="legacy-1",
+        event_type="case_created",
+        payload={"application_number": "DA-1/2020", "public_origin": False},
+        sequence=0,
+        recorded_at=datetime.now(UTC),
+    )
+    assert legacy_event.payload.get("judge_origin") is None  # sanity: key truly absent
+    assert _case_created_judge_origin([legacy_event]) is False
+
+
+def test_case_created_judge_origin_reads_true_from_the_payload() -> None:
+    event = CaseEvent(
+        event_id="case-created:c1",
+        case_id="c1",
+        event_type="case_created",
+        payload={"application_number": "PAN-1", "public_origin": False, "judge_origin": True},
+        sequence=0,
+        recorded_at=datetime.now(UTC),
+    )
+    assert _case_created_judge_origin([event]) is True
+
+
+def test_has_illustration_event_recognises_every_illustration_event_type() -> None:
+    for event_type in _ILLUSTRATION_EVENT_TYPES:
+        event = CaseEvent(
+            event_id="e1",
+            case_id="c1",
+            event_type=event_type,
+            payload={},
+            sequence=0,
+            recorded_at=datetime.now(UTC),
+        )
+        assert _has_illustration_event([event]) is True
+
+
+def test_has_illustration_event_false_with_no_matching_events() -> None:
+    event = CaseEvent(
+        event_id="e1",
+        case_id="c1",
+        event_type="ground_category_assigned",
+        payload={},
+        sequence=0,
+        recorded_at=datetime.now(UTC),
+    )
+    assert _has_illustration_event([event]) is False
+
+
+def test_is_veo_live_excluded_for_the_canonical_allowlisted_demo_cases() -> None:
+    from setback.evidence.illustration import OVERSHADOWING_SIMULATION_CLIPS
+
+    for case_id in OVERSHADOWING_SIMULATION_CLIPS:
+        assert _is_veo_live_excluded(case_id) is True
+
+
+def test_is_veo_live_excluded_is_false_for_an_ordinary_case_id() -> None:
+    assert _is_veo_live_excluded("some-ordinary-case-id") is False
+
+
+def test_shipped_overshadowing_ground_ids_requires_both_concern_type_and_shipped_status() -> None:
+    from setback.gate.validator import GateDecision, GateStatus
+
+    events = [
+        CaseEvent(
+            event_id="e1",
+            case_id="c1",
+            event_type="ground_category_assigned",
+            payload={"ground_id": "g1", "concern_type": "overshadowing"},
+            sequence=0,
+            recorded_at=datetime.now(UTC),
+        ),
+        CaseEvent(
+            event_id="e2",
+            case_id="c1",
+            event_type="ground_category_assigned",
+            payload={"ground_id": "g2", "concern_type": "property_value"},
+            sequence=1,
+            recorded_at=datetime.now(UTC),
+        ),
+    ]
+    decisions = [
+        GateDecision(
+            ground_id="g1",
+            status=GateStatus.SHIPPED,
+            category="environmental_and_social_impacts",
+            explanation="",
+            statutory_basis="s4.15(1)(b)",
+            citation_issues=(),
+        ),
+        GateDecision(
+            ground_id="g2",
+            status=GateStatus.SHIPPED,
+            category="property_value",
+            explanation="",
+            statutory_basis="",
+            citation_issues=(),
+        ),
+    ]
+    assert _shipped_overshadowing_ground_ids(events, decisions) == frozenset({"g1"})
+
+
+def test_shipped_overshadowing_ground_ids_excludes_an_overshadowing_ground_that_did_not_ship() -> (
+    None
+):
+    from setback.gate.validator import GateDecision, GateStatus
+
+    events = [
+        CaseEvent(
+            event_id="e1",
+            case_id="c1",
+            event_type="ground_category_assigned",
+            payload={"ground_id": "g1", "concern_type": "overshadowing"},
+            sequence=0,
+            recorded_at=datetime.now(UTC),
+        )
+    ]
+    decisions = [
+        GateDecision(
+            ground_id="g1",
+            status=GateStatus.REFUSED_UNSUBSTANTIATED,
+            category="environmental_and_social_impacts",
+            explanation="",
+            statutory_basis="s4.15(1)(b)",
+            citation_issues=(),
+        )
+    ]
+    assert _shipped_overshadowing_ground_ids(events, decisions) == frozenset()
+
+
+# --- end-to-end: RealPipelineRunner.run's isolated post-step ------------------
+
+
+async def test_run_generates_a_live_illustration_for_a_judge_origin_shipped_case() -> None:
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    veo_client = _FakeVeoLiveClient(clip_bytes=b"the-real-clip-bytes")
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=veo_client,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    event_types = [e.event_type for e in events]
+    assert "illustration_generating" in event_types
+    assert "illustration_ready" in event_types
+    assert "illustration_failed" not in event_types
+    assert "submission_composed" in event_types  # never blocked by the post-step
+
+    ready_event = next(e for e in events if e.event_type == "illustration_ready")
+    document_id = ready_event.payload["document_id"]
+    stored_bytes = await document_source.download_document(
+        ExhibitedDocument(
+            document_id=document_id, title=document_id, source="user-upload", case_id=case_id
+        )
+    )
+    assert stored_bytes == b"the-real-clip-bytes"
+    assert len(veo_client.calls) == 1
+    _conditioning_bytes, mime_type = veo_client.calls[0]
+    assert mime_type == "image/png"
+
+
+async def test_run_does_not_generate_a_live_illustration_when_veo_client_is_not_wired() -> None:
+    """Every other offline test in this module leaves `veo_client=None` --
+    the feature must no-op with zero side effects, matching every other
+    live-only feature's own "not wired" degrade pattern in this class."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=None,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type in _ILLUSTRATION_EVENT_TYPES for e in events)
+
+
+async def test_run_does_not_generate_a_live_illustration_when_disabled_via_env() -> None:
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    veo_client = _FakeVeoLiveClient()
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=veo_client,
+        veo_live_enabled=False,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type in _ILLUSTRATION_EVENT_TYPES for e in events)
+    assert veo_client.calls == []
+
+
+async def test_run_does_not_generate_a_live_illustration_for_a_non_judge_origin_case() -> None:
+    """A `public_origin` (or plain, neither-flag) case must never trigger
+    live Veo spend, no matter what else is wired -- this is the anonymous
+    zero-Veo-spend guarantee."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, public_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    veo_client = _FakeVeoLiveClient()
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=veo_client,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type in _ILLUSTRATION_EVENT_TYPES for e in events)
+    assert veo_client.calls == []
+
+
+async def test_run_skips_a_live_illustration_without_a_shipped_overshadowing_ground() -> None:
+    """A judge_origin case whose ground is refused (never shipped) must not
+    trigger live Veo generation -- illustrating a ground the tribunal
+    itself did not ship would be exactly the kind of thing the honesty
+    constraint rules out."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    page_anchor_id = anchor_id_for("elevations-doc", 1, None)
+    rejecting_clause = FakeLlm(
+        model="gemini-3.5-flash-lite",
+        bodies=[
+            review_body(
+                ground_id=ground_id,
+                stance="reject",
+                confidence=0.9,
+                cited_anchor_ids=[page_anchor_id],
+                rationale="clause reviewer rejects",
+            )
+        ],
+    )
+    rejecting_evidence = FakeLlm(
+        model="gemini-3.5-flash-lite",
+        bodies=[
+            review_body(
+                ground_id=ground_id,
+                stance="reject",
+                confidence=0.9,
+                cited_anchor_ids=[page_anchor_id],
+                rationale="evidence reviewer rejects",
+            )
+        ],
+    )
+    veo_client = _FakeVeoLiveClient()
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=rejecting_clause,
+        evidence_model=rejecting_evidence,
+        veo_client=veo_client,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    grounds = {g.ground_id: g for g in await store.list_grounds(case_id)}
+    assert grounds[ground_id].status is GroundStatus.REFUSED  # sanity: really didn't ship
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type in _ILLUSTRATION_EVENT_TYPES for e in events)
+    assert veo_client.calls == []
+
+
+async def test_run_does_not_regenerate_when_an_illustration_event_already_exists() -> None:
+    """Idempotence: a case that somehow already has an illustration event
+    on record (a prior attempt) must not trigger a second real Veo call."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    await store.append_event(
+        case_id, f"illustration-ready:{case_id}", "illustration_ready", payload={"document_id": "x"}
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    veo_client = _FakeVeoLiveClient()
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=veo_client,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    assert veo_client.calls == []
+    events = await store.list_events(case_id)
+    ready_events = [e for e in events if e.event_type == "illustration_ready"]
+    assert len(ready_events) == 1  # the pre-seeded one, never duplicated
+
+
+async def test_concurrent_attempts_for_the_same_case_call_veo_at_most_once() -> None:
+    """Security review (2026-08-31): two concurrent job executions for the
+    SAME case_id -- a real, pre-existing surface (see
+    `console.app.start_tribunal`'s own comment: a double-clicked "Start
+    tribunal" fires a second real Cloud Run Job execution regardless) --
+    must never both call Veo. `_has_illustration_event` alone is not
+    enough: both executions read the identical `events` snapshot captured
+    at the START of their own run, so neither sees the other's in-flight
+    attempt. The per-case atomic claim (`VeoLiveCounterStore.
+    try_claim_case`) is what actually prevents the double real spend."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    # A real delay forces the two concurrent attempts to actually
+    # interleave at the Veo call itself (an `asyncio.gather`-driven task
+    # with no genuine suspension point never yields to its sibling task at
+    # all) -- exactly the shape of two separate job containers each
+    # independently making a real, slow network call.
+    veo_client = _FakeVeoLiveClient(delay_seconds=0.01)
+    counter_store = InMemoryVeoLiveCounterStore()
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=_supporting_fakes(ground_id)[0],
+        evidence_model=_supporting_fakes(ground_id)[1],
+        veo_client=veo_client,
+        veo_live_counter_store=counter_store,
+    )
+    resume = await resume_case(store, case_id)
+    dossier, _ingest_outcome = await runner._build_dossier(case_id, resume, store=store)  # noqa: SLF001
+
+    from setback.gate.validator import GateDecision, GateStatus
+
+    decisions = [
+        GateDecision(
+            ground_id=ground_id,
+            status=GateStatus.SHIPPED,
+            category="environmental_and_social_impacts",
+            explanation="",
+            statutory_basis="s4.15(1)(b)",
+            citation_issues=(),
+        )
+    ]
+
+    # Both calls share the SAME `resume.events` snapshot -- exactly what
+    # two concurrent job executions starting from the same `resume_case`
+    # read would each see.
+    await asyncio.gather(
+        runner._attempt_veo_live_illustration(  # noqa: SLF001
+            case_id, store, resume.events, decisions, dossier
+        ),
+        runner._attempt_veo_live_illustration(  # noqa: SLF001
+            case_id, store, resume.events, decisions, dossier
+        ),
+    )
+
+    assert len(veo_client.calls) == 1, "Veo was called more than once for one case"
+    events = await store.list_events(case_id)
+    ready_events = [e for e in events if e.event_type == "illustration_ready"]
+    assert len(ready_events) == 1
+
+
+async def test_run_stops_generating_once_the_global_cap_is_reached() -> None:
+    """The atomic global counter, not a per-case one: once
+    `veo_live_max_generations` attempts have already happened (anywhere),
+    a further otherwise-qualifying case must not generate."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    veo_client = _FakeVeoLiveClient()
+    counter_store = InMemoryVeoLiveCounterStore()
+    await counter_store.try_increment(limit=1)  # pre-exhaust the cap of 1
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=veo_client,
+        veo_live_counter_store=counter_store,
+        veo_live_max_generations=1,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type in _ILLUSTRATION_EVENT_TYPES for e in events)
+    assert veo_client.calls == []
+
+
+async def test_run_emits_illustration_failed_when_veo_raises_and_still_completes_the_run() -> None:
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    veo_client = _FakeVeoLiveClient(error=RuntimeError("Vertex said no"))
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=veo_client,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)  # must not raise
+
+    events = await store.list_events(case_id)
+    event_types = [e.event_type for e in events]
+    assert "illustration_generating" in event_types
+    assert "illustration_failed" in event_types
+    assert "illustration_ready" not in event_types
+    assert "submission_composed" in event_types
+
+    failed_event = next(e for e in events if e.event_type == "illustration_failed")
+    assert "Vertex said no" in failed_event.payload["reason"]
+
+
+async def test_run_emits_illustration_failed_on_a_timeout_and_still_completes_the_run() -> None:
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    veo_client = _FakeVeoLiveClient(delay_seconds=1.0)
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=veo_client,
+        veo_live_timeout_seconds=0.01,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)  # must not raise, must not hang
+
+    events = await store.list_events(case_id)
+    event_types = [e.event_type for e in events]
+    assert "illustration_failed" in event_types
+    assert "illustration_ready" not in event_types
+    assert "submission_composed" in event_types
+
+
+async def test_run_never_generates_a_live_illustration_for_an_allowlisted_demo_case() -> None:
+    """The three canonical static-clip demo cases (`evidence.illustration.
+    OVERSHADOWING_SIMULATION_CLIPS`) must render byte-identically to before
+    this wave -- excluded from the live pipeline entirely, deliberately,
+    even if a future judge session against one of them would otherwise
+    qualify (judge_origin + a shipped overshadowing ground)."""
+    from setback.evidence.illustration import OVERSHADOWING_SIMULATION_CLIPS
+
+    allowlisted_case_id = next(iter(OVERSHADOWING_SIMULATION_CLIPS))
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+
+    # Seed the allowlisted id directly (white-box store construction,
+    # mirroring this module's existing `store._cases[...]` precedent) --
+    # `create_case`'s own deterministic hashing can't be steered to land on
+    # a specific pre-chosen id.
+    case = await store.create_case(
+        application_number=_APPLICATION_NUMBER,
+        resident_session="allowlist-probe",
+        judge_origin=True,
+    )
+    store._cases[allowlisted_case_id] = store._cases.pop(case.case_id)  # type: ignore[attr-defined]  # noqa: SLF001
+    for event_id, event in list(store._cases[allowlisted_case_id].events.items()):  # type: ignore[attr-defined]  # noqa: SLF001
+        store._cases[allowlisted_case_id].events[event_id] = replace(  # type: ignore[attr-defined]  # noqa: SLF001
+            event, case_id=allowlisted_case_id
+        )
+    case_id = allowlisted_case_id
+
+    plan_document_id = "elevations-doc"
+    document_source.add_document(_APPLICATION_NUMBER, plan_document_id, ELEVATIONS_PDF.read_bytes())
+    await store.append_event(
+        case_id,
+        f"document-uploaded:{plan_document_id}",
+        "document_uploaded",
+        payload={
+            "document_id": plan_document_id,
+            "filename": "elevations.pdf",
+            "content_type": "application/pdf",
+            "size_bytes": 12345,
+        },
+    )
+    ground_id = "ground-overshadowing"
+    await store.propose_ground(case_id, ground_id, claim="The new build will overshadow our yard.")
+    await store.append_event(
+        case_id,
+        f"ground-category:{ground_id}",
+        "ground_category_assigned",
+        payload={
+            "ground_id": ground_id,
+            "category": "environmental_and_social_impacts",
+            "concern_type": "overshadowing",
+            "evidence_document_ids": [plan_document_id],
+        },
+    )
+    clause_model, evidence_model = _supporting_fakes(ground_id)
+    veo_client = _FakeVeoLiveClient()
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=clause_model,
+        evidence_model=evidence_model,
+        veo_client=veo_client,
+    )
+    resume = await resume_case(store, case_id)
+    await runner.run(case_id, resume, store)
+
+    events = await store.list_events(case_id)
+    assert not any(e.event_type in _ILLUSTRATION_EVENT_TYPES for e in events)
+    assert veo_client.calls == []

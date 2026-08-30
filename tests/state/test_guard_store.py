@@ -20,11 +20,14 @@ from google.cloud import firestore
 from setback.state.guard_store import (
     FirestoreGuardCounterStore,
     FirestoreGuardTotalsStore,
+    FirestoreVeoLiveCounterStore,
     GuardCounterStore,
     GuardTotals,
     GuardTotalsStore,
     InMemoryGuardCounterStore,
     InMemoryGuardTotalsStore,
+    InMemoryVeoLiveCounterStore,
+    VeoLiveCounterStore,
 )
 
 # --- a tiny fake of the AsyncClient surface these stores use ----------------
@@ -357,3 +360,141 @@ async def test_concurrent_anonymous_case_increments_do_not_lose_updates() -> Non
 
     totals = await store.get_totals()
     assert totals.anonymous_cases == 30
+
+
+# --- VeoLiveCounterStore: the global judge-gated-live-Veo generation cap ----
+#
+# The atomic global counter the founder-authorized wave-13 brief names
+# explicitly ("an atomic global counter (Firestore Increment, doc like
+# guard_totals/veo_live) is below env VEO_LIVE_MAX_GENERATIONS"): one
+# document every judge-gated live Veo generation attempt across the whole
+# deployment increments, hard-capping real Veo spend regardless of how many
+# distinct cases ever qualify. Same atomic-field-transform shape as
+# `GuardCounterStore.try_increment_daily` above (no read-then-write window),
+# and the same "every attempt increments, including one that ends up
+# refused" semantics -- a failed/refused generation still permanently
+# consumes one of the finite `VEO_LIVE_MAX_GENERATIONS` slots, which is the
+# conservative (spend-safe) choice for a real-money API.
+
+
+@dataclass
+class _VeoLiveCounterStoreUnderTest:
+    store: VeoLiveCounterStore
+    label: str
+
+
+def _memory_veo_live_counter_store() -> _VeoLiveCounterStoreUnderTest:
+    return _VeoLiveCounterStoreUnderTest(InMemoryVeoLiveCounterStore(), "in-memory")
+
+
+def _firestore_veo_live_counter_store() -> _VeoLiveCounterStoreUnderTest:
+    return _VeoLiveCounterStoreUnderTest(
+        FirestoreVeoLiveCounterStore(_FakeFirestore()),  # type: ignore[arg-type]
+        "firestore-fake",
+    )
+
+
+@pytest.fixture(params=[_memory_veo_live_counter_store, _firestore_veo_live_counter_store])
+def veo_live_counter_store(request: pytest.FixtureRequest) -> VeoLiveCounterStore:
+    return request.param().store
+
+
+async def test_veo_live_try_increment_allows_up_to_the_limit(
+    veo_live_counter_store: VeoLiveCounterStore,
+) -> None:
+    assert await veo_live_counter_store.try_increment(limit=2) is True
+    assert await veo_live_counter_store.try_increment(limit=2) is True
+    assert await veo_live_counter_store.try_increment(limit=2) is False
+
+
+async def test_veo_live_try_increment_is_a_single_global_counter_not_per_caller(
+    veo_live_counter_store: VeoLiveCounterStore,
+) -> None:
+    """Unlike `GuardCounterStore` (keyed per actor/day), this is one
+    deployment-wide document -- every call shares the same underlying
+    counter regardless of any caller-side identity."""
+    assert await veo_live_counter_store.try_increment(limit=1) is True
+    assert await veo_live_counter_store.try_increment(limit=1) is False
+    assert await veo_live_counter_store.try_increment(limit=1) is False
+
+
+async def test_firestore_veo_live_counter_doc_id_is_veo_live_under_guard_totals() -> None:
+    """Pins the exact doc location the brief names: `guard_totals/veo_live`."""
+    fake = _FakeFirestore()
+    store = FirestoreVeoLiveCounterStore(fake)  # type: ignore[arg-type]
+    await store.try_increment(limit=10)
+    doc_ids = [key for key in fake.docs if key[0] == "guard_totals"]
+    assert ("guard_totals", "veo_live") in doc_ids
+
+
+async def test_concurrent_veo_live_increments_do_not_lose_updates() -> None:
+    """20 concurrent judge-gated tribunal runs all reaching the post-step at
+    once must never let more than `limit` through, and must never lose an
+    attempt off the stored count (the same lost-update hazard the public
+    spend aggregate above was fixed for)."""
+    fake = _FakeFirestore(yield_on_io=True)
+    store = FirestoreVeoLiveCounterStore(fake)  # type: ignore[arg-type]
+    limit = 10
+
+    results = await asyncio.gather(*(store.try_increment(limit=limit) for _ in range(20)))
+
+    ((_key, data),) = fake.docs.items()
+    assert data["count"] == 20, "a lost update under-counted concurrent attempts"
+    assert sum(1 for allowed in results if allowed) <= limit, "the cap was exceeded"
+
+
+# --- VeoLiveCounterStore.try_claim_case: the per-case double-generation guard
+#
+# Security review (2026-08-31): the global counter above hard-caps TOTAL
+# spend, but says nothing about a single case being double-generated. A
+# case's own `_has_illustration_event` gate in `job.pipeline` reads a
+# snapshot of that case's events taken at the START of one job execution --
+# two concurrent job executions for the SAME case_id (a known, pre-existing
+# surface: `console.app.start_tribunal`'s own comment documents that a
+# double-clicked "Start tribunal" fires a second real Cloud Run Job
+# execution regardless) would each see an empty snapshot and each proceed
+# to call Veo for real. `try_claim_case` closes this with the identical
+# atomic-increment-then-compare shape as `try_increment` above, keyed by
+# `case_id` with `limit=1`, so at most one of any number of concurrent
+# claims for the same case can ever return `True`.
+
+
+async def test_try_claim_case_allows_the_first_claim_and_refuses_the_second(
+    veo_live_counter_store: VeoLiveCounterStore,
+) -> None:
+    assert await veo_live_counter_store.try_claim_case("case-1") is True
+    assert await veo_live_counter_store.try_claim_case("case-1") is False
+    assert await veo_live_counter_store.try_claim_case("case-1") is False
+
+
+async def test_try_claim_case_is_independent_per_case_id(
+    veo_live_counter_store: VeoLiveCounterStore,
+) -> None:
+    assert await veo_live_counter_store.try_claim_case("case-1") is True
+    assert await veo_live_counter_store.try_claim_case("case-2") is True
+    assert await veo_live_counter_store.try_claim_case("case-1") is False
+    assert await veo_live_counter_store.try_claim_case("case-2") is False
+
+
+async def test_firestore_claim_case_doc_lives_under_guard_totals() -> None:
+    fake = _FakeFirestore()
+    store = FirestoreVeoLiveCounterStore(fake)  # type: ignore[arg-type]
+    await store.try_claim_case("case-abc")
+    assert ("guard_totals", "veo_live_claims_case-abc") in fake.docs
+
+
+async def test_concurrent_claims_for_one_case_never_allow_more_than_one_through() -> None:
+    """The exact race: N concurrent job executions for the same case_id,
+    all reaching the claim at once. `<=1`, not `==1`, mirrors
+    `test_concurrent_veo_live_increments_do_not_lose_updates`'s own
+    deliberate choice above: under pathological interleaving every racer's
+    own read can observe every other racer's write first and see the count
+    already above the limit, so *zero* claims winning is an accepted,
+    safe-direction outcome (a lost illustration is a UX nit; the property
+    that matters for real spend is that more than one can never win)."""
+    fake = _FakeFirestore(yield_on_io=True)
+    store = FirestoreVeoLiveCounterStore(fake)  # type: ignore[arg-type]
+
+    results = await asyncio.gather(*(store.try_claim_case("case-1") for _ in range(10)))
+
+    assert sum(1 for allowed in results if allowed) <= 1, "more than one claim was allowed"

@@ -156,6 +156,23 @@ def test_default_pipeline_factory_wires_a_real_ingest_client_for_live_ingest() -
     assert runner._ingest_client.timeout.connect == 10.0
 
 
+def test_default_pipeline_factory_wires_the_judge_gated_live_veo_client() -> None:
+    """Wave 13 (founder-authorized): the real Cloud Run Job entrypoint must
+    wire a real `VertexVeoLiveClient` and `FirestoreVeoLiveCounterStore` --
+    without both, `RealPipelineRunner._run_veo_live_illustration_step` is a
+    guaranteed no-op (see that method's own "not wired" degrade), silently
+    disabling the whole judge-gated live-generation feature in production
+    even though every other piece of it is deployed."""
+    from setback.evidence.veo_live import VertexVeoLiveClient
+    from setback.job.main import _default_pipeline_factory
+    from setback.state.guard_store import FirestoreVeoLiveCounterStore
+
+    runner = _default_pipeline_factory()
+
+    assert isinstance(runner._veo_client, VertexVeoLiveClient)
+    assert isinstance(runner._veo_live_counter_store, FirestoreVeoLiveCounterStore)
+
+
 # --- main() ----------------------------------------------------------------
 
 
