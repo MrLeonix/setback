@@ -1,3 +1,59 @@
+# STATUS — wave 12 P0 fix round part 2: security leak + XSS closed (2026-08-30)
+
+Resumed the wave-12 synthesis's full 9-item P0 list against the section below (which
+covered only a subset under different numbering) and closed the two still-open,
+in-repo items plus one non-repo doc fix, smallest surgical change each, on `main`, no
+deploy (Ship phase deploys once):
+
+1. **Objection letter leaks internal reviewer labels (P0 #4)** —
+   `job/pipeline.py`'s `GroundContent.statement` was `f"{ground.claim} {result.verdict.
+   rationale}"`; `CourtVerdict.rationale` on the CLEAR path (`court/graph.py::
+   _finalize_clear`) is always synthesized as literal `"Clause Reviewer: ... |
+   Evidence Reviewer: ..."`. The letter body now uses `ground.claim` alone. Regression
+   test reproduces the existing CLEAR-path fixture and asserts neither literal label
+   appears in the composed submission markdown; confirmed to fail against the reverted
+   code before the fix, pass after. Canonical film cases' stored documents are frozen
+   from tribunal run time and unaffected either way — this closes the leak going
+   forward, for every case run from here on.
+2. **Stored XSS via upload Content-Type trust (P0 #9, security, not film-visible,
+   prioritized regardless)** — `console/app.py`'s upload route trusted the
+   client-supplied `UploadFile.content_type` header verbatim, storing and later
+   serving it back as the response's `media_type` with no verification — on a live
+   public app whose docket `?key=` is reachable via `document.referrer`. Uploads are
+   now accepted only when their own bytes match a known image/PDF magic signature
+   (JPEG/PNG/GIF/WEBP/PDF, matching the upload widget's own `accept` attribute);
+   anything else is rejected 415. Stored/served content-type is always the sniffed
+   value, never the header. `get_uploaded_document` also now sets
+   `X-Content-Type-Options: nosniff`. New regression tests cover: rejecting
+   non-image/PDF bytes, ignoring a spoofed header (real PNG bytes declared
+   `text/html` still get served as `image/png`), and the `nosniff` header's presence.
+   Existing upload fixtures used placeholder bytes with no real signature (only ever
+   accepted because the header was trusted); updated to carry real magic bytes.
+3. **`HOW-SETBACK-WORKS.md` points to a superseded case (P0 #6, non-repo file,
+   `~/Desktop/setback-hackathon/`)** — §2's live case link and quoted-transcript
+   narrative pointed at `5e791203b4b538ec8b4de27b981e7ab6` (a wave-10 predecessor run),
+   not the current canonical real-DA case. Updated the URL to
+   `aeff0460678e76feceb7a5a7af934d31` and added a source-of-truth note pointing to
+   `FILM-SCRIPT.md` for this section's specific quoted lines and cost figure, since
+   those were captured against the superseded case and haven't been independently
+   re-verified against the current one — safer than rewriting case-specific narrative
+   content this agent can't verify against the live case page.
+
+Full offline suite green: **662 passed** (up from 648 at the wave-12 baseline this
+picked up from, +14 across the two touched test files), `ruff check` clean, `ruff
+format --check` clean, full-tree `mypy` clean (38 source files). Two commits on
+`main`, conventional-commit messages, no force-push, `veo-integration` and
+`ui-bubbles-lightbox` branches untouched. No secret value, personal identifier, or
+hostname was read, printed, or transmitted this round.
+
+**Still open from the original 9-item P0 list, unchanged from below:** #1 (redeploy)
+is explicitly out of scope for this fix round — the Ship phase's job. #8 (README.md's
+eligibility clause) is still genuinely blocked on Leo pasting the verbatim hackathon
+rules text with a citation; no agent can source that. #2/#3/#5/#7 were already closed
+by the prior pass below.
+
+---
+
 # STATUS — wave 12 P0 fix round landed, film-visible defects closed (2026-08-30)
 
 Closed the wave-12 synthesis's P0 list (5 of 6 items; #5 is genuinely blocked, see
