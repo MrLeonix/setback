@@ -60,14 +60,19 @@ async def start_tribunal(case_id: str) -> dict[str, Any]:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import os
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
 from fastapi import HTTPException, Request
+
+from setback.state.guard_store import GuardCounterStore, GuardTotals, GuardTotalsStore
 
 # --- (a) sliding-window rate limiting ---------------------------------------
 
@@ -148,15 +153,30 @@ def _client_ip(request: Request) -> str:
 
 def per_ip_case_creation_guard(
     limiter: SlidingWindowRateLimiter | None = None,
+    *,
+    docket_key_provider: Callable[[], str | None] | None = None,
 ) -> Callable[[Request], None]:
     """Build a FastAPI dependency enforcing a per-IP sliding-window limit on
-    case creation. Wire with `Depends(...)` on `POST /api/cases`."""
+    case creation. Wire with `Depends(...)` on `POST /api/cases`.
+
+    `docket_key_provider`: when given, a request carrying a verified
+    privileged-session cookie (see `is_privileged_request`) bypasses this
+    limiter too -- "privileged requests bypass ALL limits" (DESIGN SPEC
+    point 1). Left `None` by default (this limiter's own pre-existing test
+    suite calls it that way, against a bare `SimpleNamespace(client=...)`
+    fake request with no `.cookies` attribute at all) so behaviour here is
+    unchanged unless a caller opts in -- `console/app.py`'s production
+    wiring does."""
     active_limiter = limiter or SlidingWindowRateLimiter(
         limit=DEFAULT_CASE_CREATION_LIMIT,
         window_seconds=DEFAULT_CASE_CREATION_WINDOW_SECONDS,
     )
 
     def _dependency(request: Request) -> None:
+        if docket_key_provider is not None and is_privileged_request(
+            request, docket_key_provider=docket_key_provider
+        ):
+            return
         key = _client_ip(request)
         if not active_limiter.allow(key):
             raise RateLimitExceeded(
@@ -216,6 +236,9 @@ class _EventLike(Protocol):
 
     @property
     def recorded_at(self) -> datetime: ...
+
+    @property
+    def payload(self) -> Mapping[str, Any]: ...
 
 
 class CaseStoreLike(Protocol):
@@ -403,6 +426,376 @@ async def enforce_daily_spend_budget(
         raise DailySpendExceeded(spent_usd=spent, ceiling_usd=daily_ceiling_usd)
 
 
+# --- (d) public-abuse guard: the privileged (judge/founder) session --------
+#
+# "Layered + key bypass" (founder-selected design, 2026-08-29): the docket
+# board's existing key gate (`console/app.py`'s `_docket_key_accepted`)
+# doubles as the privileged-session grant. Opening `/docket` with a VALID
+# key sets an `sb_priv` cookie (`console/app.py`'s `docket_board` route);
+# every guard function below treats a request carrying a *verified* copy of
+# that cookie as exempt from every limit in this module.
+#
+# The cookie is never the docket key itself, nor derivable back into it: it
+# is `HMAC-SHA256(key=docket_key_bytes, msg="setback-privileged-v1")`, so
+# rotating `SETBACK_DOCKET_KEY` (e.g. after a suspected leak) naturally
+# invalidates every cookie issued under the old key -- a new key derives a
+# different HMAC, and the old cookie value simply stops verifying. There is
+# no separate revocation list to maintain.
+
+PRIVILEGED_COOKIE_NAME: Final[str] = "sb_priv"
+PRIVILEGED_COOKIE_MAX_AGE_SECONDS: Final[int] = 60 * 24 * 3600
+"""60 days -- long enough that a judge or the founder, once let in during
+the hackathon window, never has to re-enter the docket key."""
+
+_PRIVILEGED_HMAC_MESSAGE: Final[bytes] = b"setback-privileged-v1"
+
+
+def privileged_cookie_value(docket_key: str) -> str:
+    """The `sb_priv` cookie value for a valid docket key. See the section
+    docstring above for why an HMAC rather than the key itself."""
+    return hmac.new(docket_key.encode(), _PRIVILEGED_HMAC_MESSAGE, hashlib.sha256).hexdigest()
+
+
+def is_privileged_cookie_valid(cookie_value: str | None, docket_key: str | None) -> bool:
+    """Constant-time verification (`hmac.compare_digest`) of a `sb_priv`
+    cookie value against the console's current `docket_key`.
+
+    `docket_key` unset (no `SETBACK_DOCKET_KEY` configured -- local dev, or
+    any test that never sets it) never counts as privileged even with a
+    cookie present: with the docket gate itself disabled in that mode
+    (`console/app.py`'s `_docket_key_accepted`), there is no real secret a
+    cookie could ever have been issued to prove knowledge of.
+    """
+    if not docket_key or not cookie_value:
+        return False
+    expected = privileged_cookie_value(docket_key)
+    return hmac.compare_digest(cookie_value, expected)
+
+
+def is_privileged_request(
+    request: Request, *, docket_key_provider: Callable[[], str | None]
+) -> bool:
+    """True when `request` carries a verified `sb_priv` cookie for the
+    console's current docket key (read fresh from `docket_key_provider` on
+    every call -- never cached across a key rotation). Every guard
+    dependency below calls this first and returns early, unchecked, when it
+    is `True`."""
+    cookie_value = request.cookies.get(PRIVILEGED_COOKIE_NAME)
+    return is_privileged_cookie_valid(cookie_value, docket_key_provider())
+
+
+# --- (e) public-abuse guard: per-actor identity, never a raw IP ------------
+
+
+def public_guard_client_ip(request: Request) -> str:
+    """Best-effort caller IP for the public-abuse guard's per-actor caps,
+    Cloud-Run-aware: Google Front End appends the true client address as
+    the LAST entry of `X-Forwarded-For` on every request it forwards to a
+    Cloud Run service -- every earlier entry is client-supplied and
+    therefore forgeable (a client can send its own `X-Forwarded-For` header
+    with any leading addresses it likes; GFE always appends the real one
+    after whatever the client sent), so only the last entry is trustworthy.
+
+    Kept as its own function rather than folded into the existing
+    `_client_ip` above (used by the hourly per-IP case-creation limiter):
+    that function's own test suite (`_fake_request`, a bare
+    `SimpleNamespace(client=...)` with no `headers` attribute at all)
+    predates this Cloud-Run header-parsing need, and changing it would
+    require touching every one of those call sites for no behavioural gain
+    there. Falls back to `request.client.host`, then a shared `"unknown"`
+    bucket, exactly like `_client_ip`.
+    """
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        candidates = [part.strip() for part in forwarded_for.split(",") if part.strip()]
+        if candidates:
+            return candidates[-1]
+    if request.client is not None and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+_CLIENT_SALT_LABEL: Final[bytes] = b"setback-client-salt-v1"
+
+
+def _client_identity_salt(docket_key: str | None) -> bytes:
+    """A per-deployment salt derived in-process from the docket key (never
+    stored, never logged) -- so `hashed_client_id` below never needs to
+    persist or transmit a raw IP anywhere (GDPR/PII rule). Falls back to a
+    fixed, documented seed when no docket key is configured (local dev, or
+    a test that never sets `SETBACK_DOCKET_KEY`); production always runs
+    with a real docket key configured, so this fallback never actually
+    governs a live deployment -- it only keeps this guard functional in an
+    environment with no key at all."""
+    seed = (docket_key or "setback-no-docket-key-configured").encode()
+    return hmac.new(seed, _CLIENT_SALT_LABEL, hashlib.sha256).digest()
+
+
+def hashed_client_id(client_ip: str, *, docket_key: str | None) -> str:
+    """`sha256(salt + client_ip)`, safe to use as (part of) a Firestore
+    document id or field -- the raw IP itself is never stored, logged, or
+    transmitted anywhere past this function's own stack frame."""
+    salt = _client_identity_salt(docket_key)
+    return hashlib.sha256(salt + client_ip.encode()).hexdigest()
+
+
+# --- (f) public-abuse guard: per-actor caps ---------------------------------
+
+MAX_CASES_PER_CLIENT_PER_DAY: Final[int] = int(os.environ.get("MAX_CASES_PER_CLIENT_PER_DAY", "5"))
+"""5 new cases per client per rolling day, keyed by `hashed_client_id` --
+independent of, and layered underneath, the existing hourly per-IP limiter
+(`per_ip_case_creation_guard`) above."""
+
+MAX_INTERVIEW_TURNS_PER_CASE: Final[int] = int(os.environ.get("MAX_INTERVIEW_TURNS_PER_CASE", "30"))
+"""30 interview turns per case, counted server-side from this case's own
+stored `interview_turn` events -- not a new counter, so a resumed session
+(a fresh process, no in-memory rate-limiter state) is still capped
+correctly."""
+
+MAX_UPLOADS_PER_CASE: Final[int] = int(os.environ.get("MAX_UPLOADS_PER_CASE", "5"))
+"""5 uploads per case, counted server-side from this case's own stored
+`document_uploaded` events, the same way as `MAX_INTERVIEW_TURNS_PER_CASE`."""
+
+
+def per_client_daily_case_cap_guard(
+    counter_store: GuardCounterStore,
+    *,
+    docket_key_provider: Callable[[], str | None],
+    limit: int = MAX_CASES_PER_CLIENT_PER_DAY,
+    now: Callable[[], datetime] | None = None,
+) -> Callable[[Request], Awaitable[None]]:
+    """Build a FastAPI dependency enforcing `limit` new cases per client
+    (`hashed_client_id`) per rolling UTC day, backed by `counter_store`.
+    Wire with `Depends(...)` on `POST /api/cases`, alongside the existing
+    hourly `per_ip_case_creation_guard`. A privileged request bypasses this
+    entirely (see `is_privileged_request`)."""
+    clock = now or (lambda: datetime.now(UTC))
+
+    async def _dependency(request: Request) -> None:
+        if is_privileged_request(request, docket_key_provider=docket_key_provider):
+            return
+        docket_key = docket_key_provider()
+        client_hash = hashed_client_id(public_guard_client_ip(request), docket_key=docket_key)
+        allowed = await counter_store.try_increment_daily(
+            "case", client_hash, day=clock().date(), limit=limit
+        )
+        if not allowed:
+            raise RateLimitExceeded(
+                detail=(
+                    f"too many cases created from this address today; limit is {limit} per day"
+                ),
+                retry_after_seconds=86400.0,
+            )
+
+    return _dependency
+
+
+def _resident_turn_count(events: tuple[_EventLike, ...]) -> int:
+    return sum(
+        1
+        for e in events
+        if e.event_type == "interview_turn" and e.payload.get("role") == "resident"
+    )
+
+
+def per_case_interview_turn_cap_guard(
+    store: CaseStoreLike,
+    *,
+    docket_key_provider: Callable[[], str | None],
+    limit: int = MAX_INTERVIEW_TURNS_PER_CASE,
+) -> Callable[[Request, str], Awaitable[None]]:
+    """Build a FastAPI dependency enforcing `limit` interview turns per
+    case, counted from this case's own stored events (see
+    `MAX_INTERVIEW_TURNS_PER_CASE`). Wire with `Depends(...)` on
+    `POST /api/cases/{case_id}/interview` -- FastAPI resolves both `request`
+    and the route's own `case_id` path parameter automatically."""
+
+    async def _dependency(request: Request, case_id: str) -> None:
+        if is_privileged_request(request, docket_key_provider=docket_key_provider):
+            return
+        events = await store.list_events(case_id)
+        if _resident_turn_count(events) >= limit:
+            raise RateLimitExceeded(
+                detail=(
+                    f"this case has reached {limit} interview turns; "
+                    "it can still be browsed, just not extended further"
+                ),
+                retry_after_seconds=0.0,
+            )
+
+    return _dependency
+
+
+def per_case_upload_cap_guard(
+    store: CaseStoreLike,
+    *,
+    docket_key_provider: Callable[[], str | None],
+    limit: int = MAX_UPLOADS_PER_CASE,
+) -> Callable[[Request, str], Awaitable[None]]:
+    """Build a FastAPI dependency enforcing `limit` uploads per case,
+    counted from this case's own stored `document_uploaded` events. Wire
+    with `Depends(...)` on `POST /api/cases/{case_id}/documents`."""
+
+    async def _dependency(request: Request, case_id: str) -> None:
+        if is_privileged_request(request, docket_key_provider=docket_key_provider):
+            return
+        events = await store.list_events(case_id)
+        upload_count = sum(1 for e in events if e.event_type == "document_uploaded")
+        if upload_count >= limit:
+            raise RateLimitExceeded(
+                detail=f"this case has reached the {limit}-upload limit",
+                retry_after_seconds=0.0,
+            )
+
+    return _dependency
+
+
+# --- (g) public-abuse guard: the global public-spend ceiling ---------------
+
+PUBLIC_SPEND_CEILING_USD: Final[float] = float(os.environ.get("PUBLIC_SPEND_CEILING_USD", "26.00"))
+"""~AUD$40 at the time this ceiling was set (the founder's own number,
+2026-08-29) -- USD is this codebase's native pricing currency
+(`state.ledger.PRICING_USD_PER_MILLION_TOKENS`), so the ceiling is
+expressed in USD and converted once at configuration time rather than
+carrying a live FX conversion in the hot path."""
+
+PUBLIC_TURN_COST_ESTIMATE_USD: Final[float] = float(
+    os.environ.get("PUBLIC_TURN_COST_ESTIMATE_USD", "0.001")
+)
+"""A conservative flat estimate booked against the aggregate for every
+anonymous interview turn -- the interview model itself
+(`config.INTERVIEW`, `gemini-3.5-flash-lite`) is cheap enough that a real
+per-call price here would be more precision than this soft ceiling needs."""
+
+STREET_VIEW_FETCH_COST_USD: Final[float] = float(
+    os.environ.get("STREET_VIEW_FETCH_COST_USD", "0.007")
+)
+"""Booked per Street View Static API fetch (`evidence.imagery.
+fetch_street_view_fallback`) -- a real, metered Google Maps Platform cost,
+distinct from model spend."""
+
+MAX_ANONYMOUS_CASES_TOTAL: Final[int] = int(os.environ.get("MAX_ANONYMOUS_CASES_TOTAL", "5000"))
+MAX_ANONYMOUS_TURNS_TOTAL: Final[int] = int(os.environ.get("MAX_ANONYMOUS_TURNS_TOTAL", "100000"))
+"""Hard count backstops, independent of the dollar ceiling -- catch a
+pathological cheap-request flood (e.g. an empty-answer interview loop) that
+`PUBLIC_SPEND_CEILING_USD` alone might not reach quickly."""
+
+_THRESHOLD_PCTS: Final[tuple[int, ...]] = (50, 80, 100)
+
+
+class PublicGuardPaused(HTTPException):
+    """429: the public demo's spend ceiling or a hard count backstop has
+    been reached. Only ever wired onto an anonymous *mutating* route (see
+    `console/app.py`) -- every read stays open regardless. The detail
+    string is the same honest, plain-English copy the landing/case-page
+    banner uses (WRITING-STYLE-GUIDE.md-compliant); it never mentions the
+    key/bypass mechanism."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=429,
+            detail=(
+                "the public demo budget for this hackathon build has been used up; "
+                "every existing case stays open to browse, new interactions are paused"
+            ),
+        )
+
+
+def is_public_guard_paused(
+    totals: GuardTotals,
+    *,
+    ceiling_usd: float = PUBLIC_SPEND_CEILING_USD,
+    max_cases: int = MAX_ANONYMOUS_CASES_TOTAL,
+    max_turns: int = MAX_ANONYMOUS_TURNS_TOTAL,
+) -> bool:
+    """True once `totals` has reached the dollar ceiling or either hard
+    count backstop. Pure and synchronous so both the FastAPI dependency
+    (`public_guard_dependency`) and the landing/case-page renderers can
+    share one definition of "paused"."""
+    return (
+        totals.spend_usd >= ceiling_usd
+        or totals.anonymous_cases >= max_cases
+        or totals.anonymous_turns >= max_turns
+    )
+
+
+@dataclass
+class CachedGuardTotalsReader:
+    """Wraps a `GuardTotalsStore` with a short in-process TTL cache (<=60s
+    per the design spec) so every anonymous mutating request, plus every
+    landing/case-page render, doesn't hit Firestore just to check whether
+    the public demo is paused. One instance is shared for the lifetime of a
+    console process (see `console/app.py`'s `create_app`)."""
+
+    store: GuardTotalsStore
+    ttl_seconds: float = 30.0
+    clock: Callable[[], float] = time.monotonic
+    _cached: GuardTotals | None = field(default=None, init=False, repr=False)
+    _cached_at: float = field(default=-1.0, init=False, repr=False)
+
+    async def get_totals(self) -> GuardTotals:
+        now = self.clock()
+        if self._cached is not None and (now - self._cached_at) < self.ttl_seconds:
+            return self._cached
+        totals = await self.store.get_totals()
+        self._cached = totals
+        self._cached_at = now
+        return totals
+
+    def invalidate(self) -> None:
+        """Force the next `get_totals()` to re-read `store` -- called right
+        after this process itself books a cost against the aggregate, so a
+        request handled by this same instance never has to wait out the
+        full TTL to see its own write."""
+        self._cached = None
+        self._cached_at = -1.0
+
+
+def public_guard_dependency(
+    totals_reader: CachedGuardTotalsReader,
+    *,
+    docket_key_provider: Callable[[], str | None],
+    ceiling_usd: float = PUBLIC_SPEND_CEILING_USD,
+    max_cases: int = MAX_ANONYMOUS_CASES_TOTAL,
+    max_turns: int = MAX_ANONYMOUS_TURNS_TOTAL,
+) -> Callable[[Request], Awaitable[None]]:
+    """Build a FastAPI dependency raising `PublicGuardPaused` once the
+    public demo is paused, bypassed entirely by a privileged request. Wire
+    with `Depends(...)` on every anonymous mutating route: create case,
+    interview turn, upload, start tribunal."""
+
+    async def _dependency(request: Request) -> None:
+        if is_privileged_request(request, docket_key_provider=docket_key_provider):
+            return
+        totals = await totals_reader.get_totals()
+        if is_public_guard_paused(
+            totals, ceiling_usd=ceiling_usd, max_cases=max_cases, max_turns=max_turns
+        ):
+            raise PublicGuardPaused()
+
+    return _dependency
+
+
+async def record_threshold_events_if_crossed(
+    totals_store: GuardTotalsStore,
+    totals: GuardTotals,
+    *,
+    ceiling_usd: float = PUBLIC_SPEND_CEILING_USD,
+) -> None:
+    """Write a one-time guard event doc the first time the running spend
+    crosses each of 50%/80%/100% of `ceiling_usd`, via
+    `GuardTotalsStore.record_threshold_event`'s own idempotency check --
+    safe to call after every single spend-affecting mutation regardless of
+    whether this particular call is the one that actually crossed a new
+    threshold."""
+    if ceiling_usd <= 0:
+        return
+    pct = (totals.spend_usd / ceiling_usd) * 100
+    for threshold in _THRESHOLD_PCTS:
+        if pct >= threshold:
+            await totals_store.record_threshold_event(threshold)
+
+
 __all__ = [
     "DEFAULT_CASE_CREATION_LIMIT",
     "DEFAULT_CASE_CREATION_WINDOW_SECONDS",
@@ -411,15 +804,38 @@ __all__ = [
     "DEFAULT_INTERVIEW_TURN_WINDOW_SECONDS",
     "DEFAULT_MAX_CONCURRENT_TRIBUNALS",
     "DEFAULT_STALE_RUN_TTL_SECONDS",
+    "MAX_ANONYMOUS_CASES_TOTAL",
+    "MAX_ANONYMOUS_TURNS_TOTAL",
+    "MAX_CASES_PER_CLIENT_PER_DAY",
+    "MAX_INTERVIEW_TURNS_PER_CASE",
+    "MAX_UPLOADS_PER_CASE",
+    "PRIVILEGED_COOKIE_MAX_AGE_SECONDS",
+    "PRIVILEGED_COOKIE_NAME",
+    "PUBLIC_SPEND_CEILING_USD",
+    "PUBLIC_TURN_COST_ESTIMATE_USD",
+    "STREET_VIEW_FETCH_COST_USD",
+    "CachedGuardTotalsReader",
     "CaseStoreLike",
     "DailySpendExceeded",
+    "PublicGuardPaused",
     "RateLimitExceeded",
     "SlidingWindowRateLimiter",
     "TribunalCapacityExceeded",
     "count_running_tribunals",
     "enforce_concurrent_tribunal_cap",
     "enforce_daily_spend_budget",
+    "hashed_client_id",
+    "is_privileged_cookie_valid",
+    "is_privileged_request",
+    "is_public_guard_paused",
+    "per_case_interview_turn_cap_guard",
     "per_case_interview_turn_guard",
+    "per_case_upload_cap_guard",
+    "per_client_daily_case_cap_guard",
     "per_ip_case_creation_guard",
+    "privileged_cookie_value",
+    "public_guard_client_ip",
+    "public_guard_dependency",
+    "record_threshold_events_if_crossed",
     "todays_ledger_spend_usd",
 ]
