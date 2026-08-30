@@ -187,11 +187,21 @@ model behind the two service accounts it deploys as.
 | `gemma-4-26b-a4b-it-maas` | Low-cost clerical extraction & refusal prose (OpenAI-compatible MaaS endpoint) | n/a |
 | `veo-3.1-generate-001` | Overshadowing-simulation illustration — see below | n/a |
 
-Mandatory for all categories: 1) Gemini 3.5 or newer accessed through Gemini
-API or Vertex AI.
+Mandatory for all categories, quoted verbatim from the hackathon's own rules
+page (source:
+[allthingsagentichackathon.devpost.com/rules](https://allthingsagentichackathon.devpost.com/rules),
+fetched 2026-08-30):
 
-All four models above are accessed through Vertex AI and satisfy this
-requirement.
+> Mandatory for all categories: 1) Gemini 3.5 or newer accessed through
+> Gemini API or Vertex AI, 2) AND at least one Google Agent Framework:
+> Google ADK, GenAI SDK, Antigravity SDK or GenKit 3) AND at least one
+> Google Cloud infrastructure service (such as Cloud Run, Cloud SQL,
+> Firestore, GKE, Pub/Sub).
+
+Setback satisfies all three: (1) all four models above are accessed through
+Vertex AI, (2) the tribunal graph is built on Google's Agent Development Kit
+(`google-adk`), and (3) it deploys as a Cloud Run Service plus a Cloud Run
+Job, backed by Firestore.
 
 **Veo's role is illustration only, never evidence.** Two canonical demo
 cases that raised an overshadowing ground each carry one Veo-generated
