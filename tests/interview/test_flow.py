@@ -198,6 +198,32 @@ async def test_confirmed_concern_carries_redacted_text_with_pii_stripped() -> No
     assert "Jane Smith" in concern.initial_statement
 
 
+async def test_redacted_text_replaces_rather_than_accumulates_a_disputed_clarification() -> None:
+    """P0 regression (wave-12 synthesis #6): after a resident disputes a
+    CONFIRMING summary and corrects themselves in the CLARIFYING round that
+    follows, `redacted_text` must carry only the corrected wording -- not
+    both the disputed and the corrected clarification stitched together,
+    which used to leave a self-contradictory north/south, morning/afternoon
+    pair in the same string fed to the tribunal prompt."""
+    flow = InterviewFlow(composer=_FakeComposer())
+    await flow.start()
+    await flow.submit("The new second storey will overshadow my garden.")
+    await flow.submit("It's on the north side, blocking morning sun 9-11am.")
+    await flow.submit("no photos")
+    assert flow.stage is InterviewStage.CONFIRMING
+
+    await flow.submit("No, that's wrong -- it's actually the south side, afternoon sun 2-4pm.")
+    assert flow.stage is InterviewStage.CLARIFYING
+
+    await flow.submit("It's on the south side, blocking afternoon sun 2-4pm.")
+    assert flow.stage is InterviewStage.REQUESTING_EVIDENCE
+    assert flow._current is not None  # noqa: SLF001 -- internal check of the corrected state
+    assert "south" in flow._current.redacted_text  # noqa: SLF001
+    assert "2-4pm" in flow._current.redacted_text  # noqa: SLF001
+    assert "north" not in flow._current.redacted_text  # noqa: SLF001
+    assert "9-11am" not in flow._current.redacted_text  # noqa: SLF001
+
+
 async def test_default_normaliser_is_the_offline_keyword_test_double() -> None:
     flow = InterviewFlow(composer=_FakeComposer())
     assert isinstance(flow._concern_normaliser, KeywordConcernNormaliser)  # noqa: SLF001

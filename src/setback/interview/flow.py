@@ -208,6 +208,12 @@ class RaisedConcern:
     disputed_confirmations: tuple[str, ...] = ()
     confirmed: bool = False
     redacted_text: str = ""
+    redacted_base: str = ""
+    """`redacted_text`'s value as of concern creation, before any
+    clarification/evidence text was appended -- kept so a post-dispute
+    re-clarification (`_handle_clarifying` when `disputed_confirmations`
+    is non-empty) can rebuild `redacted_text` from this pristine base
+    instead of appending onto text the resident just said was wrong."""
 
 
 @dataclass(frozen=True)
@@ -354,16 +360,29 @@ class InterviewFlow:
             concern_type = classify_concern(answer)
             redacted_text = redact_personal_information(answer)
         self._current = RaisedConcern(
-            concern_type=concern_type, initial_statement=answer, redacted_text=redacted_text
+            concern_type=concern_type,
+            initial_statement=answer,
+            redacted_text=redacted_text,
+            redacted_base=redacted_text,
         )
         return await self._ask(InterviewStage.CLARIFYING, _CLARIFYING_INSTRUCTIONS[concern_type])
 
     async def _handle_clarifying(self, answer: str) -> InterviewTurn:
         assert self._current is not None
         self._current.clarification = answer
-        self._current.redacted_text = (
-            f"{self._current.redacted_text} {redact_personal_information(answer)}".strip()
-        )
+        if self._current.disputed_confirmations:
+            # Re-entering CLARIFYING off a disputed CONFIRMING: the resident
+            # just said the previous clarification was wrong, so replace it
+            # rather than append -- otherwise redacted_text keeps both the
+            # disputed and the corrected wording side by side (e.g. a
+            # contradictory north/south or 9am/2pm pair in the same string).
+            self._current.redacted_text = (
+                f"{self._current.redacted_base} {redact_personal_information(answer)}".strip()
+            )
+        else:
+            self._current.redacted_text = (
+                f"{self._current.redacted_text} {redact_personal_information(answer)}".strip()
+            )
         return await self._ask(
             InterviewStage.REQUESTING_EVIDENCE,
             "Ask the resident if they have any photos, plans, or documents that show this, "
