@@ -393,43 +393,108 @@ _CHIP_STACK_GAP_PX: Final[int] = 3
 to avoid a collision -- purely cosmetic breathing room so two stacked
 chips read as visibly separate labels rather than merely touching edges."""
 
+_MAX_CHIP_WIDTH_FRACTION: Final[float] = 0.35
+"""A label chip is never drawn wider than this fraction of the image it is
+drawn on -- founder requirement #2 (this fix, live FILM2 report): label
+chips were "giant filled bars" wide enough to run across whole rows of
+drawing content, not compact tags. `_draw_label_chip` enforces this by
+truncating its own text (`_truncate_text_to_fit`) *before* it ever measures
+a chip rectangle, so the cap holds regardless of how long a caption plus
+this module's own outcome suffix (`label_for`) happens to run."""
 
-def _vertically_overlaps(a: _ChipRect, b: _ChipRect) -> bool:
-    _, a_top, _, a_bottom = a
-    _, b_top, _, b_bottom = b
-    return not (a_bottom <= b_top or b_bottom <= a_top)
+_ELLIPSIS: Final[str] = "…"
 
 
-def _shift_clear_of_avoid(
-    rect: _ChipRect, avoid: Sequence[_ChipRect], max_x: float | None
-) -> _ChipRect:
-    """Place `rect` on a "shelf" immediately beside whichever already-placed
-    rects in `avoid` share its row (vertically overlap it) -- immediately
-    right of the rightmost one, or immediately left of the leftmost, never
-    past the image's left edge (`0.0`) or, when `max_x` is given, its right
-    edge either. This is the two-row fallback `_draw_label_chip` reaches
-    for only once vertical stacking has already run out of headroom at the
-    image's top edge and the chip still collides -- live-reported (wave 12,
-    FILM2): three adjacent boxes near a page's top edge left every one of
-    their chips pinned to `chip_top == 0.0` with nowhere left to stack
-    upward, so they silently overlapped instead. Returns `rect` unchanged
-    if neither side has room, so the caller's "accept the overlap rather
-    than loop forever" behaviour still applies as the final fallback."""
-    left, top, right, bottom = rect
-    width = right - left
-    same_row = [placed for placed in avoid if _vertically_overlaps(rect, placed)]
-    if not same_row:
-        return rect
-    candidates: list[_ChipRect] = []
-    right_edge = max(placed[2] for placed in same_row) + _CHIP_STACK_GAP_PX
-    if max_x is None or right_edge + width <= max_x:
-        candidates.append((right_edge, top, right_edge + width, bottom))
-    left_edge = min(placed[0] for placed in same_row) - _CHIP_STACK_GAP_PX - width
-    if left_edge >= 0.0:
-        candidates.append((left_edge, top, left_edge + width, bottom))
-    for candidate in candidates:
-        if not any(_rects_overlap(candidate, placed) for placed in avoid):
+def _text_extent(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont | ImageFont.FreeTypeFont
+) -> tuple[float, float]:
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    return right - left, bottom - top
+
+
+def _truncate_text_to_fit(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont | ImageFont.FreeTypeFont,
+    max_text_width_px: float,
+) -> str:
+    """Shorten `text` (dropping trailing characters, appending an ellipsis)
+    until it measures no wider than `max_text_width_px` -- the caller's own
+    text-only budget (a chip's *total* width also adds its fixed padding on
+    both sides; see `_MAX_CHIP_WIDTH_FRACTION`'s docstring for the overall
+    cap this exists to enforce). Returns `text` unchanged if it already
+    fits. Never returns an empty string -- a chip truncated down to just
+    the ellipsis is still strictly more useful than one with no visible
+    caption at all."""
+    width, _ = _text_extent(draw, text, font)
+    if width <= max_text_width_px:
+        return text
+    truncated = text
+    while truncated:
+        candidate = f"{truncated.rstrip()}{_ELLIPSIS}"
+        candidate_width, _ = _text_extent(draw, candidate, font)
+        if candidate_width <= max_text_width_px:
             return candidate
+        truncated = truncated[:-1]
+    return _ELLIPSIS
+
+
+def _chip_anchor_x(box_x0: float, box_x1: float, chip_width: float, max_x: float | None) -> float:
+    """Which horizontal *end* of the box (never its middle) a chip anchors
+    from -- founder requirement #3 (this fix, live FILM2 report): a
+    wide-thin box (a height-limit datum line, say) must get its label at
+    one end, not stretched or centred across it. Anchoring from the box's
+    own left edge (`box_x0`) is preferred (it reads naturally, left to
+    right); but if the box sits close enough to the image's right edge
+    that a left-anchored, width-capped chip would still run off it, anchor
+    from the box's *right* edge (`box_x1`) instead so the chip stays fully
+    on-canvas -- still a single end of the box, never its centre."""
+    if max_x is None or box_x0 + chip_width <= max_x:
+        return box_x0
+    return max(0.0, box_x1 - chip_width)
+
+
+def _stack_clear(
+    rect: _ChipRect,
+    avoid: Sequence[_ChipRect],
+    width: float,
+    height: float,
+    *,
+    grow_downward: bool,
+    bound: float | None,
+) -> tuple[_ChipRect, bool]:
+    """Nudge `rect` away from the box (up if `grow_downward` is False --
+    stacking above a box; down otherwise -- stacking below one), one
+    chip-height plus `_CHIP_STACK_GAP_PX` at a time, until it no longer
+    overlaps anything in `avoid`. Returns `(rect, True)` once clear, or
+    `(rect, False)` the moment `bound` (the image's top edge, `0.0`,
+    stacking up; `max_y`, the image's bottom edge, stacking down) would be
+    crossed -- the caller's cue to try the box's other side instead of
+    accepting the overlap outright."""
+    while any(_rects_overlap(rect, placed) for placed in avoid):
+        if grow_downward:
+            new_top = rect[3] + _CHIP_STACK_GAP_PX
+            if bound is not None and new_top + height > bound:
+                return rect, False
+        else:
+            new_top = rect[1] - height - _CHIP_STACK_GAP_PX
+            if new_top < (bound if bound is not None else 0.0):
+                return rect, False
+        rect = (rect[0], new_top, rect[0] + width, new_top + height)
+    return rect, True
+
+
+def _place_chip_below(
+    x: float,
+    box_bottom: float,
+    width: float,
+    height: float,
+    avoid: Sequence[_ChipRect],
+    max_y: float | None,
+) -> _ChipRect:
+    rect: _ChipRect = (x, box_bottom, x + width, box_bottom + height)
+    if avoid:
+        rect, _cleared = _stack_clear(rect, avoid, width, height, grow_downward=True, bound=max_y)
     return rect
 
 
@@ -443,11 +508,36 @@ def _draw_label_chip(
     font: ImageFont.ImageFont | ImageFont.FreeTypeFont | None = None,
     avoid: Sequence[_ChipRect] | None = None,
     max_x: float | None = None,
+    max_y: float | None = None,
+    box_x1: float | None = None,
+    box_bottom: float | None = None,
 ) -> _ChipRect:
-    """Draw a filled, coloured tag with white text, anchored just above
-    `(x, y)` (a box's top-left corner) -- clamped so it never draws above
-    the image's top edge. Returns the drawn chip's own rectangle
+    """Draw a compact, coloured tag with white text, anchored just *outside*
+    the box `(x, y, box_x1, box_bottom)` describes (`x, y` its top-left
+    corner) -- never on top of it. Returns the drawn chip's own rectangle
     `(left, top, right, bottom)`.
+
+    Founder requirement #1/#2 (this fix, live FILM2 report -- box fills
+    that buried the drawing, and label chips drawn as giant bars on top of
+    it): the chip is placed **above** the box's top edge when there is
+    headroom for it, never inside or across the box itself. `box_x1`
+    (the box's right edge) and `box_bottom` (its bottom edge) default to
+    `x`/`y` respectively when omitted, so a caller with no real box (this
+    function's own lower-level tests, mostly) still gets a sensible
+    single-point anchor.
+
+    Two founder-mandated shapes on top of that placement:
+
+    * **Compact, width-capped text** (`_truncate_text_to_fit`,
+      `_MAX_CHIP_WIDTH_FRACTION`) -- a chip is truncated with an ellipsis
+      so it is never wider than ~35% of `max_x` (the image's own width),
+      however long the caller's label text runs.
+    * **An end, never the middle** (`_chip_anchor_x`) -- the chip anchors
+      from the box's left edge, or its right edge if the left would run a
+      width-capped chip off the image, but never stretches across/centres
+      on the box's own width. This is what keeps a wide-thin box's label
+      (a height-limit datum line, say) at one end of the line rather than
+      slapped across its middle.
 
     Uses a real TTF (`font`, or `_label_font()`'s default if omitted --
     never PIL's implicit bitmap default) so a multi-word caption's spaces
@@ -463,40 +553,42 @@ def _draw_label_chip(
     boxes' labels overwriting each other into one illegible run-on string
     ("window W.1 -- ciwindow W.2 -- cit..."), since each chip is an opaque
     filled rectangle drawn on top of whatever was there before. Rather than
-    let a later chip silently paint over an earlier one, this chip is
-    pushed straight up (stacked, one chip-height plus `_CHIP_STACK_GAP_PX`
-    at a time) until it no longer overlaps anything in `avoid`, or until it
-    would be pushed off the top of the image entirely (`chip_top` already
-    at `0.0`). Reaching the top edge still overlapping doesn't give up
-    immediately: `_shift_clear_of_avoid` tries a horizontal offset next
-    (the two-row fallback, wave 12 -- boxes anchored near a page's own top
-    edge have no vertical headroom to stack into at all, live-reported
-    against FILM2 as several adjacent chips overlapping right at the page
-    top). Only if neither direction finds a clear spot is the last,
-    closest-fitting position accepted rather than looping forever -- a
-    still-cramped chip beats one silently dropped or an infinite loop.
-    `max_x`, if given, bounds the horizontal search to the image's own
-    width so a shifted chip is never drawn off the right edge either.
+    let a later chip silently paint over an earlier one, a chip placed
+    above its box is pushed further up (stacked, one chip-height plus
+    `_CHIP_STACK_GAP_PX` at a time -- `_stack_clear`) until it no longer
+    overlaps anything in `avoid`. If that stacking would run the chip off
+    the image's top edge before it clears, this chip falls back to sitting
+    *below* the box's bottom-left corner instead (also stacked downward,
+    away from `avoid`, capped at `max_y` if given) -- live-reported (wave
+    12, FILM2): boxes anchored near a page's own top edge have no vertical
+    headroom to stack into above them at all, so several adjacent chips
+    silently overlapped right at the page's top edge. Only if *neither*
+    side finds a clear spot is the last, closest-fitting position accepted
+    rather than looping forever -- a still-cramped chip beats one silently
+    dropped or an infinite loop.
     """
     font = font or _label_font()
-    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
-    width = (right - left) + 2 * _CHIP_PADDING_PX
-    height = (bottom - top) + 2 * _CHIP_PADDING_PX
-    chip_top = max(0.0, y - height)
-    rect: _ChipRect = (x, chip_top, x + width, chip_top + height)
+    box_x1 = x if box_x1 is None else box_x1
+    box_bottom = y if box_bottom is None else box_bottom
+    avoid = avoid or []
 
-    if avoid:
-        while any(_rects_overlap(rect, placed) for placed in avoid):
-            new_top = rect[1] - height - _CHIP_STACK_GAP_PX
-            if new_top < 0.0:
-                if rect[1] <= 0.0:
-                    # Already pinned to the top edge with no vertical
-                    # headroom left -- try a horizontal shift before
-                    # accepting the overlap as the final fallback.
-                    rect = _shift_clear_of_avoid(rect, avoid, max_x)
-                    break
-                new_top = 0.0
-            rect = (x, new_top, x + width, new_top + height)
+    if max_x is not None:
+        max_text_width = max(1.0, max_x * _MAX_CHIP_WIDTH_FRACTION - 2 * _CHIP_PADDING_PX)
+        text = _truncate_text_to_fit(draw, text, font, max_text_width)
+
+    text_width, text_height = _text_extent(draw, text, font)
+    width = text_width + 2 * _CHIP_PADDING_PX
+    height = text_height + 2 * _CHIP_PADDING_PX
+    chip_x = _chip_anchor_x(x, box_x1, width, max_x)
+
+    above_top = y - height
+    if above_top >= 0.0:
+        rect: _ChipRect = (chip_x, above_top, chip_x + width, above_top + height)
+        rect, cleared = _stack_clear(rect, avoid, width, height, grow_downward=False, bound=0.0)
+        if not cleared:
+            rect = _place_chip_below(chip_x, box_bottom, width, height, avoid, max_y)
+    else:
+        rect = _place_chip_below(chip_x, box_bottom, width, height, avoid, max_y)
 
     draw.rectangle(rect, fill=color)
     draw.text(
@@ -581,6 +673,9 @@ def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> 
             font=font,
             avoid=placed_chip_rects,
             max_x=image.width,
+            max_y=image.height,
+            box_x1=x1,
+            box_bottom=y1,
         )
         placed_chip_rects.append(chip_rect)
 

@@ -598,6 +598,174 @@ def test_render_semantic_overlay_draws_a_measurably_taller_chip_on_a_wider_page(
     assert wide_page_chip_height >= 18
 
 
+# --- box styling: stroke-only fills, compact chips outside the box (live ---
+# FILM2 founder report, this fix) -------------------------------------------
+#
+# Live-reported against the film case's own overlay: (1) an opaque/strong
+# box fill buried the drawing underneath it (a green datum-line box hid the
+# building's upper storey); (2) label chips were giant filled bars drawn ON
+# TOP of drawing content instead of clear of it; (3) a wide-thin datum-line
+# box got its label slapped across the middle of the drawing instead of
+# anchored at one end. The wave-8/9 behaviour this suite already pins
+# (width-ratio chip sizing, collision stacking, the box cap, legend colours,
+# the page-area guard) is kept intact; these tests pin the styling fix on
+# top of it.
+
+
+def test_render_semantic_overlay_box_interior_leaves_the_drawing_readable() -> None:
+    """Founder complaint #1: sample a pixel strictly inside a box's
+    interior -- clear of its own outline stroke and of its label chip
+    (drawn outside the box, see the tests below) -- and confirm the
+    drawing pixel underneath survived. A box is stroke-only (or a fill so
+    faint the drawing survives); it must never bury what's underneath it."""
+    original_pixel = (20, 90, 200)
+    base = Image.new("RGB", (400, 300), color="white")
+    ImageDraw.Draw(base).rectangle((150, 100, 250, 200), fill=original_pixel)
+    buf = io.BytesIO()
+    base.save(buf, format="PNG")
+    page = render_photo(buf.getvalue(), resize_width_px=200)
+
+    box = OverlayBox(
+        anchor_id="a1",
+        bbox=BoundingBox(x0=140, y0=90, x1=260, y1=210),
+        role=OverlayRole.SUPPORTS_SHIPPED,
+        color=OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED],
+        label="9m height limit datum line",
+    )
+    png_bytes = render_semantic_overlay(page, [box])
+    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+
+    # Well inside the box's interior: >4px clear of the box's own outline
+    # stroke on every side, and below where the label chip (drawn above the
+    # box) could ever reach.
+    sample = image.getpixel((200, 150))
+    delta = sum(abs(int(a) - int(b)) for a, b in zip(sample, original_pixel, strict=True))
+    assert delta < 30, f"drawing pixel under the box changed too much: {sample} vs {original_pixel}"
+
+
+def test_draw_label_chip_never_overlaps_its_own_box_rect() -> None:
+    """Founder complaint #2: the chip is a label *for* the box, but it must
+    never be drawn on top of the box (or the drawing content the box
+    outlines) -- it belongs immediately outside the box's own rectangle."""
+    image = Image.new("RGB", (500, 400), color="white")
+    draw = ImageDraw.Draw(image)
+    box_rect = (100.0, 150.0, 300.0, 170.0)  # (x0, top, x1, bottom) in pixels
+
+    chip_rect = _draw_label_chip(
+        draw,
+        box_rect[0],
+        box_rect[1],
+        "window W.1 — cited by a refused ground",
+        (0, 0, 0),
+        max_x=image.width,
+        box_x1=box_rect[2],
+        box_bottom=box_rect[3],
+    )
+
+    def _overlaps(
+        a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+    ) -> bool:
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        return not (ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0)
+
+    assert not _overlaps(chip_rect, box_rect)
+
+
+def test_draw_label_chip_never_spans_more_than_35_percent_of_the_image_width() -> None:
+    """Founder complaint #2's concrete cap: however long the label text (a
+    caption plus this module's own outcome suffix can run long), the drawn
+    chip is truncated to stay compact rather than growing into "a giant
+    filled bar" across the drawing."""
+    image = Image.new("RGB", (600, 400), color="white")
+    draw = ImageDraw.Draw(image)
+    long_label = (
+        "the very long wall that shadows almost your entire window and most "
+        "of your backyard as well — cited by a refused ground"
+    )
+    rect = _draw_label_chip(
+        draw, 50.0, 200.0, long_label, (0, 0, 0), max_x=image.width, box_x1=550.0, box_bottom=220.0
+    )
+    width = rect[2] - rect[0]
+    assert width <= image.width * 0.35 + 1e-6
+
+
+def test_draw_label_chip_anchors_at_the_box_left_end_when_it_fits() -> None:
+    """Founder complaint #3: a wide-thin box's label sits at one *end* of
+    the box, not stretched or centred across it. When the box's left edge
+    has room for the (now width-capped) chip, the chip anchors there."""
+    image = Image.new("RGB", (1000, 800), color="white")
+    draw = ImageDraw.Draw(image)
+    rect = _draw_label_chip(
+        draw,
+        50.0,
+        390.0,
+        "9m height limit datum line — included in your submission",
+        (0, 0, 0),
+        max_x=image.width,
+        box_x1=950.0,
+        box_bottom=410.0,
+    )
+    assert rect[0] == pytest.approx(50.0)
+    assert (rect[2] - rect[0]) <= image.width * 0.35 + 1e-6
+
+
+def test_draw_label_chip_anchors_at_the_box_right_end_when_the_left_end_overflows() -> None:
+    """Founder complaint #3, the other end: if anchoring at the box's left
+    edge would run the (width-capped) chip off the image's right edge, the
+    chip anchors from the box's *right* edge instead -- still a single end,
+    never stretched/centred across the box's own width."""
+    image = Image.new("RGB", (1000, 800), color="white")
+    draw = ImageDraw.Draw(image)
+    rect = _draw_label_chip(
+        draw,
+        700.0,  # box's own left edge -- too close to the image's right edge
+        390.0,
+        "9m height limit datum line — included in your submission",
+        (0, 0, 0),
+        max_x=image.width,
+        box_x1=950.0,
+        box_bottom=410.0,
+    )
+    assert rect[2] == pytest.approx(950.0)
+    assert (rect[2] - rect[0]) <= image.width * 0.35 + 1e-6
+
+
+def test_render_semantic_overlay_wide_thin_box_label_sits_at_an_end_not_the_middle() -> None:
+    """End-to-end synthetic wide-thin box (aspect > 6:1, like the real
+    "9m height limit datum line" anchor): the rendered chip must land at
+    the box's left end, clear of the box itself and capped in width --
+    never spanning across the box's own middle the way the live FILM2
+    report showed."""
+    page = _page((1000, 800))
+    wide_thin_box = OverlayBox(
+        anchor_id="datum-line",
+        bbox=BoundingBox(x0=50, y0=390, x1=900, y1=410),  # ~850x20 px -> aspect 42.5:1
+        role=OverlayRole.SUPPORTS_SHIPPED,
+        color=OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED],
+        label="9m height limit datum line — included in your submission",
+    )
+    png_bytes = render_semantic_overlay(page, [wide_thin_box])
+    image = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    chip_color = OVERLAY_COLOR[OverlayRole.SUPPORTS_SHIPPED]
+
+    # Box top edge in top-down pixels: page height 800pt, box y1=410 -> top
+    # row = 800 - 410 = 390. Scan strictly above it for chip pixels.
+    box_top_px = 390
+    chip_columns = {
+        x
+        for x in range(image.width)
+        if any(image.getpixel((x, y)) == chip_color for y in range(0, box_top_px))
+    }
+    assert chip_columns, "no chip pixels drawn above the box"
+    chip_left, chip_right = min(chip_columns), max(chip_columns)
+    chip_width = chip_right - chip_left
+    assert chip_width <= image.width * 0.35 + 1
+    # Anchored at the box's own left end (x=50), not centred across its
+    # ~850px width.
+    assert chip_left <= 55
+
+
 # --- adjacent chips must not overlap into unreadable run-on text (wave 9, --
 # founder live finding) -------------------------------------------------------
 #
@@ -631,18 +799,25 @@ def test_draw_label_chip_avoiding_a_previous_chip_does_not_overlap_it() -> None:
     assert not _overlaps(first_rect, second_rect)
 
 
-def test_draw_label_chip_shifts_horizontally_once_pinned_to_the_top_edge() -> None:
+def test_draw_label_chip_falls_back_below_the_box_once_pinned_to_the_top_edge() -> None:
     """P0 regression (wave-12 synthesis #1, live FILM2 report): three
     adjacent boxes near a page's *top* edge leave `_draw_label_chip` no
-    vertical headroom to stack into (each chip is already pinned at
-    `chip_top == 0.0`) -- the pre-fix behaviour silently accepted the
-    overlap the moment stacking ran out of room, reproducing the reported
-    "boxes at the top of the page collide" defect. With a horizontal
-    fallback, chips that can't fit in one column must still end up
-    side-by-side rather than painted on top of one another."""
+    vertical headroom to stack into above the box (each chip is already
+    pinned at `chip_top == 0.0`) -- the pre-fix behaviour silently accepted
+    the overlap the moment stacking ran out of room, reproducing the
+    reported "boxes at the top of the page collide" defect.
+
+    Superseded from a horizontal-shift fallback (wave 12) to a below-the-
+    box fallback (this fix's founder requirement #2: a chip must always sit
+    *outside* its own box, preferentially above -- but a horizontal
+    neighbour is still squarely *beside* the drawing above it, not clear of
+    it; dropping straight below the box, where each box already has clear
+    space by construction, is what actually stays clear of nearby drawing
+    content). `box_bottom` gives each chip a real box to fall below."""
     image = Image.new("RGB", (900, 200), color=(255, 255, 255))
     draw = ImageDraw.Draw(image)
     placed: list[tuple[float, float, float, float]] = []
+    box_bottom = 30.0  # each synthetic box spans pixel y in [4.0, 30.0]
     for i, x in enumerate((10.0, 40.0, 70.0), start=1):
         rect = _draw_label_chip(
             draw,
@@ -652,6 +827,7 @@ def test_draw_label_chip_shifts_horizontally_once_pinned_to_the_top_edge() -> No
             (0, 0, 0),
             avoid=placed,
             max_x=image.width,
+            box_bottom=box_bottom,
         )
         placed.append(rect)
 
@@ -665,6 +841,11 @@ def test_draw_label_chip_shifts_horizontally_once_pinned_to_the_top_edge() -> No
     for i in range(len(placed)):
         for j in range(i + 1, len(placed)):
             assert not _overlaps(placed[i], placed[j]), (i, j, placed)
+
+    # At least the chips that could not fit above (all three, here -- none
+    # has 0..4px of headroom) must have fallen below the box rather than
+    # being silently squashed against the top edge overlapping each other.
+    assert all(rect[1] >= box_bottom for rect in placed)
 
 
 def test_render_semantic_overlay_staggers_overlapping_chips_instead_of_merging_them() -> None:
