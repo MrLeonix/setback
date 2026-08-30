@@ -84,10 +84,23 @@ run = one graph execution.
 |---|---|---|---|---|
 | `IngestNode` | no | — | OnlineDA, ePlanning, eTrack, resident photo uploads | — |
 | `ClauseReviewerNode` | yes | `gemini-3.5-flash-lite` MINIMAL → escalates to `gemini-3.7-flash` LOW on breaker | LEP/DCP clause text, zoning controls (height/FSR), the s4.15(1) heads-of-consideration list | photos, plans, bounding boxes |
-| `EvidenceReviewerNode` | yes | same tiers as above | resident photos, architectural plans/elevations, bbox-anchored image crops | legislation text, clause numbers, DCP text |
+| `EvidenceReviewerNode` | yes | same tiers as above | photo/plan **captions**, source references, and provenance grades from the evidence dossier — text only (see docs-truth correction below) | legislation text, clause numbers, DCP text |
 | `AdjudicatorNode` | yes | `gemini-3.7-flash` LOW only (never degrades further) | the **structured findings** (not raw evidence) from both reviewers, only when triggered | raw photos or raw clause text directly — it adjudicates conclusions, not source material |
 | `S415GateNode` | no | — | every `GroundFinding`, the in-code s4.15 category data (`gate/s415.py`'s `PLANNING_HEADS`/`NON_PLANNING_GROUNDS`), Firestore evidence/clause existence | — |
 | `ComposerNode` | partial | `gemma-4-26b-a4b-it-maas` for resident-facing prose only | gated grounds, evidence anchors | — (legal content is templated, not generated) |
+
+**Docs-truth correction (wave 12):** the "Reads" cell above used to read "resident
+photos, architectural plans/elevations, bbox-anchored image crops," which reads as the
+Evidence Reviewer visually examining image pixels. It never has. `build_evidence_slice`
+constructs an `EvidenceSlice` whose only fields are `ground_text` plus `EvidencePhoto`/
+`EvidencePlan` — each carrying a `caption`, `source_ref`, and (for photos) a provenance
+`grade`, never image bytes — and `evidence_slice_to_content` (`court/roles.py`) serializes
+that into a single `genai.types.Part(text=...)`, never an `inline_data`/`file_data` part
+(`tests/test_slice_disjointness.py` asserts exactly this). The Evidence Reviewer's
+rationale is grounded in whatever a caption says, not in anything it looked at — any
+pitch narration or demo copy claiming otherwise is wrong and should be corrected
+alongside this note. Attaching the actual image (`image_base64` as an inline-data Part)
+is real, scoped follow-up work, not something already shipped.
 
 ### Edges
 
