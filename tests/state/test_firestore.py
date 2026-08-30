@@ -242,6 +242,51 @@ async def test_create_case_records_public_origin_when_requested(store: CaseStore
     assert created_event.payload["public_origin"] is True
 
 
+async def test_create_case_defaults_to_not_judge_origin(store: CaseStore) -> None:
+    """Wave 13 (judge-gated LIVE Veo): a legacy case with no `judge_origin`
+    on its `case_created` payload -- and every case created with the default
+    argument -- must read back `False`, never raise a `KeyError`."""
+    case = await store.create_case(application_number="PAN-661190", resident_session="s1")
+
+    events = await store.list_events(case.case_id)
+    created_event = next(e for e in events if e.event_type == EventType.CASE_CREATED.value)
+    assert created_event.payload["judge_origin"] is False
+
+
+async def test_create_case_records_judge_origin_when_requested(store: CaseStore) -> None:
+    """A `judge_origin=True` case (a privileged/judge session, per
+    `console.guards.is_privileged_request`) records that on its own
+    `case_created` event -- `job.pipeline`'s judge-gated live-Veo post-step
+    reads exactly this event/payload back as one of its gating conditions."""
+    case = await store.create_case(
+        application_number="PAN-661190", resident_session="s1", judge_origin=True
+    )
+
+    events = await store.list_events(case.case_id)
+    created_event = next(e for e in events if e.event_type == EventType.CASE_CREATED.value)
+    assert created_event.payload["judge_origin"] is True
+
+
+async def test_create_case_public_origin_and_judge_origin_are_independent_flags(
+    store: CaseStore,
+) -> None:
+    """The two flags are recorded independently -- a case can be neither
+    (a privileged session hitting the public flow is not itself a thing
+    that happens, but the two booleans are stored as distinct payload keys,
+    never derived from one another)."""
+    case = await store.create_case(
+        application_number="PAN-661190",
+        resident_session="s1",
+        public_origin=False,
+        judge_origin=True,
+    )
+
+    events = await store.list_events(case.case_id)
+    created_event = next(e for e in events if e.event_type == EventType.CASE_CREATED.value)
+    assert created_event.payload["public_origin"] is False
+    assert created_event.payload["judge_origin"] is True
+
+
 # --- list_cases ------------------------------------------------------------
 
 

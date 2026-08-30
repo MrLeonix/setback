@@ -339,7 +339,12 @@ class CaseStore(Protocol):
     """
 
     async def create_case(
-        self, *, application_number: str, resident_session: str, public_origin: bool = False
+        self,
+        *,
+        application_number: str,
+        resident_session: str,
+        public_origin: bool = False,
+        judge_origin: bool = False,
     ) -> CaseRecord:
         """`public_origin=True` marks a case created by an anonymous (not
         `console.guards.is_privileged_request`) caller -- recorded on this
@@ -351,7 +356,20 @@ class CaseStore(Protocol):
         every other field here: a second `create_case` call against an
         existing case id is a no-op regardless of what `public_origin` it
         is called with -- a case's origin, like its `application_number`,
-        is fixed at the moment it is first created."""
+        is fixed at the moment it is first created.
+
+        `judge_origin=True` marks a case created by a PRIVILEGED session
+        (`console.guards.is_privileged_request` -- a verified `sb_priv`
+        cookie, i.e. a judge or the founder), recorded alongside
+        `public_origin` on the same `case_created` event payload (wave 13,
+        founder-authorized judge-gated LIVE Veo generation). The two flags
+        are independent, never derived from one another: `public_origin` is
+        `not is_privileged_request(...)` and `judge_origin` is
+        `is_privileged_request(...)`, both computed once by the caller
+        (`console.app.create_case`) at the same moment. A legacy case
+        created before this flag existed reads back `False` (`Mapping.get`'s
+        default), never a `KeyError` -- see `job.pipeline`'s own
+        `_case_created_judge_origin` reader."""
         ...
 
     async def get_case(self, case_id: str) -> CaseRecord | None: ...
@@ -467,7 +485,12 @@ class InMemoryCaseStore:
         return data
 
     async def create_case(
-        self, *, application_number: str, resident_session: str, public_origin: bool = False
+        self,
+        *,
+        application_number: str,
+        resident_session: str,
+        public_origin: bool = False,
+        judge_origin: bool = False,
     ) -> CaseRecord:
         case_id = case_id_for(application_number, resident_session)
         existing = self._get(case_id)
@@ -484,7 +507,11 @@ class InMemoryCaseStore:
             case_id,
             _case_created_event_id(case_id),
             EventType.CASE_CREATED,
-            payload={"application_number": application_number, "public_origin": public_origin},
+            payload={
+                "application_number": application_number,
+                "public_origin": public_origin,
+                "judge_origin": judge_origin,
+            },
         )
         return record
 
@@ -810,7 +837,12 @@ class FirestoreCaseStore:
             raise CaseNotFoundError(case_id)
 
     async def create_case(
-        self, *, application_number: str, resident_session: str, public_origin: bool = False
+        self,
+        *,
+        application_number: str,
+        resident_session: str,
+        public_origin: bool = False,
+        judge_origin: bool = False,
     ) -> CaseRecord:
         case_id = case_id_for(application_number, resident_session)
         ref = self._case_ref(case_id)
@@ -830,7 +862,11 @@ class FirestoreCaseStore:
             case_id,
             _case_created_event_id(case_id),
             EventType.CASE_CREATED,
-            payload={"application_number": application_number, "public_origin": public_origin},
+            payload={
+                "application_number": application_number,
+                "public_origin": public_origin,
+                "judge_origin": judge_origin,
+            },
         )
         return record
 

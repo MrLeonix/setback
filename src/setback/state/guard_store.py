@@ -263,12 +263,85 @@ class FirestoreGuardTotalsStore:
         return True
 
 
+# --- (c) the global judge-gated live-Veo generation cap ---------------------
+#
+# Wave 13 (founder-authorized, 2026-08-29/31): judge-gated LIVE Veo 3.1
+# generation is real, metered spend on a genuinely shared quota -- unlike
+# `GuardCounterStore` above (per-actor, per-day), this is ONE deployment-wide
+# ceiling on total attempts ever, so it is a single document rather than a
+# keyed collection. `VeoLiveCounterStore.try_increment` mirrors `GuardCounter
+# Store.try_increment_daily`'s exact semantics and atomicity guarantee (a
+# single Firestore `Increment` field-transform, never a read-then-write --
+# see the module docstring's "Concurrency" section, which applies here
+# unchanged): every attempt increments the stored count, including one that
+# ends up refused, and the caller passes `limit` on each call rather than the
+# store owning it, so `job.pipeline.RealPipelineRunner` can size the cap from
+# `VEO_LIVE_MAX_GENERATIONS` without this store needing to know about env
+# vars at all.
+
+
+class VeoLiveCounterStore(Protocol):
+    """One global, atomic attempt counter, hard-capping real Veo 3.1 spend
+    across every judge-gated case in the whole deployment."""
+
+    async def try_increment(self, *, limit: int) -> bool:
+        """Atomically increment the single global counter and return
+        whether this attempt (the Nth) is allowed under `limit` -- i.e.
+        `N <= limit`. Every call increments, whether or not it is allowed,
+        exactly like `GuardCounterStore.try_increment_daily`."""
+        ...
+
+
+_VEO_LIVE_COUNTER_DOC_ID = "veo_live"
+"""Lives under the same `guard_totals` root collection as the public-spend
+aggregate (`guard_totals/public`) -- a sibling ceiling, not a per-case
+document, per the brief's own naming (`guard_totals/veo_live`)."""
+
+
+class InMemoryVeoLiveCounterStore:
+    """A single-int-backed `VeoLiveCounterStore` test double / local-dev
+    fallback. Not distributed or durable across a process restart -- the
+    production default is `FirestoreVeoLiveCounterStore` regardless (see
+    `InMemoryGuardCounterStore`'s own docstring for the identical caveat)."""
+
+    def __init__(self) -> None:
+        self._count = 0
+
+    async def try_increment(self, *, limit: int) -> bool:
+        self._count += 1
+        return self._count <= limit
+
+
+class FirestoreVeoLiveCounterStore:
+    """The production `VeoLiveCounterStore`: `guard_totals/veo_live`,
+    incremented via a single atomic `firestore.Increment` field-transform
+    (never a read-then-write -- see the module docstring's "Concurrency"
+    section)."""
+
+    def __init__(self, client: firestore.AsyncClient | None = None) -> None:
+        self._client = client if client is not None else _get_client()
+
+    def _doc_ref(self) -> firestore.AsyncDocumentReference:
+        return self._client.collection("guard_totals").document(_VEO_LIVE_COUNTER_DOC_ID)
+
+    async def try_increment(self, *, limit: int) -> bool:
+        ref = self._doc_ref()
+        await ref.set({"count": firestore.Increment(1)}, merge=True)
+        snapshot = await ref.get()
+        data = snapshot.to_dict() or {}
+        current = int(data.get("count", 0))
+        return current <= limit
+
+
 __all__ = [
     "FirestoreGuardCounterStore",
     "FirestoreGuardTotalsStore",
+    "FirestoreVeoLiveCounterStore",
     "GuardCounterStore",
     "GuardTotals",
     "GuardTotalsStore",
     "InMemoryGuardCounterStore",
     "InMemoryGuardTotalsStore",
+    "InMemoryVeoLiveCounterStore",
+    "VeoLiveCounterStore",
 ]

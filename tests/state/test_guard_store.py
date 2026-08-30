@@ -20,11 +20,14 @@ from google.cloud import firestore
 from setback.state.guard_store import (
     FirestoreGuardCounterStore,
     FirestoreGuardTotalsStore,
+    FirestoreVeoLiveCounterStore,
     GuardCounterStore,
     GuardTotals,
     GuardTotalsStore,
     InMemoryGuardCounterStore,
     InMemoryGuardTotalsStore,
+    InMemoryVeoLiveCounterStore,
+    VeoLiveCounterStore,
 )
 
 # --- a tiny fake of the AsyncClient surface these stores use ----------------
@@ -357,3 +360,84 @@ async def test_concurrent_anonymous_case_increments_do_not_lose_updates() -> Non
 
     totals = await store.get_totals()
     assert totals.anonymous_cases == 30
+
+
+# --- VeoLiveCounterStore: the global judge-gated-live-Veo generation cap ----
+#
+# The atomic global counter the founder-authorized wave-13 brief names
+# explicitly ("an atomic global counter (Firestore Increment, doc like
+# guard_totals/veo_live) is below env VEO_LIVE_MAX_GENERATIONS"): one
+# document every judge-gated live Veo generation attempt across the whole
+# deployment increments, hard-capping real Veo spend regardless of how many
+# distinct cases ever qualify. Same atomic-field-transform shape as
+# `GuardCounterStore.try_increment_daily` above (no read-then-write window),
+# and the same "every attempt increments, including one that ends up
+# refused" semantics -- a failed/refused generation still permanently
+# consumes one of the finite `VEO_LIVE_MAX_GENERATIONS` slots, which is the
+# conservative (spend-safe) choice for a real-money API.
+
+
+@dataclass
+class _VeoLiveCounterStoreUnderTest:
+    store: VeoLiveCounterStore
+    label: str
+
+
+def _memory_veo_live_counter_store() -> _VeoLiveCounterStoreUnderTest:
+    return _VeoLiveCounterStoreUnderTest(InMemoryVeoLiveCounterStore(), "in-memory")
+
+
+def _firestore_veo_live_counter_store() -> _VeoLiveCounterStoreUnderTest:
+    return _VeoLiveCounterStoreUnderTest(
+        FirestoreVeoLiveCounterStore(_FakeFirestore()),  # type: ignore[arg-type]
+        "firestore-fake",
+    )
+
+
+@pytest.fixture(params=[_memory_veo_live_counter_store, _firestore_veo_live_counter_store])
+def veo_live_counter_store(request: pytest.FixtureRequest) -> VeoLiveCounterStore:
+    return request.param().store
+
+
+async def test_veo_live_try_increment_allows_up_to_the_limit(
+    veo_live_counter_store: VeoLiveCounterStore,
+) -> None:
+    assert await veo_live_counter_store.try_increment(limit=2) is True
+    assert await veo_live_counter_store.try_increment(limit=2) is True
+    assert await veo_live_counter_store.try_increment(limit=2) is False
+
+
+async def test_veo_live_try_increment_is_a_single_global_counter_not_per_caller(
+    veo_live_counter_store: VeoLiveCounterStore,
+) -> None:
+    """Unlike `GuardCounterStore` (keyed per actor/day), this is one
+    deployment-wide document -- every call shares the same underlying
+    counter regardless of any caller-side identity."""
+    assert await veo_live_counter_store.try_increment(limit=1) is True
+    assert await veo_live_counter_store.try_increment(limit=1) is False
+    assert await veo_live_counter_store.try_increment(limit=1) is False
+
+
+async def test_firestore_veo_live_counter_doc_id_is_veo_live_under_guard_totals() -> None:
+    """Pins the exact doc location the brief names: `guard_totals/veo_live`."""
+    fake = _FakeFirestore()
+    store = FirestoreVeoLiveCounterStore(fake)  # type: ignore[arg-type]
+    await store.try_increment(limit=10)
+    doc_ids = [key for key in fake.docs if key[0] == "guard_totals"]
+    assert ("guard_totals", "veo_live") in doc_ids
+
+
+async def test_concurrent_veo_live_increments_do_not_lose_updates() -> None:
+    """20 concurrent judge-gated tribunal runs all reaching the post-step at
+    once must never let more than `limit` through, and must never lose an
+    attempt off the stored count (the same lost-update hazard the public
+    spend aggregate above was fixed for)."""
+    fake = _FakeFirestore(yield_on_io=True)
+    store = FirestoreVeoLiveCounterStore(fake)  # type: ignore[arg-type]
+    limit = 10
+
+    results = await asyncio.gather(*(store.try_increment(limit=limit) for _ in range(20)))
+
+    ((_key, data),) = fake.docs.items()
+    assert data["count"] == 20, "a lost update under-counted concurrent attempts"
+    assert sum(1 for allowed in results if allowed) <= limit, "the cap was exceeded"

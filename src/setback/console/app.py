@@ -85,9 +85,11 @@ from setback.evidence.illustration import (
     ILLUSTRATION_COST_NOTE,
     ILLUSTRATION_EXPLAINER,
     ILLUSTRATION_LABEL,
+    OVERSHADOWING_SIMULATION_CLIPS,
     simulation_clip_for_case,
 )
 from setback.evidence.overlays import ROLE_CSS_CLASS_SUFFIX, ROLE_LEGEND_TEXT, OverlayRole
+from setback.evidence.veo_live import VEO_LIVE_COST_NOTE, VEO_LIVE_GENERATING_MESSAGE
 from setback.ingest.tracker import (
     DocumentNotFoundError,
     DocumentSource,
@@ -753,11 +755,23 @@ def create_app(
         ],
     )
     async def create_case(body: CreateCaseRequest, request: Request) -> dict[str, Any]:
-        is_public = not is_privileged_request(request, docket_key_provider=docket_key_of)
+        is_privileged = is_privileged_request(request, docket_key_provider=docket_key_of)
+        is_public = not is_privileged
         case = await store.create_case(
             application_number=body.application_number,
             resident_session=body.resident_session,
             public_origin=is_public,
+            # Wave 13 (founder-authorized judge-gated LIVE Veo generation):
+            # a privileged (judge/founder) session's case is stamped
+            # `judge_origin=True` alongside the existing `public_origin`
+            # stamp -- `job.pipeline`'s live-Veo post-step reads this back
+            # as one of its gating conditions. The two flags are always
+            # each other's negation for THIS route specifically (a request
+            # is either privileged or it isn't), but are recorded as
+            # independent payload keys, never derived from one another at
+            # read time -- see `state.firestore.CaseStore.create_case`'s
+            # own docstring.
+            judge_origin=is_privileged,
         )
         if is_public:
             await guard_totals.increment_anonymous_cases()
@@ -880,7 +894,11 @@ def create_app(
         `full_res_document_id`, using that event's own `mime_type` --
         without this, the browser would receive `application/octet-stream`
         for a real PNG and download it instead of displaying it inline in
-        the lightbox."""
+        the lightbox. The wave-13 judge-gated LIVE Veo clip
+        (`job.pipeline`'s `illustration_ready` event) is the same shape of
+        gap: never uploaded through this endpoint either, so it is matched
+        the same way, hardcoded to `video/mp4` (the only format Veo 3.1
+        ever outputs -- see `evidence.veo_live`'s module docstring)."""
         await _require_case(case_id)
         content_type = "application/octet-stream"
         for event in await store.list_events(case_id):
@@ -895,6 +913,12 @@ def create_app(
                 and event.payload.get("full_res_document_id") == document_id
             ):
                 content_type = str(event.payload.get("mime_type") or content_type)
+                break
+            if (
+                event.event_type == "illustration_ready"
+                and event.payload.get("document_id") == document_id
+            ):
+                content_type = "video/mp4"
                 break
         try:
             content = await documents.download_document(
@@ -2352,6 +2376,116 @@ def _render_simulation_clip_card(clip: Any) -> str:
     )
 
 
+# --- judge-gated LIVE Veo illustration card (wave 13, founder-authorized) --
+
+
+def _case_created_judge_origin(events: Sequence[CaseEvent]) -> bool:
+    """The render-layer's own reader of the `judge_origin` flag stamped by
+    this module's own `create_case` route. Duplicated (not imported) from
+    `job.pipeline`'s identically-named private helper -- that module's own
+    docstring explains why (avoiding a `job.pipeline` -> `console.app` ->
+    `job.pipeline` import-cycle risk); this module already imports
+    `job.pipeline`/`job.main` elsewhere (`LocalPipelineJobTrigger`), so the
+    same "never reach into another package's private internals" rule
+    applies in the other direction too."""
+    for event in events:
+        if event.event_type == "case_created":
+            return bool(event.payload.get("judge_origin", False))
+    return False
+
+
+_ILLUSTRATION_READY_EVENT: Final[str] = "illustration_ready"
+_ILLUSTRATION_GENERATING_EVENT: Final[str] = "illustration_generating"
+
+
+def _live_illustration_ready_document_id(events: Sequence[CaseEvent]) -> str | None:
+    """This case's own `illustration_ready` event's `document_id`, or
+    `None` if it hasn't (yet, or ever) landed."""
+    for event in events:
+        if event.event_type == _ILLUSTRATION_READY_EVENT:
+            document_id = event.payload.get("document_id")
+            return str(document_id) if document_id else None
+    return None
+
+
+def _live_illustration_is_generating(events: Sequence[CaseEvent]) -> bool:
+    """True if generation has started (`illustration_generating`) and has
+    not (yet) reached `illustration_ready` -- `illustration_failed` is
+    deliberately not distinguished from "never started" here: either way,
+    no card renders (see `_render_veo_live_generating_card`'s call site)."""
+    return any(event.event_type == _ILLUSTRATION_GENERATING_EVENT for event in events)
+
+
+def _render_veo_live_generating_card() -> str:
+    """The generating-placeholder card (design point 3): shown on a
+    judge_origin case whose live illustration has started but has no
+    `illustration_ready` event yet -- deliberately plain (no `<video>`, no
+    mandatory-label styling) since there is nothing to disclaim yet."""
+    return (
+        '<section class="card simulation-card simulation-card--generating">'
+        '<span class="tag tag--simulation">Simulation</span>'
+        f'<p class="simulation-card__generating">{_esc(VEO_LIVE_GENERATING_MESSAGE)}</p>'
+        "</section>"
+    )
+
+
+def _render_veo_live_ready_card(case_id: str, document_id: str) -> str:
+    """The full LIVE illustration card -- visually the same shape as
+    `_render_simulation_clip_card`'s pre-generated one (same mandatory
+    label/explainer styling), but sourced from this specific case's own
+    generated document and carrying `VEO_LIVE_COST_NOTE`'s distinct
+    "Generated live" cost line rather than `ILLUSTRATION_COST_NOTE`'s
+    "Pre-generated" one -- these are honestly different claims about the
+    clip and must never be interchanged."""
+    video_url = f"/api/cases/{_esc(case_id)}/documents/{_esc(document_id)}"
+    return (
+        '<section class="card simulation-card">'
+        '<span class="tag tag--simulation">Simulation</span>'
+        f'<video controls preload="none" src="{video_url}" '
+        f'aria-label="{_esc(ILLUSTRATION_EXPLAINER)}">'
+        "Your browser does not support embedded video."
+        "</video>"
+        f'<p class="simulation-card__label">{_esc(ILLUSTRATION_LABEL)}</p>'
+        f'<p class="simulation-card__explainer">{_esc(ILLUSTRATION_EXPLAINER)}</p>'
+        f'<p class="simulation-card__cost">{_esc(VEO_LIVE_COST_NOTE)}</p>'
+        "</section>"
+    )
+
+
+def _render_live_illustration_card(case_id: str, events: Sequence[CaseEvent]) -> str:
+    """The judge-gated LIVE illustration card for `case_id`, or `""`.
+
+    Three independent gates, all required, mirroring `job.pipeline`'s own
+    generation-time gating so the console never renders something the
+    pipeline itself would refuse to have produced:
+
+    1. `case_id` is not one of the three canonical, pre-generated-clip demo
+       cases (`OVERSHADOWING_SIMULATION_CLIPS`) -- those render their own
+       static card (`_render_simulation_clip_card`) exclusively; see
+       `job.pipeline._is_veo_live_excluded`'s identical exclusion and
+       docstring.
+    2. This case is `judge_origin` -- an anonymous visitor's case must
+       never render this card even if (through some future bug) an
+       illustration event existed on it; defense in depth alongside the
+       job-side gate that should have prevented one from ever being
+       written.
+    3. An `illustration_ready` or `illustration_generating` event exists;
+       `illustration_failed` alone (or nothing at all) renders no card,
+       matching the pipeline's own silent-degrade-on-failure behaviour --
+       a judge sees nothing rather than an error state.
+    """
+    if case_id in OVERSHADOWING_SIMULATION_CLIPS:
+        return ""
+    if not _case_created_judge_origin(events):
+        return ""
+    document_id = _live_illustration_ready_document_id(events)
+    if document_id is not None:
+        return _render_veo_live_ready_card(case_id, document_id)
+    if _live_illustration_is_generating(events):
+        return _render_veo_live_generating_card()
+    return ""
+
+
 def render_case_page(
     case: CaseRecord,
     grounds: Sequence[GroundRecord],
@@ -2418,6 +2552,8 @@ def render_case_page(
     )
     if simulation_clip is not None:
         evidence_section += _render_simulation_clip_card(simulation_clip)
+    else:
+        evidence_section += _render_live_illustration_card(case.case_id, events)
     overlay_section = _render_events_section(
         case.case_id,
         "annotated_overlay",

@@ -133,7 +133,9 @@ detail.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import io
 import os
 import sys
@@ -174,12 +176,21 @@ from setback.evidence.dossier import (
     EvidenceAnchor as DossierEvidenceAnchor,
 )
 from setback.evidence.grounding import GroundedBox, describe_then_ground
+from setback.evidence.illustration import OVERSHADOWING_SIMULATION_CLIPS
 from setback.evidence.imagery import (
     SecretAccessor,
     StreetViewUnavailableError,
     fetch_street_view_fallback,
 )
 from setback.evidence.overlays import AnchoredElement, build_overlay_boxes, render_semantic_overlay
+from setback.evidence.veo_live import (
+    VEO_LIVE_DOCUMENT_ID,
+    VEO_LIVE_TIMEOUT_SECONDS,
+    VeoLiveClient,
+    build_conditioning_image,
+    veo_live_enabled,
+    veo_live_max_generations,
+)
 from setback.gate.relevance import classify_relevance
 from setback.gate.validator import BoundingBox as GateBoundingBox
 from setback.gate.validator import (
@@ -212,7 +223,7 @@ from setback.state.firestore import (
     GroundStatus,
     ResumeState,
 )
-from setback.state.guard_store import GuardTotalsStore
+from setback.state.guard_store import GuardTotalsStore, VeoLiveCounterStore
 from setback.state.ledger import BudgetExceededError, Ledger
 
 _FIXTURES_DIR: Final[Path] = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "nsw"
@@ -301,6 +312,22 @@ def _case_created_public_origin(events: Sequence[CaseEvent]) -> bool:
     for event in events:
         if event.event_type == "case_created":
             return bool(event.payload.get("public_origin", False))
+    return False
+
+
+def _case_created_judge_origin(events: Sequence[CaseEvent]) -> bool:
+    """The `judge_origin` sibling of `_case_created_public_origin` above
+    (wave 13, founder-authorized judge-gated LIVE Veo generation) -- `False`
+    for a legacy case created before this flag existed, exactly like that
+    function's own default. Deliberately its own small reader rather than a
+    shared one imported from `console.app`: this module's own docstring's
+    "never reaching into another package's private internals" rule, and
+    `console.app` already imports from `job.pipeline`, so the reverse import
+    would risk a cycle -- see `_STREET_VIEW_FETCH_COST_USD`'s identical
+    duplicate-rather-than-cross-import rationale just above."""
+    for event in events:
+        if event.event_type == "case_created":
+            return bool(event.payload.get("judge_origin", False))
     return False
 
 
@@ -938,6 +965,69 @@ def _propagate_page_level_anchor_status(
     return result
 
 
+# --- judge-gated LIVE Veo illustration post-step (wave 13) ------------------
+
+_ILLUSTRATION_EVENT_TYPES: Final[frozenset[str]] = frozenset(
+    {"illustration_generating", "illustration_ready", "illustration_failed"}
+)
+"""Every event type `RealPipelineRunner._attempt_veo_live_illustration`
+can emit -- `_has_illustration_event` checks for ANY of these (the brief's
+own "no illustration event exists for the case" gating condition), not just
+a successful one, so a case that already tried (and failed) is never
+silently retried on a later run either."""
+
+
+def _has_illustration_event(events: Sequence[CaseEvent]) -> bool:
+    """True if `events` already contains a prior illustration attempt of
+    any outcome -- the idempotency half of the judge-gated live-Veo gate
+    (see `_ILLUSTRATION_EVENT_TYPES`)."""
+    return any(event.event_type in _ILLUSTRATION_EVENT_TYPES for event in events)
+
+
+def _is_veo_live_excluded(case_id: str) -> bool:
+    """`True` for the three canonical, pre-generated-clip demo cases
+    (`evidence.illustration.OVERSHADOWING_SIMULATION_CLIPS`) -- excluded
+    from live generation entirely, deliberately, regardless of whether they
+    would otherwise qualify (judge_origin + a shipped overshadowing
+    ground). This is a decision made in THIS wave to protect the
+    founder-authorized "film case 1f4b7367... must render UNCHANGED"
+    constraint robustly at the pipeline layer, not left as an assumption
+    the console-rendering layer alone would need to get right: without it,
+    a judge session visiting one of the three static-clip demo cases could
+    trigger a real, redundant, billable generation for a case that already
+    has its own honest, pre-vetted clip attached, and the case page would
+    then need to arbitrate between two different illustration cards for the
+    same case. See `console.app`'s render-layer mirror of this same
+    exclusion."""
+    return case_id in OVERSHADOWING_SIMULATION_CLIPS
+
+
+def _shipped_overshadowing_ground_ids(
+    events: Sequence[CaseEvent], decisions: Sequence[GateDecision]
+) -> frozenset[str]:
+    """The set of `ground_id`s that are BOTH tagged `concern_type ==
+    "overshadowing"` (from this case's own `ground_category_assigned`
+    events, recorded at interview time -- see `console.app._propose_ground_
+    for_confirmed_concern`) AND ended this run with `GateStatus.SHIPPED`
+    (from `decisions`, this exact run's in-memory gate outcomes -- `events`
+    alone cannot answer this, since `gate_decision` events are appended
+    during this very `run()` call, not present in `resume.events`).
+
+    Two independent conditions, matching the wave-13 brief precisely: an
+    overshadowing ground the court REJECTED, or a SHIPPED ground that isn't
+    overshadowing (e.g. height/bulk), is excluded either way -- the live
+    illustration must never be generated for a ground the tribunal itself
+    did not ship, and never generated to illustrate an unrelated ground."""
+    overshadowing_ground_ids = {
+        str(event.payload.get("ground_id", ""))
+        for event in events
+        if event.event_type == "ground_category_assigned"
+        and event.payload.get("concern_type") == "overshadowing"
+    }
+    shipped_ground_ids = {d.ground_id for d in decisions if d.status is GateStatus.SHIPPED}
+    return frozenset(overshadowing_ground_ids & shipped_ground_ids)
+
+
 class RealPipelineRunner:
     """The production `job.main.PipelineRunner`: ingest -> evidence dossier
     -> court -> gate -> dispatch, for the one demo case this build supports.
@@ -955,6 +1045,11 @@ class RealPipelineRunner:
         document_classifier: DocumentClassifier | None = None,
         street_view_secret_accessor: SecretAccessor | None = None,
         guard_totals_store: GuardTotalsStore | None = None,
+        veo_client: VeoLiveClient | None = None,
+        veo_live_counter_store: VeoLiveCounterStore | None = None,
+        veo_live_enabled: bool | None = None,
+        veo_live_max_generations: int | None = None,
+        veo_live_timeout_seconds: float | None = None,
     ) -> None:
         """Args mirror the pipeline's real dependencies; `clause_model`/
         `evidence_model`/`ingest_client`/`grounding_client`/
@@ -972,7 +1067,23 @@ class RealPipelineRunner:
         factory) passes a `state.guard_store.FirestoreGuardTotalsStore`
         instead, the same aggregate `console.guards` reads to decide
         whether the public demo is paused (see the "spend-accuracy gap"
-        section above `_book_public_guard_cost`)."""
+        section above `_book_public_guard_cost`).
+
+        `veo_client`/`veo_live_counter_store` (wave 13, founder-authorized
+        judge-gated LIVE Veo generation): both default to `None` (every
+        offline test in this module, and every deployment stage before this
+        wave) -- with either unset, `_run_veo_live_illustration_step` is a
+        guaranteed no-op, exactly like `guard_totals_store`'s own "not
+        wired" degrade above. Production wiring (`job.main`'s default
+        pipeline factory) passes a real `evidence.veo_live.
+        VertexVeoLiveClient` and `state.guard_store.
+        FirestoreVeoLiveCounterStore`. `veo_live_enabled`/`veo_live_max_
+        generations`/`veo_live_timeout_seconds` default to `None`, which
+        resolves (at call time, not construction time, for the first two)
+        to `evidence.veo_live.veo_live_enabled()`/`veo_live_max_
+        generations()`/`VEO_LIVE_TIMEOUT_SECONDS` -- explicit overrides
+        exist purely so tests can exercise the cap/kill-switch/timeout
+        without touching process environment variables."""
         self._document_source = document_source
         self._polisher = polisher
         self._grounding_client = grounding_client
@@ -982,6 +1093,15 @@ class RealPipelineRunner:
         self._document_classifier = document_classifier or _default_document_classifier
         self._street_view_secret_accessor = street_view_secret_accessor
         self._guard_totals_store = guard_totals_store
+        self._veo_client = veo_client
+        self._veo_live_counter_store = veo_live_counter_store
+        self._veo_live_enabled_override = veo_live_enabled
+        self._veo_live_max_generations_override = veo_live_max_generations
+        self._veo_live_timeout_seconds = (
+            veo_live_timeout_seconds
+            if veo_live_timeout_seconds is not None
+            else VEO_LIVE_TIMEOUT_SECONDS
+        )
 
     async def _book_public_guard_cost(
         self,
@@ -1777,6 +1897,127 @@ class RealPipelineRunner:
                 "refusals_markdown": package.refusals_explainer.markdown,
                 "refusals_html": package.refusals_explainer.html,
             },
+        )
+
+        # Judge-gated LIVE Veo illustration (wave 13, founder-authorized):
+        # a fully-isolated post-step, strictly AFTER `submission_composed`
+        # has already landed above -- see `_run_veo_live_illustration_step`'s
+        # own docstring for the isolation guarantee. `resume.events` is this
+        # case's state as of the START of this job execution (every
+        # `ground_category_assigned`/`case_created` event this step needs
+        # already existed before the tribunal was even started); `decisions`
+        # is this exact run's own in-memory gate outcomes, computed above.
+        await self._run_veo_live_illustration_step(
+            case_id, store, resume.events, decisions, dossier
+        )
+
+    async def _run_veo_live_illustration_step(
+        self,
+        case_id: str,
+        store: CaseStore,
+        events: Sequence[CaseEvent],
+        decisions: Sequence[GateDecision],
+        dossier: CaseDossier,
+    ) -> None:
+        """The wave-13 post-step, wrapped so it is structurally unable to
+        fail the tribunal run or block submission -- `run` has already
+        appended `submission_composed` by the time this is ever called.
+
+        Two layers of protection, both required by the brief: (1) a hard
+        wall-clock timeout (`self._veo_live_timeout_seconds`, ~6 minutes
+        default) via `asyncio.wait_for`, so a stuck Vertex long-running
+        operation can never hang this job process indefinitely; (2) a
+        blanket `except Exception` around the whole attempt, so ANY failure
+        -- a gating check raising unexpectedly, a Veo API error, a GCS
+        write failure, a timeout -- degrades to an `illustration_failed`
+        event rather than propagating. Even the failure-recording write
+        itself is wrapped: a case whose event store is itself unreachable
+        at that exact moment still leaves `run` to return normally, since
+        `submission_composed` is already durably written above regardless.
+        """
+        if self._veo_client is None or self._veo_live_counter_store is None:
+            return  # not wired -- every offline test, and every deployment before this wave
+        try:
+            await asyncio.wait_for(
+                self._attempt_veo_live_illustration(case_id, store, events, decisions, dossier),
+                timeout=self._veo_live_timeout_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 -- must never fail/block the tribunal run
+            # Even the failure record must never raise -- `contextlib.
+            # suppress` rather than a bare `try`/`except`/`pass` (ruff
+            # SIM105), same effect: any exception recording the failure is
+            # itself silently swallowed rather than propagating.
+            with contextlib.suppress(Exception):
+                await store.append_event(
+                    case_id,
+                    f"illustration-failed:{case_id}",
+                    "illustration_failed",
+                    payload={"reason": str(exc)[:500]},
+                )
+
+    async def _attempt_veo_live_illustration(
+        self,
+        case_id: str,
+        store: CaseStore,
+        events: Sequence[CaseEvent],
+        decisions: Sequence[GateDecision],
+        dossier: CaseDossier,
+    ) -> None:
+        """The actual gating chain + generation, run inside
+        `_run_veo_live_illustration_step`'s timeout/try-except. Every
+        condition below is independently sufficient to make this a
+        no-op -- see the wave-13 design spec point 2 for the exact AND of
+        conditions this implements, in the same order."""
+        assert self._veo_client is not None
+        assert self._veo_live_counter_store is not None
+
+        if not (
+            self._veo_live_enabled_override
+            if self._veo_live_enabled_override is not None
+            else veo_live_enabled()
+        ):
+            return
+        if _is_veo_live_excluded(case_id):
+            return  # the three canonical static-clip demo cases -- see that function's docstring
+        if not _case_created_judge_origin(events):
+            return
+        if not _shipped_overshadowing_ground_ids(events, decisions):
+            return
+        if _has_illustration_event(events):
+            return
+
+        plan_document = _select_plan_document(list(dossier.documents.values()))
+        if plan_document is None or not plan_document.pages:
+            return  # no elevation/site drawing to condition on
+
+        max_generations = (
+            self._veo_live_max_generations_override
+            if self._veo_live_max_generations_override is not None
+            else veo_live_max_generations()
+        )
+        allowed = await self._veo_live_counter_store.try_increment(limit=max_generations)
+        if not allowed:
+            return  # the global cap (VEO_LIVE_MAX_GENERATIONS) has been reached
+
+        await store.append_event(
+            case_id, f"illustration-generating:{case_id}", "illustration_generating", payload={}
+        )
+
+        conditioning_png, mime_type = build_conditioning_image(plan_document.pages[0].png_bytes)
+        clip_bytes = await self._veo_client.generate_overshadowing_clip(
+            conditioning_image=conditioning_png, conditioning_mime_type=mime_type
+        )
+
+        if isinstance(self._document_source, EvidenceUploadStore):
+            await self._document_source.add_evidence_document(
+                case_id, VEO_LIVE_DOCUMENT_ID, clip_bytes, content_type="video/mp4"
+            )
+
+        await store.append_event(
+            case_id,
+            f"illustration-ready:{case_id}",
+            "illustration_ready",
+            payload={"document_id": VEO_LIVE_DOCUMENT_ID},
         )
 
 
