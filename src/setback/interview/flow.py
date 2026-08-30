@@ -177,12 +177,17 @@ class InterviewStage(StrEnum):
 
 @dataclass(frozen=True)
 class InterviewTurn:
-    """One system-composed message shown to the resident, tagged with the
-    stage it was asked in (so a caller can render/log it without having to
-    re-derive the stage from the text)."""
+    """One message in the interview transcript, tagged with the stage it
+    was asked/answered in (so a caller can render/log it without having to
+    re-derive the stage from the text) and with `role` ("system" for
+    Setback's own composed question, "resident" for the resident's typed
+    answer) so a replayed transcript can still tell the two apart -- see
+    `_persist_system_turn`/`_persist_resident_answer` in `console.app`,
+    which persist this same distinction."""
 
     stage: InterviewStage
     prompt: str
+    role: str = "system"
 
 
 @dataclass
@@ -327,7 +332,7 @@ class InterviewFlow:
     async def submit(self, answer: str) -> InterviewTurn:
         """Advance the state machine with the resident's answer to the
         current stage's question, and return the next turn."""
-        self.transcript.append(InterviewTurn(stage=self.stage, prompt=answer))
+        self.transcript.append(InterviewTurn(stage=self.stage, prompt=answer, role="resident"))
         if self.stage is InterviewStage.OPENING:
             return await self._handle_opening(answer)
         if self.stage is InterviewStage.CLARIFYING:

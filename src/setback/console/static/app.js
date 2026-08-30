@@ -529,7 +529,7 @@
     transcriptEl.innerHTML = "";
     lastAiTurnEl = null;
     for (const turn of turns) {
-      appendTurn("ai", turn.prompt);
+      appendTurn(turn.role, turn.prompt);
     }
   }
 

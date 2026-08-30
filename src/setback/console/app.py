@@ -299,7 +299,9 @@ def _turn_to_json(turn: InterviewTurn, transcript: Sequence[InterviewTurn]) -> d
     return {
         "stage": turn.stage.value,
         "prompt": turn.prompt,
-        "turns": [{"stage": t.stage.value, "prompt": t.prompt} for t in transcript],
+        "turns": [
+            {"stage": t.stage.value, "prompt": t.prompt, "role": t.role} for t in transcript
+        ],
         "suggested_replies": _suggested_replies_for(turn.stage),
     }
 
@@ -513,6 +515,7 @@ async def _rehydrate_flow_from_store(
         InterviewTurn(
             stage=InterviewStage(str(e.payload.get("stage", InterviewStage.OPENING.value))),
             prompt=str(e.payload.get("message", "")),
+            role=str(e.payload.get("role", "system")),
         )
         for e in turn_events
     ]

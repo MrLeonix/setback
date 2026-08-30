@@ -187,6 +187,46 @@ def test_get_interview_after_a_fresh_instance_does_not_re_greet(
     assert any("overshadows my garden" in t["prompt"] for t in body["turns"])
 
 
+def test_get_interview_after_a_fresh_instance_preserves_each_turns_role(
+    store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
+) -> None:
+    """P0 regression (wave-12 synthesis #2): a replayed resident turn must
+    still render as the resident's own bubble after a cold start, not get
+    relabelled as Setback's. `_turn_to_json` must carry a `role` per turn
+    reflecting what was actually persisted (`_persist_system_turn`/
+    `_persist_resident_answer`), surviving the same rehydration path as
+    `test_get_interview_after_a_fresh_instance_does_not_re_greet`."""
+    first_app = create_app(
+        store,
+        composer=composer,
+        document_source=UserUploadedDocumentSource(),
+        job_trigger=job_trigger,
+    )
+    first_client = TestClient(first_app)
+    case_id = _create_case(first_client)
+    first_client.get(f"/api/cases/{case_id}/interview")
+    first_client.post(
+        f"/api/cases/{case_id}/interview", json={"answer": "It overshadows my garden."}
+    )
+
+    second_app = create_app(
+        store,
+        composer=composer,
+        document_source=UserUploadedDocumentSource(),
+        job_trigger=job_trigger,
+    )
+    second_client = TestClient(second_app)
+    response = second_client.get(f"/api/cases/{case_id}/interview")
+    body = response.json()
+
+    resident_turns = [t for t in body["turns"] if t["prompt"] == "It overshadows my garden."]
+    assert resident_turns, body["turns"]
+    assert resident_turns[0]["role"] == "resident"
+    # And the greeting that preceded it is still labelled the other way.
+    system_turns = [t for t in body["turns"] if t["role"] == "system"]
+    assert system_turns
+
+
 def test_get_interview_after_a_fresh_instance_can_still_advance(
     store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
 ) -> None:
