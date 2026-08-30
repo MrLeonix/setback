@@ -178,6 +178,41 @@ enablement, IAM bindings, cleanup policy) and
 [docs/ARCHITECTURE.md §5](./docs/ARCHITECTURE.md) for the credential-security
 model behind the two service accounts it deploys as.
 
+## Public demo protection
+
+The live URL above is genuinely public — no signup, no login — because judges need to
+just click it and try a case. That also means it's open to anyone else on the internet,
+so the console carries a layered abuse guard, on top of (not instead of) the existing
+hourly per-IP case-creation limiter.
+
+Every anonymous visitor gets capped per calendar day: 5 new cases, 30 interview turns per
+case, 5 uploads per case, 10 refusal-feedback submissions per case. These caps key off a
+salted SHA-256 hash of the caller's IP, never the raw address itself — no visitor IP is
+ever stored anywhere (see `console.guards.hashed_client_id`).
+
+Underneath that sits one global switch: a running public-spend ceiling
+(`PUBLIC_SPEND_CEILING_USD`, defaulting to $26 USD — about AUD$40, the founder's own
+number) plus two hard count backstops (5,000 anonymous cases, 100,000 anonymous interview
+turns, in case a cheap-request loop somehow outruns the dollar figure first). Cross it and
+new anonymous *mutations* — creating a case, an interview turn, an upload, starting a
+tribunal run — get a plain 429 with an honest message. Every existing case stays fully
+readable, and the read side of the app never blocks: nobody's work disappears because the
+budget ran out.
+
+One session bypasses all of it: opening `/docket` with the correct key (the same key that
+already gates the docket board) sets a signed cookie, and any request carrying it skips
+every limit above. That's the intended judge/founder path once the public ceiling is hit —
+not documented anywhere on the public-facing pages themselves, just here and in
+[docs/DESIGN-DECISIONS.md](./docs/DESIGN-DECISIONS.md).
+
+**One caveat worth knowing before rotating the docket key**: the key doubles as the salt
+for the per-client daily counters, so rotating it (say, after a suspected leak) does two
+things at once — it invalidates every privileged cookie issued under the old key (the
+point of rotating), and it also resets every anonymous visitor's daily case-creation count
+to zero, since their hashed identity changes with the salt. It does not touch the global
+spend ceiling or either count backstop, and it doesn't touch the older hourly per-IP
+limiter either — both keep enforcing exactly as before.
+
 ## Models used
 
 | Model | Role | Thinking level |

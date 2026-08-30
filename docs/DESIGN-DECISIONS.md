@@ -247,3 +247,49 @@ hard to add later — each fits cleanly into an existing seam (`ingest/` adapter
 second council, `ComposerPort` for a PDF adapter, IAM conditions for per-user Firestore
 rules) without a redesign. They're listed as decisions here only to record that the seam
 was considered and left open, not that the capability was overlooked.
+
+---
+
+## D11. Public-abuse guard: "layered + key bypass," not one single limit
+
+**Decision:** going public ahead of judging added a stack of independent limits rather
+than one blunt cap — a per-client daily counter (5 cases/day, 30 turns/case, 5
+uploads/case, 10 feedback submissions/case), sitting underneath the pre-existing hourly
+per-IP limiter, sitting underneath a global public-spend ceiling ($26 USD / ~AUD$40) and
+two hard count backstops. A request carrying a verified session cookie from the existing
+docket-key gate skips every one of them (`console/guards.py`).
+
+**Why layered, not one number:** a single global dollar ceiling alone can be exhausted by
+one aggressive actor before anyone else gets a turn; a single per-IP limit alone says
+nothing about total spend once enough distinct IPs show up. Each layer catches a
+different failure mode: the per-client caps stop one visitor from hogging the whole
+budget, the global ceiling stops the aggregate from ever exceeding what the founder set
+(his own number, chosen deliberately over a stricter one so the demo stays usable through
+judging), and the count backstops catch a cheap-request flood the dollar figure might not
+reach fast enough. **Why the key bypasses everything:** the docket key already exists as
+the founder's own gate — reusing it as the privileged-session grant means no second
+secret to provision under a same-night deploy, and it gives judges an escape hatch if the
+public ceiling trips mid-demo, without ever publishing that mechanism on the public pages
+themselves.
+
+**Never a raw IP anywhere:** the per-client cap keys off `sha256(salt + client_ip)`, where
+the salt is derived in-process from the docket key and never stored — GDPR/PII rule, not
+an afterthought. The tradeoff this creates: rotating the docket key doesn't just
+invalidate privileged cookies (the intended effect), it also resets every anonymous
+visitor's daily counter to zero, since their hashed identity changes with the salt. It
+does not reset the global spend ceiling, either count backstop, or the older per-IP
+hourly limiter — see README.md's "Public demo protection" section and the section
+docstring above `PRIVILEGED_COOKIE_NAME` in `console/guards.py` for the full blast-radius
+writeup, and `tests/console/test_guards.py`'s two rotation tests for what's pinned.
+
+**Alternative considered:** a single global spend ceiling with no per-client layer.
+Rejected for the reason above — it lets one actor in a tight loop burn the whole public
+demo budget by itself, which is exactly the scenario the founder asked to prevent, not
+just aggregate cost.
+
+**What this does not claim:** the per-IP identification this all rests on assumes Cloud
+Run's `X-Forwarded-For` puts the real client address last — true for the common bare
+Cloud Run ingress shape, but not verified against every possible ingress topology in front
+of this specific deployment. See the `SECURITY-REVIEW NOTE` above
+`public_guard_client_ip` in `console/guards.py` for what was actually checked and what
+remains an assumption to verify against the live service post-deploy.

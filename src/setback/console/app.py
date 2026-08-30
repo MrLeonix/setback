@@ -61,10 +61,24 @@ from setback import config
 from setback.clerk import DocumentKind, classify_concern, redact_personal_information
 from setback.clerk import _classify_document_by_keywords as _classify_document_kind_offline
 from setback.console.guards import (
+    PRIVILEGED_COOKIE_MAX_AGE_SECONDS,
+    PRIVILEGED_COOKIE_NAME,
+    PUBLIC_SPEND_CEILING_USD,
+    PUBLIC_TURN_COST_ESTIMATE_USD,
+    CachedGuardTotalsReader,
     enforce_concurrent_tribunal_cap,
     enforce_daily_spend_budget,
+    is_privileged_request,
+    is_public_guard_paused,
+    per_case_feedback_cap_guard,
+    per_case_interview_turn_cap_guard,
     per_case_interview_turn_guard,
+    per_case_upload_cap_guard,
+    per_client_daily_case_cap_guard,
     per_ip_case_creation_guard,
+    privileged_cookie_value,
+    public_guard_dependency,
+    record_threshold_events_if_crossed,
 )
 from setback.evidence.dossier import ProvenanceGrade
 from setback.evidence.illustration import (
@@ -101,6 +115,13 @@ from setback.state.firestore import (
     CaseStore,
     GroundRecord,
     GroundStatus,
+)
+from setback.state.guard_store import (
+    GuardCounterStore,
+    GuardTotals,
+    GuardTotalsStore,
+    InMemoryGuardCounterStore,
+    InMemoryGuardTotalsStore,
 )
 from setback.state.ledger import Ledger
 
@@ -618,6 +639,9 @@ def create_app(
     max_upload_bytes: int = _DEFAULT_MAX_UPLOAD_BYTES,
     sse_poll_interval_seconds: float = 0.5,
     sse_idle_timeout_seconds: float | None = None,
+    guard_counter_store: GuardCounterStore | None = None,
+    guard_totals_store: GuardTotalsStore | None = None,
+    docket_key_provider: Callable[[], str | None] | None = None,
 ) -> FastAPI:
     """Build the console FastAPI app over injected ports.
 
@@ -649,17 +673,69 @@ def create_app(
             after this many quiet seconds with no new events -- used by
             tests so a stream request completes instead of hanging;
             `None` (the default) polls forever, correct for production.
+        guard_counter_store: Durable per-actor daily counters for the
+            public-abuse guard's case-creation cap (see
+            `console.guards.per_client_daily_case_cap_guard`). Defaults to
+            a fresh `InMemoryGuardCounterStore` per app -- production
+            wiring (`_build_production_app`) passes a
+            `FirestoreGuardCounterStore` instead.
+        guard_totals_store: The public-abuse guard's running spend/count
+            aggregate (see `console.guards.CachedGuardTotalsReader`).
+            Defaults to a fresh `InMemoryGuardTotalsStore` per app --
+            production wiring passes a `FirestoreGuardTotalsStore` instead.
+        docket_key_provider: Returns the console's current docket key (or
+            `None`), read fresh on every call so a key rotation takes
+            effect immediately with no restart. Defaults to reading
+            `SETBACK_DOCKET_KEY` from the environment -- the exact source
+            `_docket_key_accepted` already reads for the docket board's own
+            gate, so the privileged-session cookie always agrees with it.
     """
     documents = document_source if document_source is not None else UserUploadedDocumentSource()
     trigger = job_trigger if job_trigger is not None else LoggingJobTrigger()
+    guard_counters = (
+        guard_counter_store if guard_counter_store is not None else InMemoryGuardCounterStore()
+    )
+    guard_totals = (
+        guard_totals_store if guard_totals_store is not None else InMemoryGuardTotalsStore()
+    )
+    docket_key_of = (
+        docket_key_provider
+        if docket_key_provider is not None
+        else (lambda: os.environ.get(_DOCKET_KEY_ENV_VAR))
+    )
 
     app = FastAPI(title="Setback")
     if _STATIC_DIR.is_dir():
         app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
     interview_flows: dict[str, InterviewFlow] = {}
-    _case_creation_guard = per_ip_case_creation_guard()
+    _case_creation_guard = per_ip_case_creation_guard(docket_key_provider=docket_key_of)
     _interview_turn_guard = per_case_interview_turn_guard()
+    _daily_case_cap_guard = per_client_daily_case_cap_guard(
+        guard_counters, docket_key_provider=docket_key_of
+    )
+    _interview_turn_cap_guard = per_case_interview_turn_cap_guard(
+        store, docket_key_provider=docket_key_of
+    )
+    _upload_cap_guard = per_case_upload_cap_guard(store, docket_key_provider=docket_key_of)
+    _feedback_cap_guard = per_case_feedback_cap_guard(store, docket_key_provider=docket_key_of)
+    _totals_reader = CachedGuardTotalsReader(guard_totals)
+    _public_guard = public_guard_dependency(_totals_reader, docket_key_provider=docket_key_of)
+
+    async def _is_paused() -> bool:
+        return is_public_guard_paused(await _totals_reader.get_totals())
+
+    async def _book_anonymous_spend(request: Request, amount_usd: float) -> None:
+        """Add `amount_usd` to the public aggregate, but only for an
+        anonymous request -- a privileged (judge/founder) session's own
+        usage never counts against the public ceiling that pauses everyone
+        else's access."""
+        if is_privileged_request(request, docket_key_provider=docket_key_of):
+            return
+        await guard_totals.add_spend(amount_usd)
+        totals = await guard_totals.get_totals()
+        await record_threshold_events_if_crossed(guard_totals, totals)
+        _totals_reader.invalidate()
 
     async def _require_case(case_id: str) -> CaseRecord:
         case = await store.get_case(case_id)
@@ -667,11 +743,24 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"case {case_id!r} not found")
         return case
 
-    @app.post("/api/cases", status_code=201, dependencies=[Depends(_case_creation_guard)])
-    async def create_case(body: CreateCaseRequest) -> dict[str, Any]:
+    @app.post(
+        "/api/cases",
+        status_code=201,
+        dependencies=[
+            Depends(_case_creation_guard),
+            Depends(_daily_case_cap_guard),
+            Depends(_public_guard),
+        ],
+    )
+    async def create_case(body: CreateCaseRequest, request: Request) -> dict[str, Any]:
         case = await store.create_case(
             application_number=body.application_number, resident_session=body.resident_session
         )
+        if not is_privileged_request(request, docket_key_provider=docket_key_of):
+            await guard_totals.increment_anonymous_cases()
+            totals = await guard_totals.get_totals()
+            await record_threshold_events_if_crossed(guard_totals, totals)
+            _totals_reader.invalidate()
         return {
             "case_id": case.case_id,
             "application_number": case.application_number,
@@ -694,8 +783,17 @@ def create_app(
             interview_flows[case_id] = flow
         return _turn_to_json(flow.transcript[-1], flow.transcript)
 
-    @app.post("/api/cases/{case_id}/interview", dependencies=[Depends(_interview_turn_guard)])
-    async def answer_interview(case_id: str, body: InterviewAnswerRequest) -> dict[str, Any]:
+    @app.post(
+        "/api/cases/{case_id}/interview",
+        dependencies=[
+            Depends(_interview_turn_guard),
+            Depends(_interview_turn_cap_guard),
+            Depends(_public_guard),
+        ],
+    )
+    async def answer_interview(
+        case_id: str, body: InterviewAnswerRequest, request: Request
+    ) -> dict[str, Any]:
         await _require_case(case_id)
         flow = interview_flows.get(case_id)
         if flow is None:
@@ -708,9 +806,15 @@ def create_app(
         await _persist_system_turn(store, case_id, turn)
         if turn.stage is InterviewStage.ASK_MORE and flow.concerns:
             await _propose_ground_for_confirmed_concern(store, case_id, flow.concerns[-1])
+        if not is_privileged_request(request, docket_key_provider=docket_key_of):
+            await guard_totals.increment_anonymous_turns()
+            await _book_anonymous_spend(request, PUBLIC_TURN_COST_ESTIMATE_USD)
         return _turn_to_json(turn, flow.transcript)
 
-    @app.post("/api/cases/{case_id}/documents")
+    @app.post(
+        "/api/cases/{case_id}/documents",
+        dependencies=[Depends(_upload_cap_guard), Depends(_public_guard)],
+    )
     async def upload_document(
         case_id: str,
         file: UploadFile = File(...),  # noqa: B008 -- required FastAPI idiom
@@ -817,7 +921,11 @@ def create_app(
         case_url = str(request.url_for("case_page", case_id=case_id))
         return Response(content=_render_qr_png(case_url), media_type="image/png")
 
-    @app.post("/api/cases/{case_id}/tribunal", status_code=202)
+    @app.post(
+        "/api/cases/{case_id}/tribunal",
+        status_code=202,
+        dependencies=[Depends(_public_guard)],
+    )
     async def start_tribunal(case_id: str) -> dict[str, Any]:
         await _require_case(case_id)
         await enforce_concurrent_tribunal_cap(store)
@@ -914,9 +1022,12 @@ def create_app(
         events = await store.list_events(case_id)
         return _render_transcript_text(events)
 
-    @app.post("/api/cases/{case_id}/grounds/{ground_id}/feedback")
+    @app.post(
+        "/api/cases/{case_id}/grounds/{ground_id}/feedback",
+        dependencies=[Depends(_feedback_cap_guard), Depends(_public_guard)],
+    )
     async def refusal_feedback(
-        case_id: str, ground_id: str, body: RefusalFeedbackRequest
+        case_id: str, ground_id: str, body: RefusalFeedbackRequest, request: Request
     ) -> dict[str, Any]:
         await _require_case(case_id)
         try:
@@ -930,6 +1041,14 @@ def create_app(
             )
         except CaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Security-review finding (2026-08-30): this route makes one real
+        # model call per request (`capture_refusal_feedback` ->
+        # `composer.compose`) but was never booked against the public
+        # aggregate -- see `MAX_REFUSAL_FEEDBACK_PER_CASE`'s docstring.
+        # Booked at the same flat estimate as an interview turn: both are
+        # one INTERVIEW-tier `composer.compose` call.
+        if not is_privileged_request(request, docket_key_provider=docket_key_of):
+            await _book_anonymous_spend(request, PUBLIC_TURN_COST_ESTIMATE_USD)
         return {
             "ground_id": feedback.ground_id,
             "re_rendered_explanation": feedback.re_rendered_explanation,
@@ -940,11 +1059,16 @@ def create_app(
         """The public, unauthenticated home page (LEO-FEEDBACK-UIUX.md §1):
         no key, no docket content -- a resident starts a new objection here
         with one DA-number input. `key`/other stray query params are simply
-        ignored rather than gating anything; this route must never 401."""
-        return render_landing_page(force_theme=theme)
+        ignored rather than gating anything; this route must never 401 and
+        must never be blocked by the public-abuse guard -- it only ever
+        renders the honest paused banner when the guard is paused (see
+        `_is_paused`), it never refuses the read itself."""
+        return render_landing_page(force_theme=theme, paused=await _is_paused())
 
     @app.get("/docket", response_class=HTMLResponse)
-    async def docket_board(theme: str | None = None, key: str | None = None) -> str:
+    async def docket_board(
+        response: Response, theme: str | None = None, key: str | None = None
+    ) -> str:
         if not _docket_key_accepted(key):
             raise HTTPException(
                 status_code=401,
@@ -952,11 +1076,31 @@ def create_app(
                     "This docket board requires a passphrase: GET /docket?key=<SETBACK_DOCKET_KEY>."
                 ),
             )
+        # A VALID key doubles as a privileged-session grant (DESIGN SPEC
+        # point 1, "Layered + key bypass"): `_docket_key_accepted` above
+        # already enforced `key == expected_key` via `secrets.compare_digest`
+        # whenever a real key is configured, so reaching this line with
+        # `expected_key` truthy means `key` is genuine -- safe to mint the
+        # cookie from it. No configured key at all (local dev) means there
+        # is no real secret to grant a privileged session over.
+        expected_key = os.environ.get(_DOCKET_KEY_ENV_VAR)
+        if expected_key:
+            response.set_cookie(
+                key=PRIVILEGED_COOKIE_NAME,
+                value=privileged_cookie_value(expected_key),
+                max_age=PRIVILEGED_COOKIE_MAX_AGE_SECONDS,
+                httponly=True,
+                secure=True,
+                samesite="lax",
+            )
         cases: list[tuple[CaseRecord, tuple[GroundRecord, ...]]] = []
         for case in await store.list_cases():
             if not _is_hygiene_excluded(case):
                 cases.append((case, await store.list_grounds(case.case_id)))
-        return render_docket_board(cases, force_theme=theme)
+        totals = await guard_totals.get_totals()
+        return render_docket_board(
+            cases, force_theme=theme, guard_totals=totals, ceiling_usd=PUBLIC_SPEND_CEILING_USD
+        )
 
     @app.get("/cases/{case_id}", response_class=HTMLResponse)
     async def case_page(case_id: str, theme: str | None = None) -> str:
@@ -964,7 +1108,9 @@ def create_app(
         grounds = await store.list_grounds(case_id)
         events = await store.list_events(case_id)
         ledger = await store.load_ledger(case_id)
-        return render_case_page(case, grounds, events, ledger, force_theme=theme)
+        return render_case_page(
+            case, grounds, events, ledger, force_theme=theme, paused=await _is_paused()
+        )
 
     return app
 
@@ -1238,17 +1384,53 @@ def _collapse_to_latest_per_application_number(
     ]
 
 
+_GUARD_PAUSED_BANNER_COPY: Final[str] = (
+    "We've used up the public demo budget for this hackathon build. "
+    "Every case that's already open stays open to browse. "
+    "Starting anything new is paused for now."
+)
+"""Copy checked against WRITING-STYLE-GUIDE.md (binding for public-facing
+text): plain, honest, contractions kept in, no slop vocabulary, and no
+mention of the key/bypass mechanism (DESIGN SPEC point 4)."""
+
+
+def _guard_paused_banner_html(paused: bool) -> str:
+    if not paused:
+        return ""
+    return f'<div class="guard-paused-banner" role="status">{_esc(_GUARD_PAUSED_BANNER_COPY)}</div>'
+
+
+def _docket_spend_summary_html(totals: GuardTotals | None, ceiling_usd: float) -> str:
+    """Founder/judge-only spend visibility (DESIGN SPEC point 5), rendered
+    only on the key-gated docket board -- never on any public page."""
+    if totals is None:
+        return ""
+    pct = min(100.0, (totals.spend_usd / ceiling_usd) * 100) if ceiling_usd > 0 else 0.0
+    return (
+        '<p class="docket-spend-summary">Public spend: '
+        f"${totals.spend_usd:.2f} / ${ceiling_usd:.2f} ({pct:.0f}%) &middot; "
+        f"{totals.anonymous_cases} anonymous cases &middot; "
+        f"{totals.anonymous_turns} anonymous turns</p>"
+    )
+
+
 def render_docket_board(
     cases: Sequence[tuple[CaseRecord, tuple[GroundRecord, ...]]],
     *,
     force_theme: str | None = None,
+    guard_totals: GuardTotals | None = None,
+    ceiling_usd: float = PUBLIC_SPEND_CEILING_USD,
 ) -> str:
     """Render the docket board: every case this console instance has
     created, each as a `.docket-card` (UI-SPEC.md §3.1) carrying a derived
     overall-status tag rather than a bare grounds count -- collapsed to one
     row per `application_number` (`_collapse_to_latest_per_application_
     number`) so duplicate variants of the same real DA number don't each
-    get their own row."""
+    get their own row.
+
+    `guard_totals`/`ceiling_usd`: the public-abuse guard's current spend %,
+    surfaced here only (founder/judge-visible, key-gated) -- see
+    `_docket_spend_summary_html`."""
     collapsed = _collapse_to_latest_per_application_number(cases)
     rows = "".join(
         _render_docket_card(case, grounds, earlier_count=earlier_count)
@@ -1256,6 +1438,7 @@ def render_docket_board(
     )
     if not rows:
         rows = '<p class="empty">No cases yet -- create one to get started.</p>'
+    spend_summary = _docket_spend_summary_html(guard_totals, ceiling_usd)
     return f"""
 <!doctype html>
 {_html_tag(force_theme)}
@@ -1273,6 +1456,7 @@ def render_docket_board(
   </header>
   <main class="container">
     <h2>Docket board</h2>
+    {spend_summary}
     <div class="docket-list">
       {rows}
     </div>
@@ -1295,14 +1479,20 @@ def _render_qr_png(data: str) -> bytes:
     return buf.getvalue()
 
 
-def render_landing_page(*, force_theme: str | None = None) -> str:
+def render_landing_page(*, force_theme: str | None = None, paused: bool = False) -> str:
     """The public, Google/Claude-style home page (LEO-FEEDBACK-UIUX.md §1):
     product name, caption, ONE highlighted DA-number input that starts a new
     objection, and the persistent disclaimer footer -- no docket content, no
     key gate. `app.js`'s `initLandingPage()` (client-side) submits the form
     via `POST /api/cases`, then redirects to the new case page, and renders
     a "your previous cases" list read from this browser's own localStorage
-    (nothing server-side -- no cases are listed here by the server)."""
+    (nothing server-side -- no cases are listed here by the server).
+
+    `paused`: the public-abuse guard's current state (DESIGN SPEC point 4)
+    -- renders a calm, honest banner when `True`; this route itself never
+    401s or refuses the read either way (see `console/app.py`'s
+    `landing_page`)."""
+    banner = _guard_paused_banner_html(paused)
     return f"""
 <!doctype html>
 {_html_tag(force_theme)}
@@ -1317,6 +1507,7 @@ def render_landing_page(*, force_theme: str | None = None) -> str:
   <main class="landing__main">
     <h1 class="landing__title">Setback</h1>
     <p class="landing__tagline">A Collaborative Partner for planning objections</p>
+    {banner}
     <form id="start-case-form" class="landing__form">
       <input id="application-number-input" name="application_number" type="text"
              placeholder="DA number, e.g. DA2026/0359" autocomplete="off" autofocus
@@ -2165,6 +2356,7 @@ def render_case_page(
     ledger: Ledger | None = None,
     *,
     force_theme: str | None = None,
+    paused: bool = False,
 ) -> str:
     """Render the case page: interview transcript, evidence, reviewer
     opinions, adjudication, gate decisions with refusal explanations, and
@@ -2182,6 +2374,10 @@ def render_case_page(
 
     `force_theme`: see `_html_tag` -- an opt-in `?theme=light`/`dark`
     override for filming consistency, never a default.
+
+    `paused`: the public-abuse guard's current state (DESIGN SPEC point 4)
+    -- this page (and every read) stays fully reachable either way; only
+    the calm banner changes.
     """
     by_type: dict[str, list[CaseEvent]] = {}
     for event in events:
@@ -2277,6 +2473,7 @@ def render_case_page(
       {_THEME_TOGGLE_BUTTON}
     </div>
   </header>
+  {_guard_paused_banner_html(paused)}
   <main class="case-layout">
     <aside class="case-layout__chat">
       <section class="card chat-card">
@@ -2343,6 +2540,7 @@ def _build_production_app() -> FastAPI:
     """
     from setback.evidence.storage import GcsEvidenceStore
     from setback.state.firestore import FirestoreCaseStore
+    from setback.state.guard_store import FirestoreGuardCounterStore, FirestoreGuardTotalsStore
 
     store = FirestoreCaseStore()
     document_source = GcsEvidenceStore()
@@ -2360,6 +2558,19 @@ def _build_production_app() -> FastAPI:
         document_source=document_source,
         job_trigger=job_trigger,
         concern_normaliser=ModelConcernNormaliser(model_client),
+        # Security-review finding (2026-08-30): these two were declared on
+        # `create_app`'s signature (and this very function's docstring
+        # already claimed they were wired here) but never actually passed
+        # -- meaning the deployed console would have silently fallen back
+        # to a fresh in-memory counter/aggregate *per Cloud Run instance*,
+        # each reset to zero on every restart/scale event, for both the
+        # per-client daily cap and (far more seriously) the global public-
+        # spend ceiling the founder is relying on as the one hard blocker
+        # on real spend. Firestore-backed, durable, and shared by every
+        # instance is the entire point of `state.guard_store`'s Firestore
+        # adapters existing at all.
+        guard_counter_store=FirestoreGuardCounterStore(),
+        guard_totals_store=FirestoreGuardTotalsStore(),
     )
 
 
