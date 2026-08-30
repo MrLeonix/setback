@@ -393,6 +393,44 @@ _CHIP_STACK_GAP_PX: Final[int] = 3
 to avoid a collision -- purely cosmetic breathing room so two stacked
 chips read as visibly separate labels rather than merely touching edges."""
 
+def _vertically_overlaps(a: _ChipRect, b: _ChipRect) -> bool:
+    _, a_top, _, a_bottom = a
+    _, b_top, _, b_bottom = b
+    return not (a_bottom <= b_top or b_bottom <= a_top)
+
+
+def _shift_clear_of_avoid(
+    rect: _ChipRect, avoid: Sequence[_ChipRect], max_x: float | None
+) -> _ChipRect:
+    """Place `rect` on a "shelf" immediately beside whichever already-placed
+    rects in `avoid` share its row (vertically overlap it) -- immediately
+    right of the rightmost one, or immediately left of the leftmost, never
+    past the image's left edge (`0.0`) or, when `max_x` is given, its right
+    edge either. This is the two-row fallback `_draw_label_chip` reaches
+    for only once vertical stacking has already run out of headroom at the
+    image's top edge and the chip still collides -- live-reported (wave 12,
+    FILM2): three adjacent boxes near a page's top edge left every one of
+    their chips pinned to `chip_top == 0.0` with nowhere left to stack
+    upward, so they silently overlapped instead. Returns `rect` unchanged
+    if neither side has room, so the caller's "accept the overlap rather
+    than loop forever" behaviour still applies as the final fallback."""
+    left, top, right, bottom = rect
+    width = right - left
+    same_row = [placed for placed in avoid if _vertically_overlaps(rect, placed)]
+    if not same_row:
+        return rect
+    candidates: list[_ChipRect] = []
+    right_edge = max(placed[2] for placed in same_row) + _CHIP_STACK_GAP_PX
+    if max_x is None or right_edge + width <= max_x:
+        candidates.append((right_edge, top, right_edge + width, bottom))
+    left_edge = min(placed[0] for placed in same_row) - _CHIP_STACK_GAP_PX - width
+    if left_edge >= 0.0:
+        candidates.append((left_edge, top, left_edge + width, bottom))
+    for candidate in candidates:
+        if not any(_rects_overlap(candidate, placed) for placed in avoid):
+            return candidate
+    return rect
+
 
 def _draw_label_chip(
     draw: ImageDraw.ImageDraw,
@@ -403,6 +441,7 @@ def _draw_label_chip(
     *,
     font: ImageFont.ImageFont | ImageFont.FreeTypeFont | None = None,
     avoid: Sequence[_ChipRect] | None = None,
+    max_x: float | None = None,
 ) -> _ChipRect:
     """Draw a filled, coloured tag with white text, anchored just above
     `(x, y)` (a box's top-left corner) -- clamped so it never draws above
@@ -427,9 +466,16 @@ def _draw_label_chip(
     pushed straight up (stacked, one chip-height plus `_CHIP_STACK_GAP_PX`
     at a time) until it no longer overlaps anything in `avoid`, or until it
     would be pushed off the top of the image entirely (`chip_top` already
-    at `0.0`), at which point the last, closest-fitting position is
-    accepted rather than looping forever -- a still-cramped chip beats one
-    silently dropped or an infinite loop.
+    at `0.0`). Reaching the top edge still overlapping doesn't give up
+    immediately: `_shift_clear_of_avoid` tries a horizontal offset next
+    (the two-row fallback, wave 12 -- boxes anchored near a page's own top
+    edge have no vertical headroom to stack into at all, live-reported
+    against FILM2 as several adjacent chips overlapping right at the page
+    top). Only if neither direction finds a clear spot is the last,
+    closest-fitting position accepted rather than looping forever -- a
+    still-cramped chip beats one silently dropped or an infinite loop.
+    `max_x`, if given, bounds the horizontal search to the image's own
+    width so a shifted chip is never drawn off the right edge either.
     """
     font = font or _label_font()
     left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
@@ -443,7 +489,11 @@ def _draw_label_chip(
             new_top = rect[1] - height - _CHIP_STACK_GAP_PX
             if new_top < 0.0:
                 if rect[1] <= 0.0:
-                    break  # already pinned to the top edge; accept the overlap
+                    # Already pinned to the top edge with no vertical
+                    # headroom left -- try a horizontal shift before
+                    # accepting the overlap as the final fallback.
+                    rect = _shift_clear_of_avoid(rect, avoid, max_x)
+                    break
                 new_top = 0.0
             rect = (x, new_top, x + width, new_top + height)
 
@@ -522,7 +572,14 @@ def render_semantic_overlay(page: RenderedPage, boxes: Sequence[OverlayBox]) -> 
         x0, y0, x1, y1 = _page_points_to_full_res_pixels(box.bbox, page)
         draw.rectangle((x0, y0, x1, y1), outline=box.color, width=_BOX_WIDTH_PX)
         chip_rect = _draw_label_chip(
-            draw, x0, y0, box.label, box.color, font=font, avoid=placed_chip_rects
+            draw,
+            x0,
+            y0,
+            box.label,
+            box.color,
+            font=font,
+            avoid=placed_chip_rects,
+            max_x=image.width,
         )
         placed_chip_rects.append(chip_rect)
 

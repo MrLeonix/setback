@@ -631,6 +631,42 @@ def test_draw_label_chip_avoiding_a_previous_chip_does_not_overlap_it() -> None:
     assert not _overlaps(first_rect, second_rect)
 
 
+def test_draw_label_chip_shifts_horizontally_once_pinned_to_the_top_edge() -> None:
+    """P0 regression (wave-12 synthesis #1, live FILM2 report): three
+    adjacent boxes near a page's *top* edge leave `_draw_label_chip` no
+    vertical headroom to stack into (each chip is already pinned at
+    `chip_top == 0.0`) -- the pre-fix behaviour silently accepted the
+    overlap the moment stacking ran out of room, reproducing the reported
+    "boxes at the top of the page collide" defect. With a horizontal
+    fallback, chips that can't fit in one column must still end up
+    side-by-side rather than painted on top of one another."""
+    image = Image.new("RGB", (900, 200), color=(255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    placed: list[tuple[float, float, float, float]] = []
+    for i, x in enumerate((10.0, 40.0, 70.0), start=1):
+        rect = _draw_label_chip(
+            draw,
+            x,
+            4.0,  # so little headroom above this that stacking hits the top edge
+            f"window W.{i} -- cited by a refused ground",
+            (0, 0, 0),
+            avoid=placed,
+            max_x=image.width,
+        )
+        placed.append(rect)
+
+    def _overlaps(
+        a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+    ) -> bool:
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        return not (ax1 <= bx0 or bx1 <= ax0 or ay1 <= by0 or by1 <= ay0)
+
+    for i in range(len(placed)):
+        for j in range(i + 1, len(placed)):
+            assert not _overlaps(placed[i], placed[j]), (i, j, placed)
+
+
 def test_render_semantic_overlay_staggers_overlapping_chips_instead_of_merging_them() -> None:
     """End-to-end: three boxes close enough together, with long enough
     captions, that every pair's natural chip width collides -- exactly the
