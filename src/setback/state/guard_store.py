@@ -20,21 +20,30 @@ thin Firestore adapter:
    idempotent-by-natural-key shape `state.firestore.CaseStore.append_event`
    already uses, just at the deployment-wide level instead of per-case).
 
-**Documented approximation**, both stores: every mutation is a plain
-read-then-write against `google.cloud.firestore.AsyncClient`, not a
-transaction -- matching `FirestoreCaseStore.append_event`'s own accepted
-race window ("acceptable here" per that module's docstring) rather than
-adding transaction machinery for an abuse-mitigation counter, not a
-billing-grade ledger. A lost update under real concurrent traffic only ever
-under-counts (biasing toward the demo staying open a little longer than
-exactly $26, never toward closing early) or lets a per-actor cap be
-exceeded by a small margin -- acceptable trade-offs at this hackathon
-build's traffic scale, not a hard security boundary.
+**Concurrency**: every counting mutation below (the daily per-actor counter,
+and every field of the global spend/count aggregate) is a single atomic
+Firestore field-transform (`firestore.Increment`, via `.set(..., merge=True)`),
+never a client-side read-then-write. `FirestoreCaseStore.append_event`'s own
+accepted read-then-write race window ("acceptable here" per that module's
+docstring) is a materially different case -- it assumes one job writes to a
+given case at a time. The aggregate here has the opposite shape: *every*
+anonymous request across the whole public deployment writes to the exact
+same `guard_totals/public` document, the single highest-contention write in
+this system, so a read-then-write race there is not a rare edge case but
+the expected common case under real traffic -- and for a spend *ceiling*,
+a lost update undercounts spend, which lets real spending run past the
+ceiling rather than stopping at it (the wrong direction for a cost cap).
+An earlier revision of this module did read-then-write here; a security
+review (2026-08-30) demonstrated concurrent requests losing updates
+(`tests/state/test_guard_store.py::test_concurrent_*`) and this was fixed
+to the current atomic-increment shape before the guard shipped. Only
+`record_threshold_event`'s existence-check-then-set keeps a (accepted,
+low-stakes) race: at worst a threshold's one-time observability event is
+written twice, never a cap bypass.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol
@@ -111,15 +120,22 @@ class FirestoreGuardCounterStore:
     ) -> bool:
         doc_id = _daily_counter_doc_id(prefix, key_hash, day)
         ref = self._client.collection("guard_counters").document(doc_id)
+        # An atomic field-transform, not a read-then-write: `count` is
+        # incremented server-side with no window for a concurrent caller to
+        # read the same "before" value (see the module docstring's
+        # "Concurrency" section). Every attempt increments -- including one
+        # that ends up refused below -- which is why the comparison is
+        # `<=`: this is the Nth attempt is allowed iff N <= limit, a
+        # definition that (unlike "read current, compare, then write") is
+        # correct under arbitrary concurrency.
+        await ref.set(
+            {"count": firestore.Increment(1), "expireAt": _utcnow() + timedelta(hours=ttl_hours)},
+            merge=True,
+        )
         snapshot = await ref.get()
-        current = 0
-        if snapshot.exists:
-            data = snapshot.to_dict() or {}
-            current = int(data.get("count", 0))
-        if current >= limit:
-            return False
-        await ref.set({"count": current + 1, "expireAt": _utcnow() + timedelta(hours=ttl_hours)})
-        return True
+        data = snapshot.to_dict() or {}
+        current = int(data.get("count", 0))
+        return current <= limit
 
 
 # --- (b) the global public-spend aggregate -----------------------------------
@@ -218,20 +234,25 @@ class FirestoreGuardTotalsStore:
         snapshot = await self._doc_ref().get()
         return _totals_from_dict(snapshot.to_dict() if snapshot.exists else None)
 
-    async def _mutate(self, fn: Callable[[GuardTotals], GuardTotals]) -> GuardTotals:
-        current = await self.get_totals()
-        updated = fn(current)
-        await self._doc_ref().set(_totals_to_dict(updated))
-        return updated
+    async def _increment_field(self, field_name: str, amount: float) -> GuardTotals:
+        """Atomically add `amount` to one field of the single
+        `guard_totals/public` document -- the one doc *every* anonymous
+        request in the whole deployment writes to, so this is the
+        highest-contention write in the guard (see the module docstring's
+        "Concurrency" section). A `firestore.Increment` field-transform,
+        not a read-then-write: correct under any number of simultaneous
+        callers, with no lost-update window at all."""
+        await self._doc_ref().set({field_name: firestore.Increment(amount)}, merge=True)
+        return await self.get_totals()
 
     async def add_spend(self, amount_usd: float) -> GuardTotals:
-        return await self._mutate(lambda t: replace(t, spend_usd=t.spend_usd + amount_usd))
+        return await self._increment_field("spend_usd", amount_usd)
 
     async def increment_anonymous_cases(self) -> GuardTotals:
-        return await self._mutate(lambda t: replace(t, anonymous_cases=t.anonymous_cases + 1))
+        return await self._increment_field("anonymous_cases", 1)
 
     async def increment_anonymous_turns(self) -> GuardTotals:
-        return await self._mutate(lambda t: replace(t, anonymous_turns=t.anonymous_turns + 1))
+        return await self._increment_field("anonymous_turns", 1)
 
     async def record_threshold_event(self, threshold_pct: int) -> bool:
         event_ref = self._doc_ref().collection("events").document(f"threshold-{threshold_pct}")

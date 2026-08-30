@@ -18,8 +18,10 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 
+from setback.console import app as console_app_module
 from setback.console.app import (
     RealJobTrigger,
+    _build_production_app,
     _is_hygiene_excluded,
     create_app,
     render_landing_page,
@@ -3042,3 +3044,210 @@ def test_privileged_session_bypasses_the_spend_ceiling(
             assert response.status_code == 201, response.text
         finally:
             del os.environ["SETBACK_DOCKET_KEY"]
+
+
+# --- security-review finding: refusal feedback was a total ceiling bypass ---
+#
+# `POST /api/cases/{case_id}/grounds/{ground_id}/feedback` (`refusal_feedback`
+# in `console/app.py`) makes one real model call per request
+# (`capture_refusal_feedback` -> `composer.compose`, an INTERVIEW-tier call)
+# but, unlike every other mutating route, shipped with no `_public_guard`
+# dependency at all: an anonymous caller could hit it an unlimited number of
+# times -- distinct `ground_id`/`pushback` pairs are never deduplicated
+# against each other, only an *exact repeat* is a no-op, and even a repeat's
+# model call still runs before the dedup check -- burning real spend that
+# was never booked against the public aggregate either, regardless of
+# whether the guard was paused. A single anonymous actor in a tight loop
+# against this one endpoint could exhaust the entire public demo budget
+# (and everyone else's access) with zero rate limiting.
+
+
+def test_refusal_feedback_is_paused_once_the_ceiling_is_reached(
+    store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
+) -> None:
+    from setback.state.guard_store import InMemoryGuardTotalsStore
+
+    totals_store = InMemoryGuardTotalsStore()
+    app = create_app(
+        store, composer=composer, job_trigger=job_trigger, guard_totals_store=totals_store
+    )
+    paused_client = TestClient(app)
+    case_id = _create_case(paused_client)
+
+    async def _blow_the_ceiling() -> None:
+        await totals_store.add_spend(9999.0)
+
+    asyncio.run(_blow_the_ceiling())
+
+    response = paused_client.post(
+        f"/api/cases/{case_id}/grounds/ground-1/feedback",
+        json={"original_explanation": "x", "pushback": "y"},
+    )
+    assert response.status_code == 429
+    assert "key" not in response.text.lower()
+
+
+def test_refusal_feedback_books_anonymous_spend(
+    store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
+) -> None:
+    """Every anonymous refusal-feedback call makes a real model call and
+    must be booked against the public aggregate exactly like an interview
+    turn -- previously it was not booked at all, silently under-counting
+    real spend against the ceiling that is supposed to track it."""
+    from setback.state.guard_store import InMemoryGuardTotalsStore
+
+    totals_store = InMemoryGuardTotalsStore()
+    app = create_app(
+        store, composer=composer, job_trigger=job_trigger, guard_totals_store=totals_store
+    )
+    client = TestClient(app)
+    case_id = _create_case(client)
+
+    response = client.post(
+        f"/api/cases/{case_id}/grounds/ground-1/feedback",
+        json={"original_explanation": "x", "pushback": "y"},
+    )
+    assert response.status_code == 200, response.text
+
+    async def _read_totals() -> float:
+        return (await totals_store.get_totals()).spend_usd
+
+    assert asyncio.run(_read_totals()) > 0.0
+
+
+def test_refusal_feedback_privileged_session_bypasses_the_ceiling(
+    store: InMemoryCaseStore, composer: _FakeComposer, job_trigger: _RecordingJobTrigger
+) -> None:
+    from setback.state.guard_store import InMemoryGuardTotalsStore
+
+    totals_store = InMemoryGuardTotalsStore()
+    app = create_app(
+        store, composer=composer, job_trigger=job_trigger, guard_totals_store=totals_store
+    )
+    with TestClient(app, base_url="https://testserver") as privileged_client:
+        case_id = _create_case(privileged_client)
+
+        async def _blow_the_ceiling() -> None:
+            await totals_store.add_spend(9999.0)
+
+        asyncio.run(_blow_the_ceiling())
+
+        os.environ["SETBACK_DOCKET_KEY"] = "let-me-in"
+        try:
+            privileged_client.get("/docket?key=let-me-in")
+            response = privileged_client.post(
+                f"/api/cases/{case_id}/grounds/ground-1/feedback",
+                json={"original_explanation": "x", "pushback": "y"},
+            )
+            assert response.status_code == 200, response.text
+        finally:
+            del os.environ["SETBACK_DOCKET_KEY"]
+
+
+def test_refusal_feedback_cap_blocks_after_the_per_case_limit(client: TestClient) -> None:
+    """Distinct `ground_id`/`pushback` pairs are never deduplicated against
+    each other, so without a cap of its own an anonymous actor could spam
+    an unbounded number of real model calls against a single case -- a
+    per-case backstop layered underneath the global ceiling, the same way
+    uploads and interview turns each have one."""
+    from setback.console.guards import MAX_REFUSAL_FEEDBACK_PER_CASE
+
+    case_id = _create_case(client)
+    last_status = 200
+    for i in range(MAX_REFUSAL_FEEDBACK_PER_CASE + 1):
+        response = client.post(
+            f"/api/cases/{case_id}/grounds/ground-{i}/feedback",
+            json={"original_explanation": "x", "pushback": f"distinct pushback {i}"},
+        )
+        last_status = response.status_code
+    assert last_status == 429
+
+
+# --- security-review finding: the production guard stores were never wired -
+#
+# `create_app`'s own docstring, for both `guard_counter_store` and
+# `guard_totals_store`, explicitly claims "production wiring
+# (`_build_production_app`) passes a `FirestoreGuardCounterStore`/
+# `FirestoreGuardTotalsStore` instead" of the in-memory default. That
+# claim was false: `_build_production_app` was never updated to pass
+# either kwarg, so the ONE deployed console (`setback-console`) would have
+# run with process-local, in-memory counters and aggregate -- silently
+# undermining every layer this whole guard exists for. Concretely, on
+# Cloud Run:
+#
+# - The global public-spend ceiling (`guard_totals/public` in the design)
+#   would instead be a separate, independent counter *per Cloud Run
+#   instance*, reset to zero on every instance restart/scale event. Under
+#   any real concurrent traffic (Cloud Run scales out under load) there is
+#   no single "$26 spent so far" -- there are as many independent partial
+#   totals as there are live instances, each individually capped at $26,
+#   so the actual aggregate spend before every instance is paused could be
+#   a multiple of the intended ceiling. This is precisely the "important
+#   blocker" the founder asked for, so this is the most severe finding in
+#   this review despite touching no attacker-facing code at all.
+# - The per-client daily case-creation cap has the same per-instance,
+#   restart-resets-to-zero problem; session affinity (routing a client
+#   with an existing cookie back to the same instance) does not fix this
+#   for a client's *first* request, before any affinity cookie exists, nor
+#   for the ceiling above, which by definition must be shared across every
+#   instance regardless of any one client's affinity.
+#
+# Fully offline: every real client class instantiated inside
+# `_build_production_app` is replaced with a lightweight stand-in before
+# calling it, so this never touches real GCP credentials or the network.
+
+
+class _StubModelClient:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        pass
+
+
+class _RecordingFakeFirestoreGuardCounterStore:
+    """A distinguishable stand-in for `FirestoreGuardCounterStore` --
+    tests assert on its *type*, not its behaviour, so this never touches
+    Firestore."""
+
+
+class _RecordingFakeFirestoreGuardTotalsStore:
+    """A distinguishable stand-in for `FirestoreGuardTotalsStore`, see
+    `_RecordingFakeFirestoreGuardCounterStore` above."""
+
+
+def test_production_app_wires_firestore_backed_guard_stores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the fix: `_build_production_app` must call `create_app` with
+    real (Firestore-backed, not in-memory-default) guard stores -- this
+    test fails against the code as originally shipped, where neither
+    kwarg was passed at all."""
+    from setback.evidence import storage as storage_module
+    from setback.state import firestore as firestore_module
+    from setback.state import guard_store as guard_store_module
+
+    monkeypatch.setattr(firestore_module, "FirestoreCaseStore", InMemoryCaseStore)
+    monkeypatch.setattr(storage_module, "GcsEvidenceStore", UserUploadedDocumentSource)
+    monkeypatch.setattr(console_app_module, "ModelClient", _StubModelClient)
+    monkeypatch.setattr(
+        guard_store_module, "FirestoreGuardCounterStore", _RecordingFakeFirestoreGuardCounterStore
+    )
+    monkeypatch.setattr(
+        guard_store_module, "FirestoreGuardTotalsStore", _RecordingFakeFirestoreGuardTotalsStore
+    )
+
+    captured: dict[str, object] = {}
+    real_create_app = console_app_module.create_app
+
+    def _spy_create_app(*args: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return real_create_app(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(console_app_module, "create_app", _spy_create_app)
+
+    _build_production_app()
+
+    assert isinstance(
+        captured.get("guard_counter_store"), _RecordingFakeFirestoreGuardCounterStore
+    ), "the production app is not durably tracking the per-client daily cap"
+    assert isinstance(
+        captured.get("guard_totals_store"), _RecordingFakeFirestoreGuardTotalsStore
+    ), "the production app is not durably tracking the global public-spend ceiling"

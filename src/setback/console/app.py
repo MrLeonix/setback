@@ -70,6 +70,7 @@ from setback.console.guards import (
     enforce_daily_spend_budget,
     is_privileged_request,
     is_public_guard_paused,
+    per_case_feedback_cap_guard,
     per_case_interview_turn_cap_guard,
     per_case_interview_turn_guard,
     per_case_upload_cap_guard,
@@ -717,6 +718,7 @@ def create_app(
         store, docket_key_provider=docket_key_of
     )
     _upload_cap_guard = per_case_upload_cap_guard(store, docket_key_provider=docket_key_of)
+    _feedback_cap_guard = per_case_feedback_cap_guard(store, docket_key_provider=docket_key_of)
     _totals_reader = CachedGuardTotalsReader(guard_totals)
     _public_guard = public_guard_dependency(_totals_reader, docket_key_provider=docket_key_of)
 
@@ -1020,9 +1022,12 @@ def create_app(
         events = await store.list_events(case_id)
         return _render_transcript_text(events)
 
-    @app.post("/api/cases/{case_id}/grounds/{ground_id}/feedback")
+    @app.post(
+        "/api/cases/{case_id}/grounds/{ground_id}/feedback",
+        dependencies=[Depends(_feedback_cap_guard), Depends(_public_guard)],
+    )
     async def refusal_feedback(
-        case_id: str, ground_id: str, body: RefusalFeedbackRequest
+        case_id: str, ground_id: str, body: RefusalFeedbackRequest, request: Request
     ) -> dict[str, Any]:
         await _require_case(case_id)
         try:
@@ -1036,6 +1041,14 @@ def create_app(
             )
         except CaseNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Security-review finding (2026-08-30): this route makes one real
+        # model call per request (`capture_refusal_feedback` ->
+        # `composer.compose`) but was never booked against the public
+        # aggregate -- see `MAX_REFUSAL_FEEDBACK_PER_CASE`'s docstring.
+        # Booked at the same flat estimate as an interview turn: both are
+        # one INTERVIEW-tier `composer.compose` call.
+        if not is_privileged_request(request, docket_key_provider=docket_key_of):
+            await _book_anonymous_spend(request, PUBLIC_TURN_COST_ESTIMATE_USD)
         return {
             "ground_id": feedback.ground_id,
             "re_rendered_explanation": feedback.re_rendered_explanation,
@@ -2527,6 +2540,7 @@ def _build_production_app() -> FastAPI:
     """
     from setback.evidence.storage import GcsEvidenceStore
     from setback.state.firestore import FirestoreCaseStore
+    from setback.state.guard_store import FirestoreGuardCounterStore, FirestoreGuardTotalsStore
 
     store = FirestoreCaseStore()
     document_source = GcsEvidenceStore()
@@ -2544,6 +2558,19 @@ def _build_production_app() -> FastAPI:
         document_source=document_source,
         job_trigger=job_trigger,
         concern_normaliser=ModelConcernNormaliser(model_client),
+        # Security-review finding (2026-08-30): these two were declared on
+        # `create_app`'s signature (and this very function's docstring
+        # already claimed they were wired here) but never actually passed
+        # -- meaning the deployed console would have silently fallen back
+        # to a fresh in-memory counter/aggregate *per Cloud Run instance*,
+        # each reset to zero on every restart/scale event, for both the
+        # per-client daily cap and (far more seriously) the global public-
+        # spend ceiling the founder is relying on as the one hard blocker
+        # on real spend. Firestore-backed, durable, and shared by every
+        # instance is the entire point of `state.guard_store`'s Firestore
+        # adapters existing at all.
+        guard_counter_store=FirestoreGuardCounterStore(),
+        guard_totals_store=FirestoreGuardTotalsStore(),
     )
 
 

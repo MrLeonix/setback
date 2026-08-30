@@ -557,6 +557,43 @@ def test_public_guard_client_ip_falls_back_to_unknown_with_nothing_available() -
     assert public_guard_client_ip(request) == "unknown"
 
 
+def test_public_guard_client_ip_handles_an_ipv6_last_entry() -> None:
+    """IPv6 literals use colons, not commas, so comma-splitting the header
+    is safe -- but this pins that an IPv6 address in the trusted (last)
+    position round-trips untouched rather than being mangled by any
+    over-eager parsing."""
+    request = _fake_public_request(
+        host="10.0.0.1",
+        headers={"X-Forwarded-For": "1.2.3.4, 2001:db8::1"},
+    )
+    assert public_guard_client_ip(request) == "2001:db8::1"
+
+
+def test_public_guard_client_ip_forged_ipv6_first_entry_is_still_ignored() -> None:
+    request = _fake_public_request(
+        host="10.0.0.1",
+        headers={"X-Forwarded-For": "2001:db8::dead:beef, 5.6.7.8"},
+    )
+    assert public_guard_client_ip(request) == "5.6.7.8"
+
+
+def test_public_guard_client_ip_tolerates_a_single_entry_with_no_forged_prefix() -> None:
+    """No intermediate proxy at all -- just Google Front End's own append,
+    with nothing client-supplied in front of it."""
+    request = _fake_public_request(host="10.0.0.1", headers={"X-Forwarded-For": "5.6.7.8"})
+    assert public_guard_client_ip(request) == "5.6.7.8"
+
+
+def test_public_guard_client_ip_tolerates_trailing_whitespace_and_empty_segments() -> None:
+    """A malformed/adversarial header (stray commas, trailing whitespace)
+    must not crash the guard or resolve to an empty string -- it should
+    still land on the last non-empty entry."""
+    request = _fake_public_request(
+        host="10.0.0.1", headers={"X-Forwarded-For": "1.2.3.4, , 5.6.7.8, "}
+    )
+    assert public_guard_client_ip(request) == "5.6.7.8"
+
+
 # --- public-abuse guard: salted client hashing -------------------------------
 
 
@@ -584,6 +621,57 @@ def test_hashed_client_id_differs_when_the_docket_key_differs() -> None:
     a = hashed_client_id("203.0.113.7", docket_key="key-one")
     b = hashed_client_id("203.0.113.7", docket_key="key-two")
     assert a != b
+
+
+async def test_rotating_the_docket_key_also_resets_the_per_client_daily_cap() -> None:
+    """Security-review finding (2026-08-30): rotating `SETBACK_DOCKET_KEY`
+    does more than invalidate privileged cookies (the documented,
+    intended effect) -- it also changes `hashed_client_id`'s salt, so the
+    same real client hashes to a *different* daily-cap counter doc under
+    the new key. A client that had already used all 5 of today's
+    allowance under the old key gets a fresh allowance the instant the key
+    rotates. Pinned here (not silently left undiscovered) per the design
+    spec's own instruction to document a rotation's effects; see the
+    SECURITY-REVIEW NOTE above `PRIVILEGED_COOKIE_NAME` for why this is
+    accepted rather than reworked."""
+    counter_store = InMemoryGuardCounterStore()
+    old_key_guard = per_client_daily_case_cap_guard(
+        counter_store, docket_key_provider=lambda: "old-key", limit=1
+    )
+    request_under_old_key = _fake_public_request(host="9.9.9.9")
+    await old_key_guard(request_under_old_key)  # uses the client's one-and-only slot today
+    with pytest.raises(RateLimitExceeded):
+        await old_key_guard(request_under_old_key)
+
+    # The same real client, same day, immediately after a key rotation:
+    # a *different* dependency instance built with the new key (mirroring
+    # `console/app.py` re-reading `docket_key_provider()` on every call)
+    # treats it as an entirely fresh actor.
+    new_key_guard = per_client_daily_case_cap_guard(
+        counter_store, docket_key_provider=lambda: "new-key", limit=1
+    )
+    await new_key_guard(request_under_old_key)  # must not raise -- this is the finding
+
+
+async def test_rotating_the_docket_key_does_not_affect_the_global_ceiling() -> None:
+    """The blast radius stops at the per-client daily cap: the global
+    spend ceiling / count backstops (`GuardTotalsStore`) are not keyed by
+    the docket key at all, so a rotation never resets or affects them."""
+    totals_store = InMemoryGuardTotalsStore()
+    await totals_store.add_spend(20.0)  # under a 26.0 ceiling, e.g.
+    reader = CachedGuardTotalsReader(totals_store, ttl_seconds=0.0)
+
+    guard_under_old_key = public_guard_dependency(
+        reader, docket_key_provider=lambda: "old-key", ceiling_usd=26.0
+    )
+    await guard_under_old_key(_fake_public_request())  # must not raise: under the ceiling
+
+    await totals_store.add_spend(10.0)  # now 30.0, over the 26.0 ceiling
+    guard_under_new_key = public_guard_dependency(
+        reader, docket_key_provider=lambda: "new-key", ceiling_usd=26.0
+    )
+    with pytest.raises(PublicGuardPaused):
+        await guard_under_new_key(_fake_public_request())  # still paused after "rotation"
 
 
 # --- public-abuse guard: per-client daily case-creation cap dependency ------

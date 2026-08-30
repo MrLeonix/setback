@@ -9,11 +9,13 @@ Fully offline: no live Firestore, no network.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
+from google.cloud import firestore
 
 from setback.state.guard_store import (
     FirestoreGuardCounterStore,
@@ -57,18 +59,45 @@ class _FakeDocumentRef:
         self.id = path[-1]
 
     async def get(self) -> _FakeSnapshot:
+        if self._root.yield_on_io:
+            await asyncio.sleep(0)
         return _FakeSnapshot(self.id, self._root.docs.get(self._path))
 
     async def set(self, document_data: dict[str, Any], merge: bool = False) -> None:
-        self._root.docs[self._path] = dict(document_data)
+        """Mirrors real `AsyncDocumentReference.set`: `merge=True` combines
+        with any existing document rather than replacing it, and a
+        `firestore.Increment` value is resolved server-side as an atomic
+        field-transform against whatever the field currently holds --
+        unlike a client-side read-modify-write, this resolution happens as
+        one indivisible step with no `await` in between, exactly like the
+        real service, so concurrent callers can never race each other out
+        of an increment the way they can race a get()-then-set() pair.
+        """
+        if self._root.yield_on_io:
+            await asyncio.sleep(0)
+        current = dict(self._root.docs.get(self._path, {})) if merge else {}
+        for field_name, value in document_data.items():
+            if isinstance(value, firestore.Increment):
+                current[field_name] = current.get(field_name, 0) + value.value
+            else:
+                current[field_name] = value
+        self._root.docs[self._path] = current
 
     def collection(self, name: str) -> _FakeCollectionRef:
         return _FakeCollectionRef(self._root, (*self._path, name))
 
 
 class _FakeFirestore:
-    def __init__(self) -> None:
+    def __init__(self, *, yield_on_io: bool = False) -> None:
         self.docs: dict[tuple[str, ...], dict[str, Any]] = {}
+        # `yield_on_io`: when True, `.get()`/`.set()` each yield control back
+        # to the event loop (`await asyncio.sleep(0)`) before touching
+        # `docs`, so concurrent `asyncio.gather`-driven callers actually
+        # interleave the way separate real Firestore round-trips would --
+        # needed to make a read-then-write race reproducible against this
+        # in-process fake at all. Off by default so every existing
+        # single-call test keeps its simple, deterministic control flow.
+        self.yield_on_io = yield_on_io
 
     def collection(self, name: str) -> _FakeCollectionRef:
         return _FakeCollectionRef(self, (name,))
@@ -240,3 +269,91 @@ async def test_record_threshold_event_tracks_distinct_thresholds_independently(
     assert await totals_store.record_threshold_event(80) is True
     assert await totals_store.record_threshold_event(50) is False
     assert await totals_store.record_threshold_event(100) is True
+
+
+# --- adversarial: concurrent writers must never lose an update ---------------
+#
+# Security-review finding: both Firestore adapters originally did a plain
+# `await ref.get()` then, after some Python-side computation, an `await
+# ref.set(...)` -- two separate round-trips with an `await` on each side.
+# Under real concurrent public traffic (many anonymous requests landing on
+# the *same* actor's daily counter doc, or -- worse -- the *one* global
+# `guard_totals/public` aggregate doc that every single anonymous request
+# writes to) two callers can both read the same "before" value before
+# either has written its "after" value back, and the second writer's `set`
+# clobbers the first's -- a classic lost update. For a counter that exists
+# specifically to cap spend/attempts, losing updates only ever
+# *undercounts*, i.e. leaks past the cap the counter exists to enforce --
+# the opposite of "acceptable to lose a little accuracy" for a billing-grade
+# ceiling the founder is relying on as "an important blocker".
+#
+# These tests drive real concurrent interleaving (`asyncio.gather` against
+# a fake client whose `get`/`set` each yield control once, exactly like a
+# real network round-trip would) and assert every single one of `n`
+# concurrent writers' contributions survives -- pinning the fix (an atomic
+# Firestore field-transform `Increment`, resolved server-side with no
+# read-then-write window at all) rather than merely re-asserting the old
+# read-then-write shape.
+
+
+async def test_concurrent_daily_counter_increments_do_not_lose_updates() -> None:
+    """20 concurrent case-creation attempts from the same actor, all
+    landing in the same pathological lockstep (every one of the 20
+    `set()`s completes before any of the 20 `get()`-backs resolves -- the
+    single worst-case ordering `asyncio.gather` against a yielding fake can
+    produce, deliberately more adversarial than real network jitter would
+    ever actually serialize).
+
+    Two properties matter here, and they matter differently:
+
+    1. The stored counter itself must never lose an update -- it must land
+       on exactly 20, matching the 20 real attempts that were made. This
+       is the actual bug a read-then-write race causes (see the module
+       docstring): silently undercounting, which is the wrong direction
+       for a cap meant to stop abuse.
+    2. The cap must never be exceeded: at most `limit` of the 20 may come
+       back allowed. Under this specific pathological ordering, a caller's
+       own post-increment read can observe *other* callers' increments
+       that landed first, so it can end up denying a request that a
+       perfectly-ordered arbiter would have allowed -- fewer than `limit`
+       allowed is an acceptable, fail-closed outcome; more than `limit`
+       allowed never is.
+    """
+    fake = _FakeFirestore(yield_on_io=True)
+    store = FirestoreGuardCounterStore(fake)  # type: ignore[arg-type]
+    day = date(2026, 8, 30)
+    limit = 5
+
+    results = await asyncio.gather(
+        *(store.try_increment_daily("case", "actor-a", day=day, limit=limit) for _ in range(20))
+    )
+
+    ((_key, data),) = fake.docs.items()
+    assert data["count"] == 20, "a lost update under-counted concurrent attempts"
+    allowed_count = sum(1 for allowed in results if allowed)
+    assert allowed_count <= limit, "the cap was exceeded under concurrent load"
+
+
+async def test_concurrent_spend_increments_do_not_lose_updates() -> None:
+    """50 concurrent $0.001 anonymous-turn bookings against the *one*
+    global aggregate doc every anonymous request shares -- the doc every
+    public request in the whole deployment contends on, so this is the
+    highest-contention case in the guard. The total must land on exactly
+    50 * 0.001, not less."""
+    fake = _FakeFirestore(yield_on_io=True)
+    store = FirestoreGuardTotalsStore(fake)  # type: ignore[arg-type]
+
+    await asyncio.gather(*(store.add_spend(0.001) for _ in range(50)))
+
+    totals = await store.get_totals()
+    assert totals.spend_usd == pytest.approx(0.05)
+
+
+async def test_concurrent_anonymous_case_increments_do_not_lose_updates() -> None:
+    fake = _FakeFirestore(yield_on_io=True)
+    store = FirestoreGuardTotalsStore(fake)  # type: ignore[arg-type]
+
+    await asyncio.gather(*(store.increment_anonymous_cases() for _ in range(30)))
+
+    totals = await store.get_totals()
+    assert totals.anonymous_cases == 30

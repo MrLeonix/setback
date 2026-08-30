@@ -441,6 +441,30 @@ async def enforce_daily_spend_budget(
 # invalidates every cookie issued under the old key -- a new key derives a
 # different HMAC, and the old cookie value simply stops verifying. There is
 # no separate revocation list to maintain.
+#
+# SECURITY-REVIEW NOTE (2026-08-30), full blast radius of a rotation: the
+# per-client daily case-creation cap below (`hashed_client_id` /
+# `_client_identity_salt`) derives ITS salt from this exact same docket key
+# (per the design spec, "salt is derived in-process from the docket key").
+# A rotation therefore does two things, not one: it invalidates every
+# privileged cookie (intended, documented above) AND it silently resets
+# every anonymous actor's per-client daily-cap counter to a fresh bucket --
+# a client hash under the new salt shares no history with its hash under
+# the old one, so `guard_counters/case_<old-hash>_<yyyymmdd>` becomes
+# unreachable and every actor effectively gets a new 5-per-day allowance
+# the moment the key changes. This is a real, if bounded, side effect: it
+# does NOT touch the global spend ceiling or either count backstop
+# (`guard_totals/public` is not keyed by the docket key at all), and does
+# NOT touch the older, independent hourly per-IP limiter
+# (`per_ip_case_creation_guard`, keyed by raw IP, no salt) -- both keep
+# enforcing exactly as before. Left as spec-compliant (not silently
+# reworked to a separately-rotatable salt) rather than introducing a new
+# secret to provision under tonight's deploy window; a founder rotating the
+# key for a real leak should expect this reset as a secondary effect, not
+# just the (larger, intended) cookie invalidation. Pinned by
+# `test_rotating_the_docket_key_also_resets_the_per_client_daily_cap` and
+# `test_rotating_the_docket_key_does_not_affect_the_global_ceiling` in
+# `tests/console/test_guards.py`.
 
 PRIVILEGED_COOKIE_NAME: Final[str] = "sb_priv"
 PRIVILEGED_COOKIE_MAX_AGE_SECONDS: Final[int] = 60 * 24 * 3600
@@ -504,6 +528,41 @@ def public_guard_client_ip(request: Request) -> str:
     require touching every one of those call sites for no behavioural gain
     there. Falls back to `request.client.host`, then a shared `"unknown"`
     bucket, exactly like `_client_ip`.
+
+    SECURITY-REVIEW NOTE (2026-08-30), UNVERIFIED PLATFORM ASSUMPTION --
+    read before trusting this in production: "the last entry is always the
+    true client IP" is the DESIGN SPEC's own instruction, not something
+    re-derived here, and it is NOT uniformly true across every Google
+    Cloud ingress shape. Google's own External Application Load Balancer
+    docs (docs.cloud.google.com/load-balancing/docs/https,
+    "X-Forwarded-For header" section, checked 2026-08-30) state it
+    *appends two* addresses -- the client IP, THEN the load balancer's own
+    forwarding-rule IP -- which would make the true client IP the
+    SECOND-TO-LAST entry, with the (constant, shared-by-every-request)
+    load-balancer IP last; several independent write-ups of bare Cloud Run
+    (no separate external HTTPS Load Balancer resource in front of the
+    `*.run.app`/custom-domain ingress) instead describe GFE appending only
+    one address, making last correct -- and at least one names a *third*
+    shape again (Firebase Hosting in front of Cloud Run adds Fastly as yet
+    another hop, shifting the true client IP to third-from-last). This
+    module cannot tell which ingress shape `setback-console` actually runs
+    behind from inside the request handler. Getting this wrong is not a
+    minor bug: if the last entry actually turns out to be a constant
+    infrastructure IP rather than the client's, `hashed_client_id` collapses
+    *every* anonymous visitor into one shared identity, and the "5 cases
+    per client per day" cap would then apply to the whole public site
+    combined rather than to each visitor -- a functional outage, not a
+    security hole, but arguably worse for launch night. VERIFY BEFORE
+    RELYING ON THIS: after the one authorized production deploy, hit the
+    live service from two different real networks and confirm (server-side
+    only, never logged/printed with real values) that this function
+    returns two different values for those two requests, and that a
+    hand-forged leading `X-Forwarded-For` entry does not change the
+    result. Left as "last entry" here (spec-compliant, not silently
+    changed to "second-to-last") because the secondary sources found
+    during this review conflict with each other and neither is a
+    Cloud-Run-specific first-party statement definitive enough to justify
+    silently overriding the founder's explicit instruction on this branch.
     """
     forwarded_for = request.headers.get("x-forwarded-for")
     if forwarded_for:
@@ -555,6 +614,22 @@ correctly."""
 MAX_UPLOADS_PER_CASE: Final[int] = int(os.environ.get("MAX_UPLOADS_PER_CASE", "5"))
 """5 uploads per case, counted server-side from this case's own stored
 `document_uploaded` events, the same way as `MAX_INTERVIEW_TURNS_PER_CASE`."""
+
+MAX_REFUSAL_FEEDBACK_PER_CASE: Final[int] = int(
+    os.environ.get("MAX_REFUSAL_FEEDBACK_PER_CASE", "10")
+)
+"""10 refusal-feedback submissions per case (security-review finding,
+2026-08-30): `POST /api/cases/{case_id}/grounds/{ground_id}/feedback`
+(`console/app.py`'s `refusal_feedback`) makes one real model call per
+request (`interview.flow.capture_refusal_feedback` -> `composer.compose`)
+and, unlike every other model-calling mutating route, originally shipped
+with no cap or ceiling gate at all -- distinct `ground_id`/`pushback` pairs
+are never deduplicated against each other (only an exact repeat is a
+no-op, and its model call still runs before that dedup check), so an
+anonymous actor in a tight loop against this one endpoint could exhaust
+the entire public demo budget by itself. Counted server-side from this
+case's own stored `resident_refusal_feedback` events, the same way as
+`MAX_UPLOADS_PER_CASE`."""
 
 
 def per_client_daily_case_cap_guard(
@@ -644,6 +719,32 @@ def per_case_upload_cap_guard(
         if upload_count >= limit:
             raise RateLimitExceeded(
                 detail=f"this case has reached the {limit}-upload limit",
+                retry_after_seconds=0.0,
+            )
+
+    return _dependency
+
+
+def per_case_feedback_cap_guard(
+    store: CaseStoreLike,
+    *,
+    docket_key_provider: Callable[[], str | None],
+    limit: int = MAX_REFUSAL_FEEDBACK_PER_CASE,
+) -> Callable[[Request, str], Awaitable[None]]:
+    """Build a FastAPI dependency enforcing `limit` refusal-feedback
+    submissions per case, counted from this case's own stored
+    `resident_refusal_feedback` events (see
+    `MAX_REFUSAL_FEEDBACK_PER_CASE`). Wire with `Depends(...)` on
+    `POST /api/cases/{case_id}/grounds/{ground_id}/feedback`."""
+
+    async def _dependency(request: Request, case_id: str) -> None:
+        if is_privileged_request(request, docket_key_provider=docket_key_provider):
+            return
+        events = await store.list_events(case_id)
+        feedback_count = sum(1 for e in events if e.event_type == "resident_refusal_feedback")
+        if feedback_count >= limit:
+            raise RateLimitExceeded(
+                detail=f"this case has reached the {limit}-feedback-submission limit",
                 retry_after_seconds=0.0,
             )
 
@@ -808,6 +909,7 @@ __all__ = [
     "MAX_ANONYMOUS_TURNS_TOTAL",
     "MAX_CASES_PER_CLIENT_PER_DAY",
     "MAX_INTERVIEW_TURNS_PER_CASE",
+    "MAX_REFUSAL_FEEDBACK_PER_CASE",
     "MAX_UPLOADS_PER_CASE",
     "PRIVILEGED_COOKIE_MAX_AGE_SECONDS",
     "PRIVILEGED_COOKIE_NAME",
@@ -828,6 +930,7 @@ __all__ = [
     "is_privileged_cookie_valid",
     "is_privileged_request",
     "is_public_guard_paused",
+    "per_case_feedback_cap_guard",
     "per_case_interview_turn_cap_guard",
     "per_case_interview_turn_guard",
     "per_case_upload_cap_guard",
