@@ -1,3 +1,20 @@
+# STATUS — post-freeze incident fix + film-case allowlist, RE-FROZEN FINAL (2026-08-30)
+
+**Superseding update.** Five commits landed after the wave-12 freeze declared below
+(`56a7f73`, `1d5d565`, `230bc07`, `a665c89`, `bfed41f`, `3135a1a`). Two matter substantively:
+a tribunal-capacity incident fix (`1d5d565` + `230bc07`, with `a665c89` recording the
+incident) that counts `tribunal_rerun_ignored` as a terminal event and excludes stale runs
+from the concurrency cap via a 15-minute TTL, and `3135a1a`, which allowlists the founder's
+canonical film case (`1f4b7367fd30c089173ef09d7e8383a4`) for the Veo overshadowing clip and
+adds a founder-approved one-time-cost disclosure ("Pre-generated with Veo 3.1 · one-time
+cost US$1.60 · not part of this case's run cost") directly on the Evidence-tab card.
+`bfed41f` restyled overlay chips/boxes (stroke-only green boxes, compact chips outside the
+box). Final state: `setback-console` revision **`setback-console-00022-w62`**, **691 tests
+green**. This — not the `-00020-sl4` / 676-tests state described below — is the actual final
+frozen state for filming; no further agent build pass is planned.
+
+---
+
 # STATUS — wave 12 CLOSED, build RE-FROZEN FINAL (2026-08-30)
 
 **Wave 12 is done.** Film-kit patch pass re-verified every ship-phase claim below live
