@@ -119,7 +119,7 @@ make test
 make run-local
 ```
 
-`make test` runs the full offline suite (676 tests) and `make run-local`
+`make test` runs the full offline suite (691 tests) and `make run-local`
 serves the console UI on `localhost:8000` with no network calls — both work
 with no GCP project at all, and are enough to read the code, run the tests,
 and click through the UI.
@@ -203,18 +203,22 @@ Vertex AI, (2) the tribunal graph is built on Google's Agent Development Kit
 (`google-adk`), and (3) it deploys as a Cloud Run Service plus a Cloud Run
 Job, backed by Firestore.
 
-**Veo's role is illustration only, never evidence.** Two canonical demo
-cases that raised an overshadowing ground each carry one Veo-generated
-video clip on their Evidence tab, conditioned on the real DA's own
-elevation drawing, captioned with a mandatory, non-dismissible
-"AI-generated illustration — not evidence" label. The clip was generated
-once, offline, ahead of time (`veo-3.1-generate-001`, 1080p, 16:9, 8s) and
-is served as a static asset — the running app makes no on-demand Veo calls.
-It is structurally excluded from the tribunal's evidence pipeline: it is
-never built into a `SourceDocument`/`EvidenceAnchor`, so it can never be
-cited, graded, or seen by either reviewer or the adjudicator
-(`tests/evidence/test_illustration.py` asserts this directly against a
-built case dossier). See [DISCLOSURE.md](./DISCLOSURE.md) for the
+**Veo's role is illustration only, never evidence.** The allowlisted demo
+case set — the two prior canonical cases that raised an overshadowing
+ground, plus the founder's canonical film case
+(`1f4b7367fd30c089173ef09d7e8383a4`) — each carry one Veo-generated video
+clip on their Evidence tab, conditioned on the real DA's own elevation
+drawing, captioned with a mandatory, non-dismissible "AI-generated
+illustration — not evidence" label. The card also shows a founder-approved
+one-time-cost disclosure directly on it: "Pre-generated with Veo 3.1 ·
+one-time cost US$1.60 · not part of this case's run cost." The clip was
+generated once, offline, ahead of time (`veo-3.1-generate-001`, 1080p,
+16:9, 8s) and is served as a static asset — the running app makes no
+on-demand Veo calls. It is structurally excluded from the tribunal's
+evidence pipeline: it is never built into a `SourceDocument`/`EvidenceAnchor`,
+so it can never be cited, graded, or seen by either reviewer or the
+adjudicator (`tests/evidence/test_illustration.py` asserts this directly
+against a built case dossier). See [DISCLOSURE.md](./DISCLOSURE.md) for the
 generation process.
 
 ## Data sources
