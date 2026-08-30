@@ -774,6 +774,113 @@
   }
 
   // ===========================================================================
+  // Refusal-feedback affordance (Collaborative Partner track: the agent
+  // must have "a clear way to capture feedback"). Each refused ground's
+  // card renders a plain toggle + hidden `<textarea>` form
+  // (`console/app.py`'s `_render_refusal_feedback_affordance`), submitting
+  // to the ALREADY-EXISTING, already-guarded `POST /api/cases/{case_id}/
+  // grounds/{ground_id}/feedback`. That route makes one real, budgeted,
+  // capped model call per request and never changes the gate's ruling --
+  // it only records the pushback and returns an acknowledging
+  // restatement, rendered inline here via `.textContent` (never
+  // `.innerHTML`) since it is model-composed free text, exactly like every
+  // other resident/model string this file renders (the app's own recently
+  // fixed XSS class). The submit button stays disabled for the whole
+  // in-flight request -- a past lesson: a double-click on a slow
+  // connection must never fire a second real model call / book spend
+  // twice for one pushback.
+  // ===========================================================================
+
+  function initRefusalFeedbackForms() {
+    const affordances = document.querySelectorAll(".refusal-feedback-affordance");
+    affordances.forEach((affordance) => {
+      const toggleBtn = affordance.querySelector(".refusal-feedback-affordance__toggle");
+      const form = affordance.querySelector(".refusal-feedback-form");
+      const textarea = form ? form.querySelector(".refusal-feedback-form__input") : null;
+      const submitBtn = form ? form.querySelector(".refusal-feedback-form__submit") : null;
+      const statusEl = form ? form.querySelector(".refusal-feedback-form__status") : null;
+      if (!toggleBtn || !form || !textarea || !submitBtn || !statusEl) return;
+
+      const thisCaseId = affordance.getAttribute("data-case-id") || caseId;
+      const groundId = affordance.getAttribute("data-ground-id") || "";
+      const originalExplanation = affordance.getAttribute("data-original-explanation") || "";
+
+      toggleBtn.addEventListener("click", () => {
+        form.hidden = false;
+        toggleBtn.hidden = true;
+        textarea.focus();
+      });
+
+      function setStatus(message, variant) {
+        statusEl.classList.remove(
+          "refusal-feedback-form__status--error",
+          "refusal-feedback-form__status--success"
+        );
+        if (!message) {
+          statusEl.hidden = true;
+          statusEl.textContent = "";
+          return;
+        }
+        statusEl.textContent = message;
+        statusEl.hidden = false;
+        if (variant) statusEl.classList.add(`refusal-feedback-form__status--${variant}`);
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        // Idempotency guard against a double-click/double-Enter: a
+        // disabled submit button short-circuits a second `submit` event
+        // fired while the first request is still in flight.
+        if (submitBtn.disabled) return;
+        const pushback = textarea.value.trim();
+        if (!pushback) {
+          setStatus("Tell the tribunal why you disagree first.", "error");
+          return;
+        }
+        submitBtn.disabled = true;
+        textarea.disabled = true;
+        setStatus("Submitting…", null);
+        try {
+          const response = await fetch(
+            `/api/cases/${encodeURIComponent(thisCaseId)}/grounds/` +
+              `${encodeURIComponent(groundId)}/feedback`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                original_explanation: originalExplanation,
+                pushback: pushback,
+              }),
+            }
+          );
+          if (response.ok) {
+            const body = await response.json();
+            setStatus(body.re_rendered_explanation || "Recorded.", "success");
+            textarea.value = "";
+          } else {
+            let detail = "We couldn't record that just now. Please try again shortly.";
+            try {
+              const errorBody = await response.json();
+              if (errorBody && errorBody.detail) detail = errorBody.detail;
+            } catch (err) {
+              // Non-JSON error body: keep the generic message above.
+            }
+            setStatus(detail, "error");
+          }
+        } catch (err) {
+          setStatus(
+            "Could not reach the server. Please check your connection and try again.",
+            "error"
+          );
+        } finally {
+          textarea.disabled = false;
+          submitBtn.disabled = false;
+        }
+      });
+    });
+  }
+
+  // ===========================================================================
   // Wave 9 (LEO-FEEDBACK-UIUX.md §1/§2/§6): copy-link + copy-text, both via
   // the same small clipboard helper with a manual-select fallback for a
   // context where the async Clipboard API isn't available.
@@ -1528,6 +1635,7 @@
     };
   }
 
+  initRefusalFeedbackForms();
   loadInterview();
   connectEventStream();
 })();

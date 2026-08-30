@@ -1148,6 +1148,91 @@ button:hover {
   font-size: var(--text-sm);
 }
 
+/* --- refusal-feedback affordance: "a clear way to capture feedback" ------
+   Deliberately quiet -- a plain text-style toggle (like `.summary-list__
+   change`), not a second filled CTA competing with the refusal card's own
+   framing. `min-height: 44px` unconditionally (not gated to a mobile
+   media query) per the touch-target requirement at every width. */
+
+.refusal-feedback-affordance {
+  margin-top: var(--space-3);
+}
+
+.refusal-feedback-affordance__toggle {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  padding: var(--space-2) 0;
+  min-height: 44px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.refusal-feedback-affordance__toggle:hover {
+  text-decoration: underline;
+}
+
+.refusal-feedback-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  max-width: 48ch;
+}
+
+.refusal-feedback-form[hidden] {
+  display: none;
+}
+
+.refusal-feedback-form__input {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  resize: vertical;
+}
+
+.refusal-feedback-form__submit {
+  align-self: flex-start;
+  min-height: 44px;
+}
+
+.refusal-feedback-form__status {
+  margin: 0;
+  font-size: var(--text-sm);
+}
+
+.refusal-feedback-form__status--error {
+  color: var(--error);
+}
+
+.refusal-feedback-form__status--success {
+  color: var(--status-shipped);
+}
+
+/* --- resident feedback on refusals (flat event list) ---------------------
+   Previously unstyled (relied on the generic `.event-list li` fallback);
+   the pushback is the resident's own words (quoted), the response is
+   Setback's acknowledging restatement -- visually distinct so the two
+   voices don't blur together. */
+
+.refusal-feedback__pushback {
+  margin: 0 0 var(--space-1);
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.refusal-feedback__response {
+  margin: 0;
+}
+
 /* --- §2.10 Verdict banner / stamp -------------------------------------------
    Deliberately the single largest text element in the app (36px) -- the
    likely judge-screenshot frame. Colour uses the same 4-token status map

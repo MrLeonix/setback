@@ -1582,8 +1582,44 @@ def _refusal_reassurance(total_grounds: int) -> str:
     return f" Your other {other_count} {noun} {verb} unaffected."
 
 
+def _render_refusal_feedback_affordance(case_id: str, ground_id: str, explanation: str) -> str:
+    """The on-page way a resident disputes a gate refusal (Collaborative
+    Partner track: the agent must have "a clear way to capture feedback").
+    A small plain toggle -- no new visual language, `.button--secondary`
+    plus a `.refusal-feedback-form` styled like every other text input on
+    this page -- opens onto the ALREADY-EXISTING, already-guarded `POST
+    /api/cases/{case_id}/grounds/{ground_id}/feedback`
+    (`console.app.refusal_feedback` -> `interview.flow.
+    capture_refusal_feedback`); `app.js`'s `initRefusalFeedbackForms` wires
+    the fetch, the busy/success/failure states, and the idempotency guard
+    against a double-click re-booking the same model call twice.
+
+    `explanation` is the gate's own composed wording -- upstream free text,
+    `_esc`-ed into the `data-original-explanation` attribute exactly like
+    every other resident/model-sourced string on this page (never
+    interpolated raw)."""
+    return (
+        f'<div class="refusal-feedback-affordance" data-case-id="{_esc(case_id)}" '
+        f'data-ground-id="{_esc(ground_id)}" '
+        f'data-original-explanation="{_esc(explanation)}">'
+        '<button type="button" class="refusal-feedback-affordance__toggle">'
+        "Disagree with this refusal? Tell the tribunal."
+        "</button>"
+        '<form class="refusal-feedback-form" hidden>'
+        f'<label for="refusal-feedback-input-{_esc(ground_id)}" class="visually-hidden">'
+        "Tell the tribunal why you disagree</label>"
+        f'<textarea id="refusal-feedback-input-{_esc(ground_id)}" '
+        'class="refusal-feedback-form__input" rows="3" '
+        'placeholder="Tell the tribunal why you disagree..." required></textarea>'
+        '<button type="submit" class="button--secondary refusal-feedback-form__submit">'
+        "Submit</button>"
+        '<p class="refusal-feedback-form__status" aria-live="polite" hidden></p>'
+        "</form></div>"
+    )
+
+
 def _render_gate_detail(
-    ground: GroundRecord, gate_decision: Mapping[str, Any], total_grounds: int
+    case_id: str, ground: GroundRecord, gate_decision: Mapping[str, Any], total_grounds: int
 ) -> str:
     """The gate's ruling on `ground`, rendered INSIDE that ground's own
     accordion (LEO-FEEDBACK-UIUX.md §3) rather than a separate, unlinked
@@ -1606,6 +1642,7 @@ def _render_gate_detail(
             f'<p class="refusal-card__heading">We didn&rsquo;t include: {_esc(ground.claim)}</p>'
             f'<p class="refusal-card__reason">'
             f"{_esc(explanation)}{_refusal_reassurance(total_grounds)}</p>"
+            f"{_render_refusal_feedback_affordance(case_id, ground.ground_id, explanation)}"
             "</div></div>"
         )
     basis = str(gate_decision.get("statutory_basis") or "")
@@ -2126,6 +2163,7 @@ _GROUND_STATUS_MODIFIER_AND_LABEL: Mapping[GroundStatus, tuple[str, str]] = {
 
 
 def _render_ground_card(
+    case_id: str,
     ground: GroundRecord,
     gate_decision: Mapping[str, Any] | None,
     review_verdicts: Sequence[CaseEvent],
@@ -2142,7 +2180,7 @@ def _render_ground_card(
     modifier, label = _GROUND_STATUS_MODIFIER_AND_LABEL[ground.status]
     detail_html = ""
     if gate_decision is not None:
-        detail_html += _render_gate_detail(ground, gate_decision, total_grounds)
+        detail_html += _render_gate_detail(case_id, ground, gate_decision, total_grounds)
     opinions_html = "".join(_render_review_verdict_item(e) for e in review_verdicts)
     if adjudication is not None:
         opinions_html += _render_adjudication_decision_item(adjudication)
@@ -2166,6 +2204,7 @@ def _render_ground_card(
 
 
 def _render_grounds_section(
+    case_id: str,
     grounds: Sequence[GroundRecord],
     gate_decisions_by_ground: Mapping[str, Mapping[str, Any]],
     review_verdicts_by_ground: Mapping[str, Sequence[CaseEvent]],
@@ -2179,6 +2218,7 @@ def _render_grounds_section(
     total_grounds = len(grounds)
     items = "".join(
         _render_ground_card(
+            case_id,
             g,
             gate_decisions_by_ground.get(g.ground_id),
             review_verdicts_by_ground.get(g.ground_id, ()),
@@ -2397,7 +2437,11 @@ def render_case_page(
     }
 
     grounds_section = _render_grounds_section(
-        grounds, gate_decisions_by_ground, review_verdicts_by_ground, adjudication_by_ground
+        case.case_id,
+        grounds,
+        gate_decisions_by_ground,
+        review_verdicts_by_ground,
+        adjudication_by_ground,
     )
     check_answers_section = _render_check_answers_section(grounds, events)
     case_notes_section = _render_case_notes_section(events)
