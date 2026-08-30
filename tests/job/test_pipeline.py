@@ -3251,6 +3251,70 @@ async def test_run_does_not_regenerate_when_an_illustration_event_already_exists
     assert len(ready_events) == 1  # the pre-seeded one, never duplicated
 
 
+async def test_concurrent_attempts_for_the_same_case_call_veo_at_most_once() -> None:
+    """Security review (2026-08-31): two concurrent job executions for the
+    SAME case_id -- a real, pre-existing surface (see
+    `console.app.start_tribunal`'s own comment: a double-clicked "Start
+    tribunal" fires a second real Cloud Run Job execution regardless) --
+    must never both call Veo. `_has_illustration_event` alone is not
+    enough: both executions read the identical `events` snapshot captured
+    at the START of their own run, so neither sees the other's in-flight
+    attempt. The per-case atomic claim (`VeoLiveCounterStore.
+    try_claim_case`) is what actually prevents the double real spend."""
+    store = InMemoryCaseStore()
+    document_source = UserUploadedDocumentSource()
+    case_id, ground_id = await _seed_case_single_ground(
+        store, document_source=document_source, judge_origin=True
+    )
+    # A real delay forces the two concurrent attempts to actually
+    # interleave at the Veo call itself (an `asyncio.gather`-driven task
+    # with no genuine suspension point never yields to its sibling task at
+    # all) -- exactly the shape of two separate job containers each
+    # independently making a real, slow network call.
+    veo_client = _FakeVeoLiveClient(delay_seconds=0.01)
+    counter_store = InMemoryVeoLiveCounterStore()
+
+    runner = _judge_gated_runner(
+        document_source=document_source,
+        clause_model=_supporting_fakes(ground_id)[0],
+        evidence_model=_supporting_fakes(ground_id)[1],
+        veo_client=veo_client,
+        veo_live_counter_store=counter_store,
+    )
+    resume = await resume_case(store, case_id)
+    dossier, _ingest_outcome = await runner._build_dossier(case_id, resume, store=store)  # noqa: SLF001
+
+    from setback.gate.validator import GateDecision, GateStatus
+
+    decisions = [
+        GateDecision(
+            ground_id=ground_id,
+            status=GateStatus.SHIPPED,
+            category="environmental_and_social_impacts",
+            explanation="",
+            statutory_basis="s4.15(1)(b)",
+            citation_issues=(),
+        )
+    ]
+
+    # Both calls share the SAME `resume.events` snapshot -- exactly what
+    # two concurrent job executions starting from the same `resume_case`
+    # read would each see.
+    await asyncio.gather(
+        runner._attempt_veo_live_illustration(  # noqa: SLF001
+            case_id, store, resume.events, decisions, dossier
+        ),
+        runner._attempt_veo_live_illustration(  # noqa: SLF001
+            case_id, store, resume.events, decisions, dossier
+        ),
+    )
+
+    assert len(veo_client.calls) == 1, "Veo was called more than once for one case"
+    events = await store.list_events(case_id)
+    ready_events = [e for e in events if e.event_type == "illustration_ready"]
+    assert len(ready_events) == 1
+
+
 async def test_run_stops_generating_once_the_global_cap_is_reached() -> None:
     """The atomic global counter, not a per-case one: once
     `veo_live_max_generations` attempts have already happened (anywhere),

@@ -234,3 +234,55 @@ def test_live_card_never_renders_on_an_allowlisted_demo_case() -> None:
     assert clip.static_path in page
     assert "some-other-live-document-id" not in page
     assert VEO_LIVE_GENERATING_MESSAGE not in page
+
+
+_FOUNDER_FILM_CASE_ID = "1f4b7367fd30c089173ef09d7e8383a4"
+"""The exact, founder-authorized single-demo film case id (STATUS.md/
+SMOKE.md) -- pinned by its literal string, not `next(iter(...))` (which
+resolves to a different member of the same 3-entry allowlist), because this
+is the one case id the review brief names by name as required to render
+byte-identical / UNCHANGED. The underlying gates (`_is_veo_live_excluded`
+in `job.pipeline`, the mirrored check in `_render_live_illustration_card`
+here) are a plain set-membership check with no per-id branching, so any
+member proves the *logic*; this test additionally proves the *exact,
+named* case id is really a member and really excluded, adversarially, even
+when every other wave-13 gating condition is otherwise satisfied."""
+
+
+def test_founder_film_case_is_in_the_allowlist() -> None:
+    """Sanity: if this ever stopped being true, every assertion below would
+    pass for the wrong reason."""
+    assert _FOUNDER_FILM_CASE_ID in OVERSHADOWING_SIMULATION_CLIPS
+
+
+def test_founder_film_case_renders_unchanged_even_when_every_live_gate_would_otherwise_pass() -> (
+    None
+):
+    """Security review (2026-08-31) pinning test: the founder's own
+    single-demo film case (`1f4b7367fd30c089173ef09d7e8383a4`) must render
+    its pre-generated static clip -- and ONLY that -- even in the
+    adversarial case where every wave-13 live-generation condition is
+    otherwise satisfied (judge_origin, a shipped overshadowing ground, and
+    both an `illustration_generating` AND an `illustration_ready` event
+    already on record, as if a bug elsewhere had let live generation run
+    against it anyway). No live-card marker (the live cost line, the
+    generating message, or the live document id) may ever appear."""
+    clip = OVERSHADOWING_SIMULATION_CLIPS[_FOUNDER_FILM_CASE_ID]
+    live_document_id = "should-never-be-referenced"
+
+    page = render_case_page(
+        _case(_FOUNDER_FILM_CASE_ID),
+        [],
+        [
+            _judge_case_created(_FOUNDER_FILM_CASE_ID),
+            _overshadowing_ground_event(_FOUNDER_FILM_CASE_ID),
+            _generating_event(_FOUNDER_FILM_CASE_ID),
+            _ready_event(_FOUNDER_FILM_CASE_ID, live_document_id),
+        ],
+    )
+
+    assert clip.static_path in page
+    assert html.escape(clip.caption) in page
+    assert live_document_id not in page
+    assert VEO_LIVE_GENERATING_MESSAGE not in page
+    assert VEO_LIVE_COST_NOTE not in page

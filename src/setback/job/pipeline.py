@@ -1986,6 +1986,21 @@ class RealPipelineRunner:
         if _has_illustration_event(events):
             return
 
+        # Security review (2026-08-31): `_has_illustration_event` above only
+        # sees `events` as they stood at the START of this job execution --
+        # it cannot see another, concurrent job execution for this SAME
+        # case_id that is also mid-attempt right now (a real, pre-existing
+        # surface: `console.app.start_tribunal`'s own comment documents a
+        # double-clicked "Start tribunal" firing a second real Cloud Run Job
+        # execution regardless). An atomic per-case claim, checked here --
+        # BEFORE the global cap is spent and BEFORE Veo is ever called --
+        # is what actually prevents one case from being billed twice: at
+        # most one of any number of concurrent attempts for this case_id
+        # can ever win it.
+        claimed = await self._veo_live_counter_store.try_claim_case(case_id)
+        if not claimed:
+            return  # another concurrent attempt for this exact case already won the claim
+
         plan_document = _select_plan_document(list(dossier.documents.values()))
         if plan_document is None or not plan_document.pages:
             return  # no elevation/site drawing to condition on
