@@ -10,11 +10,18 @@ than driving a real interview through `create_app` to reach it.
 
 from __future__ import annotations
 
+import html
 from datetime import UTC, datetime
 
 from setback.console.app import render_case_page
-from setback.evidence.illustration import ILLUSTRATION_LABEL, OVERSHADOWING_SIMULATION_CLIPS
+from setback.evidence.illustration import (
+    ILLUSTRATION_COST_NOTE,
+    ILLUSTRATION_LABEL,
+    OVERSHADOWING_SIMULATION_CLIPS,
+)
+from setback.models.client import TokenUsage
 from setback.state.firestore import CaseEvent, CaseRecord
+from setback.state.ledger import Ledger
 
 _FILM2_CASE_ID = "cc9bfc59084fd7cac527c479f0e71996"
 _NON_DEMO_CASE_ID = "0" * 32
@@ -115,3 +122,54 @@ def test_simulation_card_appears_in_the_evidence_panel_not_the_overlay_panel() -
 
     assert ILLUSTRATION_LABEL in _panel(html, "evidence")
     assert ILLUSTRATION_LABEL not in _panel(html, "overlay")
+
+
+# --- cost label (founder-approved wording, wave 12 instruction 2) ------------
+
+
+def test_simulation_card_includes_the_cost_label() -> None:
+    html_out = render_case_page(
+        _case(_FILM2_CASE_ID), [], [_overshadowing_ground_category_event(_FILM2_CASE_ID)]
+    )
+
+    # `_esc` html-escapes the apostrophe in "case's" -- a browser renders
+    # `&#x27;` as a plain apostrophe just the same, so this is still the
+    # exact founder-approved text as displayed.
+    assert html.escape(ILLUSTRATION_COST_NOTE) in html_out
+    assert html.escape(ILLUSTRATION_COST_NOTE) in _panel(html_out, "evidence")
+
+
+def test_simulation_card_cost_label_absent_without_the_card() -> None:
+    html_out = render_case_page(
+        _case(_FILM2_CASE_ID), [], [_height_bulk_ground_category_event(_FILM2_CASE_ID)]
+    )
+
+    assert html.escape(ILLUSTRATION_COST_NOTE) not in html_out
+
+
+def test_cost_label_never_touches_the_header_run_cost_chip() -> None:
+    """The Veo card's one-time-cost line must never leak into, or be
+    confused with, the header's `data-run-cost-usd` attribute (the case's
+    real tribunal-run-cost ledger total) -- they are deliberately unrelated
+    numbers ($1.60 one-time vs. per-run token spend)."""
+    ledger = Ledger()
+    ledger.record(
+        stage="test",
+        model="gemini-3.5-flash-lite",
+        usage=TokenUsage(prompt_tokens=1000, output_tokens=1000),
+    )
+    assert ledger.total_cost_usd > 0
+
+    html_out = render_case_page(
+        _case(_FILM2_CASE_ID),
+        [],
+        [_overshadowing_ground_category_event(_FILM2_CASE_ID)],
+        ledger,
+    )
+
+    assert html.escape(ILLUSTRATION_COST_NOTE) in html_out
+    expected = f'data-run-cost-usd="{ledger.total_cost_usd:.6f}"'
+    assert expected in html_out
+    # The ledger's real run-cost total is untouched by, and distinct from,
+    # the card's fixed $1.60 one-time-cost figure.
+    assert f"{ledger.total_cost_usd:.6f}" != "1.600000"

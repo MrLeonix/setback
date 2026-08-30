@@ -57,6 +57,16 @@ ILLUSTRATION_EXPLAINER: Final[str] = (
 )
 """The one-line explainer required alongside the mandatory label."""
 
+ILLUSTRATION_COST_NOTE: Final[str] = (
+    "Pre-generated with Veo 3.1 · one-time cost US$1.60 · not part of this case's run cost"
+)
+"""Founder-approved cost-disclosure line (wave-12 instruction 2) shown on
+the Veo card. $1.60 is this specific clip's real one-time generation cost
+(8s x $0.20/s, per the veo spend ledger) -- a fixed, pre-generation cost of
+the one shared clip, never a per-case or per-run figure, and never wired to
+`state.ledger.Ledger`/the case's own run-cost total (deliberately a
+different module, a different number, and a different sentence)."""
+
 
 @dataclass(frozen=True, slots=True)
 class SimulationClip:
@@ -90,6 +100,8 @@ OVERSHADOWING_SIMULATION_CLIPS: Final[Mapping[str, SimulationClip]] = {
     # per case this wave (wave-12 instruction 3: no on-demand generation).
     "cc9bfc59084fd7cac527c479f0e71996": _OVERSHADOWING_SIMULATION_CLIP,  # DA2026/0412-FILM2
     "aeff0460678e76feceb7a5a7af934d31": _OVERSHADOWING_SIMULATION_CLIP,  # real-DA
+    # the founder's single-demo film case
+    "1f4b7367fd30c089173ef09d7e8383a4": _OVERSHADOWING_SIMULATION_CLIP,
 }
 
 
@@ -116,6 +128,7 @@ def simulation_clip_for_case(
 
 
 __all__ = [
+    "ILLUSTRATION_COST_NOTE",
     "ILLUSTRATION_EXPLAINER",
     "ILLUSTRATION_LABEL",
     "OVERSHADOWING_SIMULATION_CLIPS",

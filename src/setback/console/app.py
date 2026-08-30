@@ -68,6 +68,7 @@ from setback.console.guards import (
 )
 from setback.evidence.dossier import ProvenanceGrade
 from setback.evidence.illustration import (
+    ILLUSTRATION_COST_NOTE,
     ILLUSTRATION_EXPLAINER,
     ILLUSTRATION_LABEL,
     simulation_clip_for_case,
@@ -2152,6 +2153,7 @@ def _render_simulation_clip_card(clip: Any) -> str:
         "</video>"
         f'<p class="simulation-card__label">{_esc(ILLUSTRATION_LABEL)}</p>'
         f'<p class="simulation-card__explainer">{_esc(ILLUSTRATION_EXPLAINER)}</p>'
+        f'<p class="simulation-card__cost">{_esc(ILLUSTRATION_COST_NOTE)}</p>'
         "</section>"
     )
 

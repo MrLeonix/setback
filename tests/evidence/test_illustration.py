@@ -16,6 +16,7 @@ from pathlib import Path
 
 from setback.evidence.dossier import build_dossier
 from setback.evidence.illustration import (
+    ILLUSTRATION_COST_NOTE,
     ILLUSTRATION_LABEL,
     OVERSHADOWING_SIMULATION_CLIPS,
     SimulationClip,
@@ -32,15 +33,33 @@ ELEVATIONS_PDF = FIXTURES / "elevations.pdf"
 # case ids are referenced, as plain strings, for the config-lookup test.
 _FILM2_CASE_ID = "cc9bfc59084fd7cac527c479f0e71996"
 _REAL_DA_CASE_ID = "aeff0460678e76feceb7a5a7af934d31"
+# The founder's single-demo film case (filmed same-day as this wave) --
+# same real DA/elevations as the two canonical film cases above, so the one
+# clip is equally honest to attach here. See illustration.py's allowlist
+# comment.
+_FOUNDER_FILM_CASE_ID = "1f4b7367fd30c089173ef09d7e8383a4"
 
 
 def test_illustration_label_is_the_mandatory_disclosure_text() -> None:
     assert ILLUSTRATION_LABEL == "AI-generated illustration — not evidence"
 
 
+def test_illustration_cost_note_is_the_founder_approved_text() -> None:
+    assert ILLUSTRATION_COST_NOTE == (
+        "Pre-generated with Veo 3.1 · one-time cost US$1.60 · not part of this case's run cost"
+    )
+
+
 def test_known_demo_cases_are_configured() -> None:
     assert _FILM2_CASE_ID in OVERSHADOWING_SIMULATION_CLIPS
     assert _REAL_DA_CASE_ID in OVERSHADOWING_SIMULATION_CLIPS
+    assert _FOUNDER_FILM_CASE_ID in OVERSHADOWING_SIMULATION_CLIPS
+    # Same clip constant as the other two film cases (wave-12 instruction 1:
+    # "same clip constant") -- never a second generated clip.
+    assert (
+        OVERSHADOWING_SIMULATION_CLIPS[_FOUNDER_FILM_CASE_ID]
+        is OVERSHADOWING_SIMULATION_CLIPS[_FILM2_CASE_ID]
+    )
 
 
 def test_simulation_clip_for_case_returns_none_for_an_unknown_case() -> None:
