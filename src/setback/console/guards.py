@@ -214,6 +214,9 @@ class _EventLike(Protocol):
     @property
     def sequence(self) -> int: ...
 
+    @property
+    def recorded_at(self) -> datetime: ...
+
 
 class CaseStoreLike(Protocol):
     """The narrow slice of `state.firestore.CaseStore` these guards need --
@@ -251,11 +254,36 @@ slot for a run that never started -- exactly what happened to both
 canonical demo cases at once, exhausting `DEFAULT_MAX_CONCURRENT_TRIBUNALS`
 (2) for every other case."""
 
+DEFAULT_STALE_RUN_TTL_SECONDS: Final[float] = 15 * 60.0
+"""15 minutes -- longer than any documented legitimate run (ARCHITECTURE.md
+§3 describes the pipeline as "a multi-minute, multi-model-call batch job",
+not a multi-*ten*-minute one).
 
-async def count_running_tribunals(store: CaseStoreLike, *, case_limit: int = 200) -> int:
+DESIGN-DECISIONS.md and ARCHITECTURE.md §4 both say plainly there is no
+sweeper: a crashed/OOM-killed/timed-out job execution leaves its case stuck
+mid-run "with no automated recovery". A crash never gets to record a
+terminal event, so that case's `tribunal_requested` would otherwise count
+as "running" forever -- one crash permanently halves
+`DEFAULT_MAX_CONCURRENT_TRIBUNALS` (2), and a second wedges it to zero,
+with nothing but a manual re-trigger able to clear it. This TTL is the
+guard's own count-side mitigation for that documented gap: a start event
+older than this stops counting toward the cap, so a crashed run's
+concurrency slot recovers on its own instead of staying wedged. It does not
+touch the store -- a genuinely still-running job keeps running; it is
+simply no longer charged against capacity past this age."""
+
+
+async def count_running_tribunals(
+    store: CaseStoreLike,
+    *,
+    case_limit: int = 200,
+    now: datetime | None = None,
+    stale_run_ttl_seconds: float = DEFAULT_STALE_RUN_TTL_SECONDS,
+) -> int:
     """Count cases with a `tribunal_requested` event newer (higher
     `sequence`) than their latest terminal event, or with no terminal event
-    at all.
+    at all -- excluding one whose `tribunal_requested` is older than
+    `stale_run_ttl_seconds` (see :data:`DEFAULT_STALE_RUN_TTL_SECONDS`).
 
     `case_limit` bounds how many of the most recently created cases
     (`CaseStore.list_cases` is already sorted newest-first) are checked --
@@ -263,22 +291,28 @@ async def count_running_tribunals(store: CaseStoreLike, *, case_limit: int = 200
     hackathon build's data volume, not a claim of exhaustive correctness at
     an arbitrary scale.
     """
+    current_time = now or datetime.now(UTC)
     cases = await store.list_cases(limit=case_limit)
     running = 0
     for case in cases:
         events = await store.list_events(case.case_id)
-        start_sequence = max(
-            (e.sequence for e in events if e.event_type == _TRIBUNAL_START_EVENT),
+        start_event = max(
+            (e for e in events if e.event_type == _TRIBUNAL_START_EVENT),
+            key=lambda e: e.sequence,
             default=None,
         )
-        if start_sequence is None:
+        if start_event is None:
             continue
         terminal_sequence = max(
             (e.sequence for e in events if e.event_type in _TRIBUNAL_TERMINAL_EVENTS),
             default=None,
         )
-        if terminal_sequence is None or terminal_sequence < start_sequence:
-            running += 1
+        if terminal_sequence is not None and terminal_sequence >= start_event.sequence:
+            continue
+        age_seconds = (current_time - start_event.recorded_at).total_seconds()
+        if age_seconds >= stale_run_ttl_seconds:
+            continue
+        running += 1
     return running
 
 
@@ -376,6 +410,7 @@ __all__ = [
     "DEFAULT_INTERVIEW_TURN_LIMIT",
     "DEFAULT_INTERVIEW_TURN_WINDOW_SECONDS",
     "DEFAULT_MAX_CONCURRENT_TRIBUNALS",
+    "DEFAULT_STALE_RUN_TTL_SECONDS",
     "CaseStoreLike",
     "DailySpendExceeded",
     "RateLimitExceeded",

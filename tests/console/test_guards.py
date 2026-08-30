@@ -10,7 +10,7 @@ actually wires into a route the way `console/app.py` will use it.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from setback.console.guards import (
+    DEFAULT_STALE_RUN_TTL_SECONDS,
     DailySpendExceeded,
     RateLimitExceeded,
     SlidingWindowRateLimiter,
@@ -258,6 +259,68 @@ async def test_count_running_tribunals_excludes_an_idempotent_rerun_replay() -> 
     await store.append_event(case_id, "tribunal-req-2", "tribunal_requested", payload={})
     await store.append_event(case_id, "rerun-ignored", "tribunal_rerun_ignored", payload={})
     assert await count_running_tribunals(store) == 0
+
+
+async def test_count_running_tribunals_excludes_a_run_past_the_stale_ttl() -> None:
+    """DESIGN-DECISIONS.md/ARCHITECTURE.md both say plainly there is no
+    sweeper: a crashed/OOM-killed/timed-out job execution leaves its case
+    stuck with no automated recovery. Without this TTL that stuck
+    `tribunal_requested` (no terminal event ever follows -- nothing crashed
+    *recorded* anything) would count as "running" forever, permanently
+    burning a concurrency slot; a second crash would burn the other one and
+    wedge every future case behind `DEFAULT_MAX_CONCURRENT_TRIBUNALS` (2)
+    stuck slots that can never clear themselves."""
+    requested_at = datetime(2026, 8, 29, 7, 0, tzinfo=UTC)
+    store = InMemoryCaseStore(clock=lambda: requested_at)
+    case_id = await _make_case_with_events(store, "PAN-1")
+    await store.append_event(case_id, "tribunal-req", "tribunal_requested", payload={})
+
+    past_ttl = requested_at + timedelta(seconds=DEFAULT_STALE_RUN_TTL_SECONDS, microseconds=1)
+    assert await count_running_tribunals(store, now=past_ttl) == 0
+
+
+async def test_count_running_tribunals_counts_a_run_still_within_the_stale_ttl() -> None:
+    requested_at = datetime(2026, 8, 29, 7, 0, tzinfo=UTC)
+    store = InMemoryCaseStore(clock=lambda: requested_at)
+    case_id = await _make_case_with_events(store, "PAN-1")
+    await store.append_event(case_id, "tribunal-req", "tribunal_requested", payload={})
+
+    within_ttl = requested_at + timedelta(seconds=DEFAULT_STALE_RUN_TTL_SECONDS - 1)
+    assert await count_running_tribunals(store, now=within_ttl) == 1
+
+
+async def test_count_running_tribunals_stale_ttl_is_keyed_to_the_latest_start_event() -> None:
+    """A re-requested run (see the "re-requested after completion" case
+    above) must be judged by its own, most recent `tribunal_requested`
+    timestamp -- not by the case's first one, which would make an entirely
+    fresh run look stale just because the case is old."""
+    first_requested_at = datetime(2026, 8, 29, 6, 0, tzinfo=UTC)
+    second_requested_at = first_requested_at + timedelta(seconds=DEFAULT_STALE_RUN_TTL_SECONDS + 60)
+    current = {"value": first_requested_at}
+    store = InMemoryCaseStore(clock=lambda: current["value"])
+    case_id = await _make_case_with_events(store, "PAN-1")
+    await store.append_event(case_id, "tribunal-req-1", "tribunal_requested", payload={})
+    await store.append_event(case_id, "submitted", "submission_composed", payload={})
+
+    current["value"] = second_requested_at
+    await store.append_event(case_id, "tribunal-req-2", "tribunal_requested", payload={})
+
+    just_after_second_request = second_requested_at + timedelta(seconds=1)
+    assert await count_running_tribunals(store, now=just_after_second_request) == 1
+
+
+async def test_count_running_tribunals_does_not_resurrect_a_completed_run_past_the_ttl() -> None:
+    """The TTL only ever *excludes* a would-be-running case; it must never
+    flip an already-terminal run back to "running" just because a lot of
+    time has passed."""
+    requested_at = datetime(2026, 8, 29, 7, 0, tzinfo=UTC)
+    store = InMemoryCaseStore(clock=lambda: requested_at)
+    case_id = await _make_case_with_events(store, "PAN-1")
+    await store.append_event(case_id, "tribunal-req", "tribunal_requested", payload={})
+    await store.append_event(case_id, "submitted", "submission_composed", payload={})
+
+    long_after = requested_at + timedelta(seconds=DEFAULT_STALE_RUN_TTL_SECONDS * 10)
+    assert await count_running_tribunals(store, now=long_after) == 0
 
 
 async def test_enforce_concurrent_tribunal_cap_raises_once_the_cap_is_reached() -> None:
