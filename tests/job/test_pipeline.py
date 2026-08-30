@@ -790,6 +790,15 @@ async def test_run_ships_a_resolvable_ground_and_refuses_the_irrelevant_one() ->
     submission_event = next(e for e in events if e.event_type == "submission_composed")
     assert "overshadow" in submission_event.payload["submission_markdown"].lower()
     assert "property value" not in submission_event.payload["submission_markdown"].lower()
+    # P0 privacy fix: a shipped ground's letter body is `ground.claim`
+    # alone -- never `CourtVerdict.rationale`, which the CLEAR path
+    # (`court/graph.py::_finalize_clear`) always synthesizes as literal
+    # "Clause Reviewer: ... | Evidence Reviewer: ..." internal-role
+    # labels. A resident-facing composed document leaking those labels
+    # was the exact bug; this ground's CLEAR verdict (both reviewers
+    # above support it) is the case that used to trip it.
+    assert "Clause Reviewer:" not in submission_event.payload["submission_markdown"]
+    assert "Evidence Reviewer:" not in submission_event.payload["submission_markdown"]
     # Docs-truth-fix wave: `dispatch/composer.py` no longer headers a refusal
     # with the raw internal `ground_id` hash -- it renders a human-readable
     # category label instead (see that module's `_refusal_heading`). This

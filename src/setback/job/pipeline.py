@@ -1512,7 +1512,14 @@ class RealPipelineRunner:
                     else None
                 )
                 ground_content[ground.ground_id] = GroundContent(
-                    statement=f"{ground.claim} {result.verdict.rationale}",
+                    # P0 security/privacy fix: `result.verdict.rationale`
+                    # (`court/graph.py`'s `_finalize_clear`) is built as
+                    # `f"Clause Reviewer: ... | Evidence Reviewer: ..."` --
+                    # internal reviewer-role labels that must never reach a
+                    # resident-facing composed document. `ground.claim` is
+                    # the resident's own words and is sufficient for the
+                    # letter body on its own.
+                    statement=ground.claim,
                     document_title=document_title,
                     page=first_citation.page if first_citation is not None else 1,
                     annotated_image_ref=annotated_ref,
