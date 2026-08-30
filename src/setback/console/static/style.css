@@ -803,6 +803,45 @@ button:hover {
   border: 1px solid var(--border-strong);
 }
 
+/* --- Overshadowing-simulation card (wave 12 Veo integration) ---------------
+   Deliberately the hazard-flagged palette (--status-flagged-*), never the
+   neutral grey used for the real Street View/provenance badges above --
+   this card must never be visually mistaken for real evidence. The
+   mandatory label/explainer are plain paragraphs, always visible, never
+   a dismissible toast. */
+
+.simulation-card {
+  border: 2px solid var(--status-flagged-border);
+  background: var(--status-flagged-bg);
+}
+
+.tag--simulation {
+  display: inline-block;
+  margin-bottom: var(--space-2);
+  background: var(--status-flagged-border);
+  color: var(--surface);
+}
+
+.simulation-card video {
+  display: block;
+  width: 100%;
+  max-width: 480px;
+  border-radius: var(--radius);
+  background: #000;
+}
+
+.simulation-card__label {
+  margin: var(--space-2) 0 0;
+  font-weight: 700;
+  color: var(--status-flagged);
+}
+
+.simulation-card__explainer {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 /* --- §2.5 Citation chip -----------------------------------------------------
    Three variants (--clause / --doc / --region) sharing one base class,
    per the NotebookLM two-pane pattern. Behaviour lives in app.js's lane. */

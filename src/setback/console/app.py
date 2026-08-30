@@ -67,6 +67,11 @@ from setback.console.guards import (
     per_ip_case_creation_guard,
 )
 from setback.evidence.dossier import ProvenanceGrade
+from setback.evidence.illustration import (
+    ILLUSTRATION_EXPLAINER,
+    ILLUSTRATION_LABEL,
+    simulation_clip_for_case,
+)
 from setback.evidence.overlays import ROLE_CSS_CLASS_SUFFIX, ROLE_LEGEND_TEXT, OverlayRole
 from setback.ingest.tracker import (
     DocumentNotFoundError,
@@ -2113,6 +2118,44 @@ def _render_case_meta_line(events: Sequence[CaseEvent], ledger: Ledger | None) -
     return f'<p class="case-meta">{" &middot; ".join(parts)}</p>'
 
 
+def _has_overshadowing_ground(events: Sequence[CaseEvent]) -> bool:
+    """Whether this case has raised an overshadowing concern, per its own
+    `ground_category_assigned` event(s) (`_propose_ground_for_confirmed_
+    concern`'s `concern_type` payload field) -- the one gate the
+    overshadowing-simulation card (`_render_simulation_clip_card`) shares
+    with `simulation_clip_for_case`'s demo-case-id check, mirroring the
+    Street View grade-B fallback's own always-gated-on-real-content
+    conditional-rendering pattern."""
+    return any(
+        e.event_type == "ground_category_assigned"
+        and e.payload.get("concern_type") == "overshadowing"
+        for e in events
+    )
+
+
+def _render_simulation_clip_card(clip: Any) -> str:
+    """The overshadowing-simulation `<video>` card (RECOMMENDATION.md's
+    minimal integration plan, item 2): a hazard-styled card, visually
+    distinct from the neutral-grey provenance badges used for real
+    evidence documents, carrying the mandatory non-dismissible label and a
+    one-line explainer directly under the clip -- it can never be mistaken
+    for the real Street View photo or the real annotated plan elevation
+    next to it. `clip` is a `setback.evidence.illustration.SimulationClip`
+    (typed loosely here only to avoid a hard import-order dependency in
+    this module's own type-checking pass)."""
+    return (
+        '<section class="card simulation-card">'
+        '<span class="tag tag--simulation">Simulation</span>'
+        f'<video controls preload="none" src="{_esc(clip.static_path)}" '
+        f'aria-label="{_esc(clip.caption)}">'
+        "Your browser does not support embedded video."
+        "</video>"
+        f'<p class="simulation-card__label">{_esc(ILLUSTRATION_LABEL)}</p>'
+        f'<p class="simulation-card__explainer">{_esc(ILLUSTRATION_EXPLAINER)}</p>'
+        "</section>"
+    )
+
+
 def render_case_page(
     case: CaseRecord,
     grounds: Sequence[GroundRecord],
@@ -2169,6 +2212,11 @@ def render_case_page(
         _EVENT_SECTION_TITLES["document_uploaded"],
         by_type.get("document_uploaded", ()),
     )
+    simulation_clip = simulation_clip_for_case(
+        case.case_id, has_overshadowing_ground=_has_overshadowing_ground(events)
+    )
+    if simulation_clip is not None:
+        evidence_section += _render_simulation_clip_card(simulation_clip)
     overlay_section = _render_events_section(
         case.case_id,
         "annotated_overlay",
