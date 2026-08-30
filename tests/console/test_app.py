@@ -1530,9 +1530,9 @@ def test_app_js_measures_the_real_header_height_for_the_chat_pane(client: TestCl
     and on resize (the case-meta line/QR code/wrapping all change the
     header's height at different viewport widths)."""
     js = client.get("/static/app.js").text
-    assert '.topbar' in js
+    assert ".topbar" in js
     assert "--header-height" in js
-    assert "addEventListener(\"resize\"" in js
+    assert 'addEventListener("resize"' in js
 
 
 def test_chat_card_fills_the_pane_height_for_its_transcript_to_flex_against(

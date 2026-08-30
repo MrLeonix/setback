@@ -1,3 +1,57 @@
+# STATUS — wave 12 P0 fix round landed, film-visible defects closed (2026-08-30)
+
+Closed the wave-12 synthesis's P0 list (5 of 6 items; #5 is genuinely blocked, see
+below) with the smallest surgical, TDD change each, on `main`, no deploy (Ship phase
+deploys once):
+
+1. **FILM2 overlay chip collision** — `_draw_label_chip` had no fallback once vertical
+   stacking ran out of headroom at a page's top edge; it silently accepted the
+   overlap. Added `_shift_clear_of_avoid` (the two-row/horizontal-offset fallback):
+   once pinned to the top edge, a colliding chip is placed on a "shelf" beside
+   whichever already-placed chips share its row, bounded by the image's own width.
+   Regression test reproduces three adjacent windows near a page's top edge.
+2. **Transcript speaker mislabeling on reload** — `InterviewTurn` carried no `role`,
+   so a rehydrated flow's replayed resident turns rendered as Setback's own (app.js
+   hardcoded `"ai"` for every turn). Added `role` to `InterviewTurn`, threaded through
+   `_rehydrate_flow_from_store` and `_turn_to_json`, and app.js now passes `turn.role`
+   through to `appendTurn` instead of a literal `"ai"`.
+3. **Evidence Reviewer image-blindness / hallucinated rationale (FILM2)** —
+   narrative-only fix, as scoped: `court/roles.py` already only ever sends the Evidence
+   Reviewer text captions (never image bytes), but `ARCHITECTURE.md` §2's node table
+   and the non-repo film script both read as though it visually examines photos/plans.
+   Corrected both; a docs-truth note now lives beside the table. The real fix
+   (attaching `image_base64` as inline-data parts, retuning the prompt, re-validating)
+   is unchanged, scoped follow-up work, not attempted here.
+4. **Deprecated case still public on docket** — `f3f8c3475e2646537212677fbf7c8075`
+   (`DA2026/0412-FILM`, superseded by the canonical `DA2026/0412-FILM2`) is now hidden
+   from the docket-board list via a `case_id` denylist (`_DEPRECATED_CASE_IDS`),
+   deliberately not a `_JUNK_METADATA_PATTERNS` substring (a `"film"` pattern would
+   also catch the canonical FILM2 case). Hide only, never delete — `/cases/{case_id}`
+   is unaffected. Not yet reconfirmed against the live docket: that verification
+   belongs to the Ship phase's deploy, not this fix round.
+5. **Eligibility clause not verbatim (`README.md:189-190`)** — **blocked, needs Leo**:
+   the section paraphrases the hackathon's model-eligibility rule instead of quoting
+   it verbatim with a citation, and no agent can source the exact rules text. Left
+   untouched rather than fabricated. Correcting the record: **wave 6's STATUS.md entry
+   below, which claims "the verbatim hackathon model-eligibility clause is inserted,"
+   is wrong** — `README.md:189-190` was never actually verbatim-with-citation; that
+   wave's own claim of completion should not be trusted for this item.
+6. **`redacted_text` self-contradiction on a disputed re-clarification** — `_handle_
+   clarifying` always appended the new answer onto whatever `redacted_text` already
+   held, including a previously-disputed (wrong) clarification, producing
+   self-contradictory pairs (e.g. north/south, 9am/2pm) in the same string fed to the
+   tribunal prompt. Added `RaisedConcern.redacted_base` (captured once at concern
+   creation) and replace-instead-of-append when re-entering `CLARIFYING` off a
+   disputed `CONFIRMING`. Regression test proves the failure mode against the reverted
+   code and passes against the fix.
+
+Full offline suite green throughout (659 passed by the last commit of this round),
+ruff check clean, mypy clean. Six commits on `main`, conventional-commit messages, no
+force-push, `veo-integration` branch untouched. No secret value, personal identifier,
+or hostname was read, printed, or transmitted this round.
+
+---
+
 # STATUS — wave 11 SMOKE close-out: full QA loop green, build RE-FROZEN for filming (2026-08-30)
 
 Full QA→find→fix→QA smoke pass against the deployed `setback-console`

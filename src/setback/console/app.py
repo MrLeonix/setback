@@ -299,9 +299,7 @@ def _turn_to_json(turn: InterviewTurn, transcript: Sequence[InterviewTurn]) -> d
     return {
         "stage": turn.stage.value,
         "prompt": turn.prompt,
-        "turns": [
-            {"stage": t.stage.value, "prompt": t.prompt, "role": t.role} for t in transcript
-        ],
+        "turns": [{"stage": t.stage.value, "prompt": t.prompt, "role": t.role} for t in transcript],
         "suggested_replies": _suggested_replies_for(turn.stage),
     }
 

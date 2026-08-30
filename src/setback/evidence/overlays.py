@@ -393,6 +393,7 @@ _CHIP_STACK_GAP_PX: Final[int] = 3
 to avoid a collision -- purely cosmetic breathing room so two stacked
 chips read as visibly separate labels rather than merely touching edges."""
 
+
 def _vertically_overlaps(a: _ChipRect, b: _ChipRect) -> bool:
     _, a_top, _, a_bottom = a
     _, b_top, _, b_bottom = b
