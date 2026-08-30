@@ -2231,6 +2231,108 @@ def test_refusal_card_states_how_many_other_grounds_are_unaffected(
     assert "Your other 2 grounds are unaffected." in response.text
 
 
+# --- refusal-feedback UI affordance: "a clear way to capture feedback" -----
+#
+# Collaborative Partner track requirement: the agent must have a clear way
+# to capture feedback. `POST /api/cases/{case_id}/grounds/{ground_id}/
+# feedback` already existed (guarded, capped, booked) but nothing on the
+# case page could ever call it -- these pin the actual on-page affordance
+# that opens onto that route, rendered inside the refusal card itself
+# (never on a shipped/pending/flagged ground, which was never refused).
+
+
+def test_refused_ground_card_has_a_disagree_affordance(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.REFUSED))
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "gate-decision:g-1",
+            "gate_decision",
+            payload={
+                "ground_id": "g-1",
+                "status": "refused-irrelevant",
+                "category": "property_value",
+                "explanation": "Property value alone is not a s4.15(1) planning matter.",
+                "statutory_basis": "s4.15(1)",
+                "citation_issues": [],
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    body = response.text
+    assert "Disagree with this refusal? Tell the tribunal." in body
+    assert 'class="refusal-feedback-form"' in body
+    assert " hidden" in body.split('class="refusal-feedback-form"')[1].split(">")[0]
+    assert f'data-case-id="{case_id}"' in body
+    assert 'data-ground-id="g-1"' in body
+    assert (
+        'data-original-explanation="Property value alone is not a s4.15(1) planning matter."'
+        in body
+    )
+    assert "<textarea" in body
+    assert 'type="submit"' in body
+
+
+def test_non_refused_ground_card_has_no_disagree_affordance(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-shipped", GroundStatus.SUPPORTED))
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "gate-decision:g-shipped",
+            "gate_decision",
+            payload={
+                "ground_id": "g-shipped",
+                "status": "shipped",
+                "category": "environmental_and_social_impacts",
+                "explanation": "The shadow diagram shows a clear winter impact.",
+                "statutory_basis": "s4.15(1)(b)",
+                "citation_issues": [],
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    body = response.text
+    assert "Disagree with this refusal" not in body
+    assert "refusal-feedback-form" not in body
+
+
+def test_refusal_feedback_affordance_escapes_the_explanation_attribute(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """The explanation is attacker-adjacent free text upstream of this
+    render (a model composition) -- it must be `_esc`-ed into the
+    `data-original-explanation` attribute exactly like every other
+    resident/model-sourced string on this page (the app's own recently
+    fixed XSS class), not interpolated raw."""
+    case_id = _create_case(client)
+    asyncio.run(_make_ground(store, case_id, "g-1", GroundStatus.REFUSED))
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "gate-decision:g-1",
+            "gate_decision",
+            payload={
+                "ground_id": "g-1",
+                "status": "refused-irrelevant",
+                "category": "property_value",
+                "explanation": '<script>alert(1)</script>&"quoted"',
+                "statutory_basis": "s4.15(1)",
+                "citation_issues": [],
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    body = response.text
+    assert "<script>alert(1)</script>" not in body
+    assert "&lt;script&gt;" in body
+
+
 # --- wave 5: docket board derived status tag (UI-SPEC.md §3.1) --------------
 
 
