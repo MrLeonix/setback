@@ -299,9 +299,7 @@ def _turn_to_json(turn: InterviewTurn, transcript: Sequence[InterviewTurn]) -> d
     return {
         "stage": turn.stage.value,
         "prompt": turn.prompt,
-        "turns": [
-            {"stage": t.stage.value, "prompt": t.prompt, "role": t.role} for t in transcript
-        ],
+        "turns": [{"stage": t.stage.value, "prompt": t.prompt, "role": t.role} for t in transcript],
         "suggested_replies": _suggested_replies_for(turn.stage),
     }
 
@@ -1611,6 +1609,25 @@ def _is_photo_upload(filename: str, content_type: object) -> bool:
     return not is_pdf
 
 
+_STREET_VIEW_FILENAME_PREFIX: Final[str] = "Street View fallback ("
+
+
+def _street_view_attribution(filename: str) -> str:
+    """Recovers the visible attribution text Google's Street View terms
+    require (`evidence.imagery`'s module docstring) from the fallback
+    document's own filename -- `job.pipeline._street_view_fallback_document`
+    bakes it in as `f"Street View fallback ({fallback.attribution})"` since
+    that's the only field this event carries it in. `_render_document_
+    uploaded_item` overrides the doc-card's *title* to the friendlier
+    "Street View (archival)", which would otherwise silently drop this
+    attribution from the visible page entirely. Falls back to the raw
+    filename for an older persisted event that predates this exact shape
+    (an append-only log is never rewritten) -- degraded but never blank."""
+    if filename.startswith(_STREET_VIEW_FILENAME_PREFIX) and filename.endswith(")"):
+        return filename[len(_STREET_VIEW_FILENAME_PREFIX) : -1]
+    return filename
+
+
 def _render_document_uploaded_item(case_id: str, event: CaseEvent) -> str:
     """A `.doc-card` (UI-SPEC.md §2.4/§3.3). A photo upload gets a real
     `<img>` thumbnail -- the bytes already exist in whichever
@@ -1641,11 +1658,17 @@ def _render_document_uploaded_item(case_id: str, event: CaseEvent) -> str:
     uploaded_at = _format_clock_time(event.recorded_at)
     is_photo = _is_photo_upload(filename, content_type)
     grade_badge = ""
+    attribution_text = ""
     if is_street_view:
         grade_badge = (
             f'<span class="tag tag--grade-b" title="Provenance grade B -- {_esc(filename)}">'
             "Archival Street View</span>"
         )
+        # Founder bug report (P1) fix, part 2: the attribution Google's
+        # Street View terms require must be genuinely visible on the page,
+        # not just present as a hover-only tooltip's substring -- see
+        # `_street_view_attribution`'s docstring.
+        attribution_text = _street_view_attribution(filename)
     elif is_photo:
         grade_badge = (
             '<span class="tag tag--grade-a" title="Provenance grade A -- your own photo">'
@@ -1656,19 +1679,40 @@ def _render_document_uploaded_item(case_id: str, event: CaseEvent) -> str:
         thumb = f'<img class="doc-card__thumb" src="{doc_url}" alt="{_esc(title)}">'
     else:
         thumb = '<div class="doc-card__thumb doc-card__thumb--placeholder"></div>'
+    attribution_html = (
+        f'<p class="doc-card__attribution">{_esc(attribution_text)}</p>' if attribution_text else ""
+    )
     card_body = (
         f"{thumb}"
         '<div class="doc-card__body">'
         f'<p class="doc-card__title">{_esc(title)}</p>'
         f'<p class="doc-card__meta">{_esc(kind_label)} &middot; uploaded {_esc(uploaded_at)}</p>'
+        f"{attribution_html}"
         "</div>"
         f"{grade_badge}"
     )
-    # LEO-FEEDBACK-UIUX.md §4: a doc-card must open the full image/PDF in a
-    # new tab -- previously inert ("I cannot do anything with that"). Every
-    # uploaded document (photo or PDF) is already servable at `doc_url`, so
-    # this needs no new storage or preview pipeline, only a real link.
-    if doc_url is not None:
+    # LEO-FEEDBACK-UIUX.md §4 (original): a doc-card must open the full
+    # image/PDF, never sit inert.
+    #
+    # Founder bug report (P1) fix, part 1: an *image* evidence card
+    # (a resident's own photo, or this Street View fallback) now opens in
+    # the same in-page lightbox the annotated overlay uses
+    # (`app.js`'s `wireDocCardLightbox`/`openLightbox`) instead of a new
+    # tab -- carried entirely as data attributes, since a lightbox has
+    # nothing server-rendered to hook into ahead of time. A PDF doc-card
+    # is untouched: a lightbox `<img>` cannot render a PDF, so it keeps
+    # the plain new-tab link.
+    if is_photo and doc_url is not None:
+        caption_attr = (
+            f' data-lightbox-caption="{_esc(attribution_text)}"' if attribution_text else ""
+        )
+        card = (
+            '<div class="doc-card doc-card--clickable doc-card--lightbox" '
+            'role="button" tabindex="0" '
+            f'data-lightbox-src="{doc_url}" data-lightbox-alt="{_esc(title)}"'
+            f"{caption_attr}>{card_body}</div>"
+        )
+    elif doc_url is not None:
         card = (
             f'<a class="doc-card doc-card--clickable" href="{doc_url}" '
             f'target="_blank" rel="noopener">{card_body}</a>'

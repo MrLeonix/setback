@@ -1530,9 +1530,9 @@ def test_app_js_measures_the_real_header_height_for_the_chat_pane(client: TestCl
     and on resize (the case-meta line/QR code/wrapping all change the
     header's height at different viewport widths)."""
     js = client.get("/static/app.js").text
-    assert '.topbar' in js
+    assert ".topbar" in js
     assert "--header-height" in js
-    assert "addEventListener(\"resize\"" in js
+    assert 'addEventListener("resize"' in js
 
 
 def test_chat_card_fills_the_pane_height_for_its_transcript_to_flex_against(
@@ -1713,11 +1713,55 @@ def test_street_view_fallback_document_renders_in_the_evidence_section(
     assert response.status_code == 200
     assert 'class="tag tag--grade-b"' in response.text
     assert "Archival Street View" in response.text
-    assert "(c) Google Street View, 2024-06" in response.text
     expected_src = f"/api/cases/{case_id}/documents/street-view-fallback"
     assert f'<img class="doc-card__thumb" src="{expected_src}"' in response.text
     # Never mislabelled as the resident's own photo.
     assert "Your photo" not in response.text
+    # The Google Street View attribution requirement (evidence.imagery's
+    # module docstring) must be genuinely visible text, not just present
+    # somewhere in the markup (e.g. tucked into a hover-only title="..."
+    # tooltip on the grade badge, which technically contains the
+    # substring but shows a resident nothing without hovering).
+    assert '<p class="doc-card__attribution">(c) Google Street View, 2024-06</p>' in response.text
+
+
+def test_street_view_fallback_card_opens_the_lightbox_not_a_new_tab(
+    client: TestClient, store: InMemoryCaseStore
+) -> None:
+    """Founder-reported P1: clicking a Street View fallback image always
+    opened it in a new browser tab instead of the same in-page lightbox
+    the annotated overlay uses. The fix drops the `<a target="_blank">`
+    wrapper for every *image* doc-card (this one included) in favour of a
+    keyboard-accessible trigger `app.js`'s lightbox wires up, carrying the
+    full-resolution source, alt text, and the attribution caption as
+    plain data attributes -- a PDF doc-card is untouched, see
+    `test_document_uploaded_pdf_card_still_opens_in_a_new_tab`."""
+    case_id = _create_case(client)
+    asyncio.run(
+        store.append_event(
+            case_id,
+            "document-uploaded:street-view-fallback",
+            "document_uploaded",
+            payload={
+                "document_id": "street-view-fallback",
+                "filename": "Street View fallback ((c) Google Street View, 2024-06)",
+                "content_type": "image/jpeg",
+                "size_bytes": 4096,
+                "provenance_grade": "B",
+            },
+        )
+    )
+    response = client.get(f"/cases/{case_id}")
+    expected_src = f"/api/cases/{case_id}/documents/street-view-fallback"
+    assert 'class="doc-card doc-card--clickable doc-card--lightbox"' in response.text
+    assert f'data-lightbox-src="{expected_src}"' in response.text
+    assert 'data-lightbox-alt="Street View (archival)"' in response.text
+    assert 'data-lightbox-caption="(c) Google Street View, 2024-06"' in response.text
+    # Keyboard-accessible: a non-native-button trigger needs both hooks.
+    assert 'role="button"' in response.text
+    assert 'tabindex="0"' in response.text
+    # And, crucially, no more escape hatch to a new tab for this card.
+    assert 'target="_blank"' not in response.text
 
 
 # --- doc-card real thumbnails for uploaded photo evidence -------------------
@@ -1746,10 +1790,17 @@ def test_document_uploaded_photo_renders_a_real_img_thumbnail(client: TestClient
     assert f'<img class="doc-card__thumb" src="{expected_src}"' in response.text
 
 
-def test_document_uploaded_card_is_clickable_to_the_full_document(client: TestClient) -> None:
-    """LEO-FEEDBACK-UIUX.md §4: doc-cards were previously inert ("I cannot
-    do anything with that") -- clicking one must open the full image/PDF,
-    here via a plain new-tab link to the document's own serving route."""
+def test_document_uploaded_photo_card_opens_the_lightbox_not_a_new_tab(
+    client: TestClient,
+) -> None:
+    """A resident's own photo upload had the exact same new-tab
+    inconsistency the founder reported for the Street View card (both go
+    through `_render_document_uploaded_item`'s one `is_photo` branch) --
+    the same fix covers it: any image evidence card is now a
+    keyboard-accessible lightbox trigger, never a new-tab link. A PDF
+    still opens in a new tab -- see
+    `test_document_uploaded_pdf_card_still_opens_in_a_new_tab` -- since a
+    lightbox `<img>` cannot render one."""
     case_id = _create_case(client)
     upload = client.post(
         f"/api/cases/{case_id}/documents",
@@ -1757,8 +1808,30 @@ def test_document_uploaded_card_is_clickable_to_the_full_document(client: TestCl
     )
     document_id = upload.json()["document_id"]
     response = client.get(f"/cases/{case_id}")
-    expected_href = f'href="/api/cases/{case_id}/documents/{document_id}"'
-    assert f'<a class="doc-card doc-card--clickable" {expected_href}' in response.text
+    expected_src = f"/api/cases/{case_id}/documents/{document_id}"
+    assert 'class="doc-card doc-card--clickable doc-card--lightbox"' in response.text
+    assert f'data-lightbox-src="{expected_src}"' in response.text
+    assert 'role="button"' in response.text
+    assert 'tabindex="0"' in response.text
+    assert 'target="_blank"' not in response.text
+    # No attribution caption for a resident's own photo -- nothing to cite.
+    assert "data-lightbox-caption" not in response.text
+
+
+def test_document_uploaded_pdf_card_still_opens_in_a_new_tab(client: TestClient) -> None:
+    """A lightbox `<img>` cannot render a PDF, so a PDF doc-card keeps the
+    pre-existing new-tab link behaviour (LEO-FEEDBACK-UIUX.md §4) -- only
+    image evidence moved to the in-page lightbox."""
+    case_id = _create_case(client)
+    client.post(
+        f"/api/cases/{case_id}/documents",
+        files={"file": ("north-elevation.pdf", io.BytesIO(b"%PDF-fake"), "application/pdf")},
+    )
+    response = client.get(f"/cases/{case_id}")
+    expected_href = f'href="/api/cases/{case_id}/documents/'
+    assert 'class="doc-card doc-card--clickable"' in response.text
+    assert "doc-card--lightbox" not in response.text
+    assert expected_href in response.text
     assert 'target="_blank"' in response.text
     assert 'rel="noopener"' in response.text
 
