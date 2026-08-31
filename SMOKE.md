@@ -2313,3 +2313,108 @@ estimates and real job-side costs (tribunal ledger + Street View fetch) against 
 public aggregate, correctly bypassed for privileged (docket-key-cookied) sessions, and
 correctly hidden from the public docket board via the existing `qa` hygiene filter. No
 rollback performed.
+
+---
+
+# SMOKE.md v13 — judge-gated LIVE Veo 3.1 + refusal-feedback UI, merge + deploy + live smoke (2026-08-31)
+
+Founder-authorized (verbatim, per `odds-wave/ship.md`): implement/merge both reviewed
+branches, one console+job deploy, judge-gated LIVE Veo 3.1 spend hard-capped at
+`VEO_LIVE_MAX_GENERATIONS=10` (~US$16), including exactly ONE real generation during
+smoke. Both branches already TDD-implemented and adversarially reviewed in
+`odds-wave/review.md` (`feat/judge-live-veo` mergeable: yes, one real bug found and
+fixed there — per-case concurrent double-generation race, `d17dbc9`;
+`feat/refusal-feedback-ui` mergeable: yes, zero bugs).
+
+## Merge
+
+`main` @ `3978559` before this round (matches review.md and the prior CURRENT STATE).
+
+- `git merge --no-ff origin/feat/judge-live-veo` → `36a910e`, clean, no conflicts.
+- `git merge --no-ff origin/feat/refusal-feedback-ui` → `920a95f`, auto-merged cleanly
+  (only `console/app.py` and `tests/console/test_app.py` touched by both branches, in
+  disjoint regions — exactly as review.md's own dry-run merge predicted).
+- All four gates green on the merged tree: `uv run pytest -q` → **891 passed**;
+  `uv run ruff check .` → clean; `uv run ruff format --check .` → 89 files formatted;
+  `uv run mypy` → no issues, 41 source files. Matches review.md's combined dry-run
+  numbers exactly.
+- Pushed: `main` `3978559..920a95f`.
+
+## Deploy
+
+One `./deploy.sh` run (console + job together, since the job's pipeline gained the
+Veo post-step). `VEO_LIVE_*` env vars were left unset deliberately — every default
+already matches the founder's authorized cap exactly
+(`VEO_LIVE_ENABLED=true`, `VEO_LIVE_MAX_GENERATIONS=10`, `VEO_LIVE_TIMEOUT_SECONDS=360`,
+`VEO_LIVE_VERTEX_LOCATION=us-central1`), confirmed by reading `evidence/veo_live.py`'s
+literal defaults before deploying, so `deploy.sh` needed no changes.
+
+- `setback-console` revision **`setback-console-00024-mvn`**, 100% traffic
+  (stable URL `https://setback-console-956646636969.australia-southeast1.run.app`).
+- `setback-tribunal` job generation **23**.
+- Pre-deploy baseline read (read-only): `guard_totals/veo_live` did not exist yet (0
+  live generations ever); `guard_totals/public` at `anonymous_cases=2, anonymous_turns=5,
+  spend_usd=0.0154829` (unchanged since v12).
+
+## Live smoke (`curl -A "setback/0.1"`; docket key fetched into a shell var per-command,
+## used, `unset` immediately after — never printed; status codes and Firestore-read
+## numeric fields only, never resident-authored free text)
+
+| # | Check | Expected | Observed | Verdict |
+|---|-------|----------|----------|---------|
+| a | Film case `1f4b7367fd30c089173ef09d7e8383a4` | `200`, static clip + pre-generated cost label unchanged, zero live-Veo markers | `200`; `<video src="/static/illustrations/overshadowing-simulation.mp4">` unchanged; "AI-generated illustration — not evidence" + "Pre-generated with Veo 3.1 · one-time cost US$1.60 · not part of this case's run cost" both present; zero occurrences of the live cost line, "being generated", or `veo-live` anywhere on the page; grounds render | PASS |
+| b | Anonymous QA case `DA2026/VEO-QA-1` (`f425d712...`), full interview flow (opening→clarifying→requesting_evidence→confirming→ask_more→done, 5 turns, no evidence upload) | No Veo card, no illustration events, guard counters increment as before | `case_created` payload `{judge_origin: False, public_origin: True}`; zero illustration/Veo markers on the case page; `guard_totals/public`: `anonymous_cases` 2→3, `anonymous_turns` 5→10, `spend_usd` +0.005 (exactly 5×the per-turn estimate) | PASS |
+| c | Privileged flow: `/docket?key=<real>` → `sb_priv` cookie → judge QA case `DA2026/VEO-QA-JUDGE` (`527d891b...`), overshadowing concern + `elevations.pdf` uploaded as evidence → tribunal | `202`; `submission_composed` ~35s; then `illustration_generating`, then within ~6 min `illustration_ready` + live card (caption + live-cost line) renders; `guard_totals/veo_live == 1` | `/docket` no-key → `401`; wrong-key → `401`; real key → `200` + `sb_priv` cookie set; case_created `{judge_origin: True, public_origin: False}`; tribunal `202` at 23:54:08 UTC; ground SHIPPED (overshadowing, s4.15(1)(b)); `submission_composed` at +46s; `illustration_generating` immediately after; **`illustration_ready` at 23:57:02 UTC (~+3min)**, `document_id=veo-live-illustration`; case page renders both mandatory captions verbatim (`"AI-generated illustration — not evidence"` + `"Generated live with Veo 3.1 · US$1.60 · not part of this case's run cost"`) and a `<video>` pointing at `/api/cases/{id}/documents/veo-live-illustration`; that URL served **real** `video/mp4`, 3,285,979 bytes (verified `file(1)`: "ISO Media, MP4 Base Media v1"); `guard_totals/veo_live` → `{count: 1}` | PASS |
+| d | Refusal-feedback on a real refused ground, privileged session | Response renders, persists on reload, escaped | **Deviation, flagged**: case (c)'s only concern (overshadowing) SHIPPED — it has no refused ground, and the interview state machine has no reopen-after-`done` path to add a second concern retroactively without re-running the tribunal (which would have risked a **second** real Veo generation, explicitly not authorized — only one was). Rather than risk that, a second privileged case, `DA2026/VEO-QA-FEEDBACK` (`7d6e0c63...`), was created with a property-value-only concern — a concern type that can never satisfy the Veo gate's "shipped *overshadowing* ground" condition, so this tribunal run provably could not touch Veo (confirmed after the run: zero illustration events, `guard_totals/veo_live` still `{count: 1}`, unchanged). Ground refused `refused-irrelevant` (s4.15(1), "not a matter listed"); `POST .../feedback` with an adversarial pushback (`<script>alert(1)</script>`, `<b>`, `&`, `"`) → `200`, real composed response; reload confirmed the response text present, the resident feedback section present, and **every** injected tag escaped (`&lt;script&gt;alert(1)&lt;/script&gt;`, `&lt;b&gt;...&lt;/b&gt;`, `&quot;`) — zero raw `<script>` anywhere in the reloaded page | PASS (mechanism), with the case-identity deviation above named precisely rather than silently substituted |
+| e | Anonymous cannot reach Veo: second anonymous QA case `DA2026/VEO-QA-2` (`fa6640d8...`), overshadowing + `elevations.pdf` uploaded → tribunal | No illustration events even if every other Veo condition would otherwise pass | `case_created` `{judge_origin: False, public_origin: True}`; tribunal `202`; ground **SHIPPED** (overshadowing, real citation, real overlay) — i.e. every Veo gate condition except `judge_origin` was genuinely satisfied, the strongest form of this check; **zero `illustration_*` events**, `guard_totals/veo_live` still `{count: 1}` (unchanged); case page carries zero Veo markers; `guard_totals/public` correctly booked the ordinary tribunal cost (`anonymous_cases`→4, `anonymous_turns`→14, `spend_usd`→0.0331312) | PASS |
+
+Final docket-board check (real key, read-only): all four `VEO-QA-*` cases correctly
+absent from the public list (`qa` hygiene filter); `Public spend: $0.03 / $26.00 (0%) ·
+4 anonymous cases · 14 anonymous turns` — matches the Firestore read exactly.
+
+## Final Veo counter and spend
+
+- **`guard_totals/veo_live` = `{count: 1}`** — exactly the one founder-authorized real
+  generation, no more. Real spend: **~US$1.60** (Veo 3.1, one clip).
+- `guard_totals/public.spend_usd`: `0.0154829` → `0.0331312` this round (+`0.0176483`)
+  from ordinary anonymous interview/tribunal traffic generated by checks (b) and (e) —
+  not Veo spend, booked against the pre-existing public-abuse guard exactly as designed.
+- No other real model/Veo call was made this round beyond what the table above
+  documents (one Veo generation, two tribunal runs' worth of ordinary
+  reviewer/adjudicator/composer calls, one refusal-feedback composer call).
+
+## Anomalies
+
+None requiring fix-forward or rollback. The one deviation from the brief's literal
+script — check (d) run against a second privileged case rather than reusing (c)'s case
+verbatim — is named above, not silently substituted, and was the safer choice given
+the "exactly ONE real generation" constraint.
+
+## Security
+
+No secret file was read; the docket-key secret was fetched via
+`gcloud secrets versions access` directly into a shell variable, used only inside
+`curl`/`Authorization`-free query-string calls to the app's own deployed instance, and
+`unset` immediately after each use — never printed, logged, or written to any file in
+this round (the `sb_priv` cookie stored transiently in a local cookie jar during this
+session is an HMAC derived from the key, not the key itself, and was deleted at the end
+of this round). No personal identifier (founder's name, email, hostname) was sent to
+any external service — all outbound calls used the neutral `User-Agent: setback/0.1`;
+Firestore reads used the operator's own existing `gcloud`/ADC session against the same
+project the deployed service already runs in, no new credentials created. No raw
+visitor IP was read, stored, or logged by anything this round touched. Test data used
+synthetic case labels (`DA2026/VEO-QA-1/2/JUDGE/FEEDBACK`) and the repo's own
+checked-in `elevations.pdf` fixture; the one adversarial XSS payload submitted through
+the feedback endpoint was synthetic test input, never real resident data, and is
+confirmed fully escaped everywhere it renders. **No slip to report.**
+
+## Status
+
+**Deployed and smoke-verified live.** `setback-console-00024-mvn` / `setback-tribunal`
+generation 23, `australia-southeast1`, 100% traffic. All 5 founder-specified smoke
+checks pass (one with a named, transparent case-identity deviation on check (d) that
+does not weaken what was actually proven). The Stage-3 bonus condition — Veo used
+IN-PRODUCT, not just as a pre-generated demo asset — is now live and judge-reachable:
+a privileged session can trigger a real Veo 3.1 generation end-to-end, while the public/
+anonymous flow (verified adversarially, including a case that satisfied every other
+Veo condition) remains provably spend-free for Veo. No rollback performed.
