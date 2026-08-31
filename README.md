@@ -112,6 +112,8 @@ explainer).
 
 ## Local spin-up
 
+For judges: the 5-minute walkthrough is in [TESTING.md](./TESTING.md).
+
 ```sh
 uv sync
 cp .env.example .env   # fill in local overrides; see setback/config.py for defaults
