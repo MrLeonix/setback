@@ -293,3 +293,86 @@ Cloud Run ingress shape, but not verified against every possible ingress topolog
 of this specific deployment. See the `SECURITY-REVIEW NOTE` above
 `public_guard_client_ip` in `console/guards.py` for what was actually checked and what
 remains an assumption to verify against the live service post-deploy.
+
+---
+
+## D12. Judge-gated live Veo: `judge_origin`, not a manual toggle or a sample rate
+
+**Decision:** whether a case gets a real, live Veo generation is decided by one boolean
+carried on the case itself (`judge_origin`, stamped at creation time from the same
+privileged-cookie check `public_origin` already used) plus a global hard cap
+(`VEO_LIVE_MAX_GENERATIONS`), not by a founder manually flipping a per-case switch and
+not by randomly sampling some fraction of eligible cases (ARCHITECTURE.md's "Judge-gated
+live Veo generation" note, §4).
+
+**Alternatives considered:**
+- *A manual admin action ("generate Veo for this case") triggered from the docket
+  board.* Rejected: it puts a human in the loop on every single judging session, which
+  doesn't scale to however many judges try the flow concurrently or at odd hours, and
+  reintroduces exactly the kind of babysitting the rest of this system is built to avoid.
+- *Sample a percentage of all cases, judge or not, for a live clip.* Rejected outright —
+  it reintroduces real, unbounded Veo spend on the public anonymous flow, which the
+  founder's own authorization explicitly ruled out ("public/anonymous flow must remain
+  spend-free for Veo"). `judge_origin` is a fact already recorded at case-creation time
+  for an unrelated purpose (the spend guard's own privileged bypass), so reusing it here
+  costs nothing new to derive and can't drift from the guard's own definition of
+  "privileged."
+- *One shared budget with the interview/tribunal spend guard, rather than a separate
+  cap.* Rejected: the two guards protect against genuinely different failure modes — the
+  existing guard bounds ordinary interview/tribunal token spend across arbitrarily many
+  anonymous visitors, while this cap bounds a small number of expensive, discrete video
+  generations that only a judge session can ever trigger. Folding them into one number
+  would let a run of ordinary anonymous traffic silently eat into the budget meant for
+  judges to see Veo live, or vice versa — two different resources with two different
+  owners deserve two different ceilings, not one shared one that's harder to reason
+  about after the fact.
+
+**Why the double gate check (pipeline *and* console) instead of one:** the pipeline's
+gate decides whether Veo is ever called (the spend decision); the console's gate decides
+whether a generated clip is ever rendered (the disclosure decision). A single shared
+check would mean a future change to either surface could silently widen the other's
+behavior — e.g., a console change that shows the card for a case it shouldn't render for,
+just because the underlying data happens to exist. Checking `judge_origin` again,
+independently, at render time costs one extra boolean read and buys defense in depth
+against exactly that class of drift.
+
+**Cost of this decision:** two places in the codebase now need to agree on what
+"judge-gated" means, rather than one — a real (if small) coupling cost, accepted because
+the alternative (one gate, trusted everywhere downstream) is the weaker guarantee for a
+feature whose entire justification is "the public flow must never spend on this."
+
+---
+
+## D13. Per-case Veo double-generation race: caught by review, fixed with a claim, not a lock
+
+**Decision:** a second atomic Firestore counter, keyed by `case_id` with `limit=1`
+(`VeoLiveCounterStore.try_claim_case`), sits in front of the actual Veo call — separate
+from, and in addition to, the global `VEO_LIVE_MAX_GENERATIONS` counter
+(ARCHITECTURE.md's "Judge-gated live Veo generation" note, §4).
+
+**Why this exists at all:** this system already has a known, accepted surface where a
+double-clicked "Start tribunal" button fires two concurrent Cloud Run Job executions for
+the same case (`console.app.start_tribunal`'s own documented gap — not new, not
+introduced by this wave). For an ordinary tribunal run, that's wasteful but not
+dangerous: both executions converge on the same idempotent, content-hashed writes. For a
+real, billed Veo call, it's a different story — two concurrent executions each reading an
+empty illustration-event snapshot at the moment they start would each genuinely call Veo,
+double-billing one case and silently burning two slots off the whole deployment's
+ten-generation cap for a single judge session. An adversarial code review caught exactly
+this before it shipped (fixed in commit `d17dbc9`) — not found by any existing test,
+because the existing per-run idempotency check (§3's resume semantics) only ever
+considered one execution's own view of events, never two executions racing each other.
+
+**Alternative considered:** a Firestore transaction or a distributed lock around the
+whole post-step. Rejected as more machinery than the actual problem needs: the
+system already has an atomic-increment-with-compare primitive doing real work elsewhere
+(the global cap itself, and the pre-existing per-actor guard counters) — reusing that
+exact shape, just keyed by `case_id` with `limit=1`, closes the race with no new
+concurrency primitive to reason about, test, or explain to a judge reading the code.
+
+**Accepted trade-off, stated plainly:** under sufficiently pathological concurrency, the
+claim can let *zero* callers win rather than exactly one (both executions' increments
+land, both see a count above 1, both back off) — the same shape, and the same accepted
+trade-off, as the global cap's own "every attempt increments, including a refused one"
+semantics. For a real-money cap, failing toward "nobody generates" is the safe direction;
+failing toward "both generate" is the one direction this design refuses to allow.

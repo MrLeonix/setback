@@ -67,6 +67,41 @@ Veo 3.1 · one-time cost US$1.60 · not part of this case's run cost"), not
 just in this doc. See [README.md](./README.md#models-used) for the model
 table entry.
 
+## Live-generation Veo mode (judge-gated, hard-capped)
+
+Beyond the pre-generated clip above, any case created by a privileged
+session (one that has unlocked `/docket` with the real key) that ships a
+genuine overshadowing ground triggers one further, real
+`veo-3.1-generate-001` generation — built fresh from that specific case's
+own elevation drawing, not the allowlisted clip reused. The point of this
+mode is that a judge can watch Setback call Veo in-product themselves,
+rather than only ever seeing an asset generated ahead of time.
+
+Spend is bounded on purpose, not by hope: a hard global cap,
+`VEO_LIVE_MAX_GENERATIONS`, defaults to and is currently set to **10** real
+generations for the entire deployment (~US$16 total at $1.60/clip), tracked
+by an atomic Firestore counter (`guard_totals/veo_live`) that a burst of
+concurrent requests cannot outrun, plus a per-case claim that stops the same
+case from ever being billed twice. The whole mode can be switched off
+instantly with `VEO_LIVE_ENABLED=false`, no redeploy required. As of this
+writing, exactly one real generation has occurred — made during the
+founder-authorized smoke test that proved this mode end-to-end before
+judging opened — leaving the remaining cap headroom for judges to trigger
+their own.
+
+The public, anonymous flow can never reach this mode: the gate requires
+`judge_origin` on the case, checked independently in two places (the
+pipeline stage that decides whether to generate, and the console route that
+decides whether to render), so an anonymous visitor raising the identical
+concern never spends any Veo budget — confirmed live against exactly that
+adversarial case (an anonymous case satisfying every other condition except
+`judge_origin`). The generated clip carries the same mandatory
+"AI-generated illustration — not evidence" label as the pre-generated one,
+plus its own distinct cost line, "Generated live with Veo 3.1 · US$1.60 ·
+not part of this case's run cost," and is excluded from the tribunal's
+evidence pipeline on the same terms — never citable, never graded, never
+seen by either reviewer or the adjudicator.
+
 ## Build process
 
 Beyond the AI models Setback calls at runtime (disclosed above), the

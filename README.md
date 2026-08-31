@@ -213,6 +213,12 @@ to zero, since their hashed identity changes with the salt. It does not touch th
 spend ceiling or either count backstop, and it doesn't touch the older hourly per-IP
 limiter either — both keep enforcing exactly as before.
 
+**One more thing this guard doesn't cover: Veo.** The privileged cookie above bypasses
+the interview/tribunal spend guard, nothing more — it does not, by itself, turn on
+live Veo generation for a case that wouldn't otherwise qualify, and Veo's own hard cap
+(`VEO_LIVE_MAX_GENERATIONS`, see "Models used" below) is a separate ceiling that this
+guard's bypass never touches either way.
+
 ## Models used
 
 | Model | Role | Thinking level |
@@ -220,7 +226,7 @@ limiter either — both keep enforcing exactly as before.
 | `gemini-3.5-flash-lite` | Resident-facing interview | MINIMAL |
 | `gemini-3.7-flash` | Adjudication bench (conflict resolution / escalation) | LOW (its effective floor) |
 | `gemma-4-26b-a4b-it-maas` | Low-cost clerical extraction & refusal prose (OpenAI-compatible MaaS endpoint) | n/a |
-| `veo-3.1-generate-001` | Overshadowing-simulation illustration — see below | n/a |
+| `veo-3.1-generate-001` | Overshadowing-simulation illustration, pre-generated for the demo cases or generated live for a judge-gated case — see below | n/a |
 
 Mandatory for all categories, quoted verbatim from the hackathon's own rules
 page (source:
@@ -255,6 +261,35 @@ so it can never be cited, graded, or seen by either reviewer or the
 adjudicator (`tests/evidence/test_illustration.py` asserts this directly
 against a built case dossier). See [DISCLOSURE.md](./DISCLOSURE.md) for the
 generation process.
+
+**A second mode: generated live, for a judge session, hard-capped.** Any case
+created by a privileged session (one that unlocked `/docket` with the real
+key) that ships a genuine overshadowing ground triggers one further, real
+`veo-3.1-generate-001` call — a fresh clip, conditioned on that specific
+case's own elevation drawing, not a reused allowlisted asset, so a judge can
+watch Setback actually call Veo in-product instead of only seeing a
+pre-baked one. Three independent guards sit in front of every call: a kill
+switch (`VEO_LIVE_ENABLED`, default `true`, no redeploy needed to flip it),
+the three allowlisted demo cases above are excluded outright (they already
+have their own vetted clip), and a hard global ceiling
+(`VEO_LIVE_MAX_GENERATIONS`, default and currently `10`, ~US$16 total at
+$1.60/clip) tracked by an atomic Firestore counter that a burst of
+concurrent requests can't outrun. The public, anonymous flow can never reach
+any of this — the gate requires `judge_origin` on the case, checked
+independently both where the pipeline decides whether to generate and where
+the console decides whether to render, so an anonymous visitor raising the
+identical concern never spends a cent of Veo budget (verified live, against
+exactly that case). While generation is in flight (observed ~3 minutes in
+practice, hard-timed-out at `VEO_LIVE_TIMEOUT_SECONDS`, default 360s/6min),
+the case page shows a plain placeholder — "Your illustration is being
+generated — give it a couple of minutes and refresh." — and any failure
+degrades to no card at all rather than breaking the run. Once ready, the
+card carries the same mandatory "AI-generated illustration — not evidence"
+label plus its own cost line, "Generated live with Veo 3.1 · US$1.60 · not
+part of this case's run cost," and is excluded from the tribunal's evidence
+pipeline on the same terms as the pre-generated clip — never citable, never
+graded, never seen by either reviewer or the adjudicator. See
+[DISCLOSURE.md](./DISCLOSURE.md) for the cap and cost detail.
 
 ## Data sources
 

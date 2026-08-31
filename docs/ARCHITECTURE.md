@@ -38,7 +38,7 @@ is no separate `shared/` tree; `console/` and `job/` are simply two entry points
 | `setback-console` | Cloud Run **Service** (FastAPI, ASGI, scale-to-zero) | `src/setback/console/` | Firestore (`cases`, `events`), Vertex AI (interview turns only), triggers `setback-tribunal` |
 | `setback-tribunal` | Cloud Run **Job** (one execution per case run) | `src/setback/job/` (`main.py` entry point, `pipeline.py`'s `RealPipelineRunner` for the actual run) | Firestore (all collections), Vertex AI (review/adjudication/composition/grounding calls), OnlineDA / ePlanning / eTrack (via `ingest/`), GCS (uploaded evidence) |
 | `ingest/` | deterministic library, no LLM calls | `src/setback/ingest/` (`onlineda.py`, `spatial.py`, `tracker.py`) | OnlineDA API, ePlanning `layerintersect`, council eTrack `FileDownload.ashx` |
-| `evidence/` | mixed: `dossier.py`/`storage.py` are deterministic; `grounding.py` calls a model | `src/setback/evidence/` | GCS (`storage.py`'s `GcsEvidenceStore`), Firestore evidence anchors, bbox math, provenance grading, Vertex AI (grounding only) |
+| `evidence/` | mixed: `dossier.py`/`storage.py` are deterministic; `grounding.py` calls a model | `src/setback/evidence/` | GCS (`storage.py`'s `GcsEvidenceStore`), Firestore evidence anchors, bbox math, provenance grading, Vertex AI (grounding calls, `location=global`; `veo_live.py`'s judge-gated live-illustration calls, deliberately `us-central1` instead — see §4's "Judge-gated live Veo" note and §5) |
 | `court/` | the ADK graph (§2) | `src/setback/court/` (`graph.py`, `roles.py`, `bench.py`, `tally.py`) | Vertex AI directly, via ADK's own `Agent`/`genai.Client` transport — **not** `models/client.py` (see §7's docs-truth note) |
 | `gate/` | deterministic library, no LLM calls | `src/setback/gate/` (`s415.py`, `relevance.py`, `validator.py`) | Firestore (via the caller-supplied dossier), no I/O of its own |
 | `dispatch/` | output composition | `src/setback/dispatch/composer.py` | `models/client.py` (resident-facing prose polish only) |
@@ -263,6 +263,31 @@ downstream trusts row count over content — but nothing in the codebase today s
 drops one if it occurs; see §4's docs-truth note for the actual (limited) failure-recovery
 story.
 
+**Docs-truth addition (wave 13):** two more top-level collections exist outside the
+`cases/{case_id}` tree above and were not previously documented here —
+`guard_totals` (`state.guard_store.py`) backs the public-abuse spend guard and the
+judge-gated live-Veo cap:
+
+```
+guard_totals/public
+  anonymous_cases, anonymous_turns, spend_usd    # global aggregate, atomic Increment only
+  events/{threshold-<pct>}                       # idempotent one-time crossing markers
+
+guard_totals/veo_live
+  count                                           # global real-generation attempt count, atomic Increment only
+guard_totals/veo_live_claims_{case_id}
+  claimed                                         # per-case double-generation guard, atomic Increment, limit=1
+```
+
+Every field on both docs is written via `firestore.Increment`, never read-then-write —
+`guard_totals/public` in particular is the single highest-write-contention document in
+the whole system (every anonymous request across the deployment writes to it), so a
+lost update there would let real spend run past the ceiling rather than stop at it,
+which is why it was deliberately built atomic-only rather than the more common
+read-check-write shape (see `state/guard_store.py`'s own module docstring for the
+2026-08-30 security review that caught and fixed a read-then-write version of this
+before it shipped).
+
 **Resume semantics.** On start, `setback-tribunal` reads `cases/{case_id}`. If
 `ingest_complete_at` is set and the `evidence` subcollection is non-empty, `IngestNode` is
 skipped and the job resumes at the reviewer fan-out. If `status` is already `gated` or
@@ -400,6 +425,52 @@ to `run_court_verbose(..., ledger=...)` — confirmed in the current source
 `run_court_verbose` call site), so this gap that an earlier revision of this note flagged
 as still-open is closed.
 
+### Judge-gated live Veo generation: isolated, capped, never fails a run (wave 13)
+
+A fourth, later post-step, added after `submission_composed` is durably written: a
+real, per-case `veo-3.1-generate-001` call (`evidence/veo_live.py`), gated to only a
+privileged (`judge_origin`) case that shipped a genuine overshadowing ground. It is
+built to the same "never take the run down with it" standard as the rest of this
+section, by a narrower and more direct mechanism than a breaker:
+
+- **Isolation.** The whole attempt runs inside `asyncio.wait_for(...,
+  timeout=VEO_LIVE_TIMEOUT_SECONDS)` (default 360s) wrapped in a blanket `except
+  Exception`; even the failure-recording write on that path is itself wrapped in
+  `contextlib.suppress(Exception)`. Structurally, nothing this post-step can do —
+  a gating check, the Veo call, the GCS write, or the timeout firing — can propagate
+  out of `RealPipelineRunner.run` (pinned by tests covering an outright Veo-raise and
+  an outright timeout, both asserting `submission_composed` still stands and `run()`
+  doesn't raise).
+- **Cap.** `VeoLiveCounterStore.try_increment` (`state/guard_store.py`) is one atomic
+  Firestore counter (`guard_totals/veo_live`, `firestore.Increment`, never
+  read-then-write) hard-capping real generations at `VEO_LIVE_MAX_GENERATIONS` (default
+  10, ~US$16 total) across the whole deployment — every attempt increments it,
+  including one that ends up refused, matching `GuardCounterStore`'s own semantics
+  (§3). Pinned by a 20-concurrent-caller test asserting the stored count is exactly 20
+  and never more than the limit are let through.
+- **Per-case idempotence, closing a real race found by review.** An adjudicator-style
+  double-generation hazard exists here too: `console.app.start_tribunal`'s own
+  double-click-fires-a-second-job-execution surface (a known, pre-existing gap this
+  wave didn't introduce) means two concurrent job executions for the *same* `case_id`
+  could each see an empty illustration-event snapshot and each proceed to call Veo for
+  real, double-billing one case. `VeoLiveCounterStore.try_claim_case(case_id)` closes
+  this with the identical atomic-increment-then-compare shape, `limit=1`, keyed by
+  `case_id` — at most one caller can ever win the claim (under pathological
+  concurrency it can safely let *zero* win, the same accepted trade-off as the global
+  cap, never a double-charge). This was a real bug caught during adversarial review
+  (fixed in commit `d17dbc9`), not a hypothetical.
+- **Region exception.** Veo 3.1 is only available in `us-central1` on this project
+  (confirmed live: the model card returns `200` there, `404` in
+  `australia-southeast1`) — `VertexVeoLiveClient` talks to Vertex there specifically,
+  the one deliberate departure from this build's otherwise-`location=global` model
+  traffic (see §1's `evidence/` row and §5).
+- **Public flow exclusion.** The gate requires `judge_origin` on the case, checked
+  independently both here (whether to attempt generation at all) and again in
+  `console/app.py` (whether to render a card) — defense in depth, not one shared
+  check. No anonymous case has ever satisfied it; confirmed live against an anonymous
+  case built to satisfy every *other* condition (real overshadowing ground, real
+  citation, real overlay) except this one.
+
 ---
 
 ## 5. Credential security
@@ -419,7 +490,11 @@ as still-open is closed.
     a Google Cloud API credential. No Maps secret access (`--clear-secrets` passed
     explicitly on every console deploy).
   - `setback-tribunal-sa` (`sa-orchestrator`): `roles/datastore.user`,
-    `roles/aiplatform.user` (review/adjudication/composition/grounding calls), outbound
+    `roles/aiplatform.user` (review/adjudication/composition/grounding calls, and —
+    wave 13 — the judge-gated live-Veo call in `us-central1`; `roles/aiplatform.user`
+    is a project-level grant, not scoped per-region, so this needed zero new grants,
+    confirmed both before deploying and by the one real generation succeeding live
+    with no IAM error on the first attempt), outbound
     egress to `onlineda.*`, `api.apps1.nsw.gov.au`, and `etrack.georgesriver.nsw.gov.au`
     (network egress, not a GCP IAM permission, but this is the only SA whose runtime has a
     reason to reach those hosts), `roles/secretmanager.secretAccessor` scoped to exactly
