@@ -20,6 +20,11 @@ the whole pipeline.
 
 ## Architecture
 
+Here's the full architecture end to end, with the same diagram in text
+further down for anyone who wants to read or copy the Mermaid source.
+
+![Setback — System Architecture](docs/architecture-diagram.png)
+
 ```mermaid
 flowchart TB
   subgraph FE["Frontend"]
